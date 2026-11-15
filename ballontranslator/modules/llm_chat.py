@@ -8,7 +8,9 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
+
+import httpx
 
 from .context.errors import provider_error_message
 from .context.token_usage import format_completion_token_usage
@@ -63,6 +65,158 @@ def _openai_sdk_base_url(url: str) -> str:
         if parent_url:
             return parent_url
     return base_url
+
+
+class LLMConnectionError(RuntimeError):
+    """A connection-check failure with a safe message and a stable error kind."""
+
+    def __init__(self, kind: str, message: str) -> None:
+        self.kind = kind
+        super().__init__(message)
+
+
+@dataclass(frozen=True)
+class LLMConnectionTestResult:
+    ok: bool
+    message: str
+    kind: str
+    models: List[str]
+
+
+def _profile_connection_request(
+    profile: LLMProfile,
+    path: str,
+    *,
+    proxy: str,
+    timeout: float,
+    payload: Optional[Dict[str, Any]] = None,
+) -> httpx.Response:
+    api_key = resolve_api_key(profile).strip()
+    if profile.require_api_key and not api_key:
+        raise LLMApiKeyRequiredError(profile.id, profile.name)
+    headers = {'Authorization': f'Bearer {api_key}'} if api_key else {}
+    base_url = _openai_sdk_base_url(profile.base_url) or PROVIDER_DEFAULTS['OpenAI']['base_url']
+    url = f'{base_url.rstrip("/")}/{path}'
+    try:
+        # A single proxy applies to both HTTP and HTTPS, as in the requester.
+        with httpx.Client(proxy=proxy or None, timeout=timeout) as client:
+            if payload is None:
+                response = client.get(url, headers=headers)
+            else:
+                response = client.post(url, headers=headers, json=payload)
+    except httpx.TimeoutException:
+        raise LLMConnectionError('timeout', 'The connection timed out. Try again.') from None
+    except (httpx.RequestError, httpx.InvalidURL, ValueError, ImportError):
+        # Transport diagnostics can echo credentials or proxy URLs; never forward them.
+        raise LLMConnectionError('network', 'Could not connect. Check the base URL, network, and proxy.') from None
+    if not response.is_success:
+        status = response.status_code
+        if status in (401, 403):
+            kind, message = 'auth', 'Authentication failed. Check the API key.'
+        elif status == 404:
+            kind, message = 'not_found', 'Endpoint not found. Check the base URL or enter a model manually.'
+        elif status == 429:
+            kind, message = 'rate_limited', 'The provider rate limit was reached. Try again later.'
+        elif 500 <= status < 600:
+            kind, message = 'server', 'The provider has a server error. Try again later.'
+        else:
+            kind, message = 'invalid_response', 'The provider returned an unexpected response.'
+        raise LLMConnectionError(kind, f'HTTP {status}: {message}')
+    return response
+
+
+def list_profile_models(
+    profile: LLMProfile,
+    *,
+    proxy: str = '',
+    timeout: float = 15.0,
+) -> List[str]:
+    """Fetch model IDs with a blocking request; run off the Qt main thread.
+
+    Missing credentials are checked before creating any network client.
+
+    >>> try:
+    ...     list_profile_models(LLMProfile())
+    ... except LLMApiKeyRequiredError:
+    ...     print('API key required')
+    API key required
+    """
+    response = _profile_connection_request(profile, 'models', proxy=proxy, timeout=timeout)
+    try:
+        entries = response.json()
+    except ValueError:
+        entries = None
+    if isinstance(entries, dict):
+        entries = entries.get('data', entries.get('models'))
+    if not isinstance(entries, list):
+        raise LLMConnectionError(
+            'invalid_response',
+            f'HTTP {response.status_code}: The provider did not return a model list.',
+        )
+    models: List[str] = []
+    seen = set()
+    for entry in entries:
+        if isinstance(entry, dict):
+            model = entry.get('id')
+            if not isinstance(model, str) or not model.strip():
+                model = entry.get('name')
+        else:
+            model = entry
+        if isinstance(model, str) and model.strip():
+            model = model.strip()
+            if model not in seen:
+                models.append(model)
+                seen.add(model)
+    return models
+
+
+def check_profile_connection(
+    profile: LLMProfile,
+    *,
+    proxy: str = '',
+    timeout: float = 15.0,
+) -> LLMConnectionTestResult:
+    """Check access with blocking requests; run off the Qt main thread.
+
+    If model listing is unavailable or rejects the key, try one minimal chat
+    request when a model is configured: some providers (e.g. Anthropic's
+    OpenAI-compatible endpoint) authenticate chat and model listing differently,
+    so the chat result is the authoritative one. Expected connection failures
+    are returned, not raised.
+
+    >>> check_profile_connection(LLMProfile()).kind
+    'auth'
+    """
+    try:
+        models = list_profile_models(profile, proxy=proxy, timeout=timeout)
+    except LLMApiKeyRequiredError:
+        return LLMConnectionTestResult(False, 'API key is missing. Enter an API key.', 'auth', [])
+    except LLMConnectionError as error:
+        if error.kind not in ('not_found', 'invalid_response', 'auth'):
+            return LLMConnectionTestResult(False, str(error), error.kind, [])
+        if not profile.model.strip():
+            return LLMConnectionTestResult(
+                False,
+                'This provider does not list models. Enter a model name manually.',
+                error.kind,
+                [],
+            )
+    else:
+        return LLMConnectionTestResult(True, 'Connection successful.', 'ok', models)
+    try:
+        _profile_connection_request(
+            profile, 'chat/completions', proxy=proxy, timeout=timeout,
+            payload={
+                'model': profile.model.strip(),
+                'messages': [{'role': 'user', 'content': 'Hi'}],
+                'max_tokens': 1,
+            },
+        )
+    except LLMApiKeyRequiredError:
+        return LLMConnectionTestResult(False, 'API key is missing. Enter an API key.', 'auth', [])
+    except LLMConnectionError as error:
+        return LLMConnectionTestResult(False, str(error), error.kind, [])
+    return LLMConnectionTestResult(True, 'Connection successful.', 'ok', [])
 
 
 def _uses_provider_base_url(base_url: str, provider: str) -> bool:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import re
+import uuid
 from collections.abc import Mapping
 from typing import (
     Any,
@@ -141,6 +142,76 @@ PROVIDER_DEFAULTS = {
     },
 }
 
+EXTRA_PROVIDER_TEMPLATES = {
+    "SiliconFlow": {
+        "base_url": "https://api.siliconflow.cn/v1",
+        "require_api_key": True,
+        "model": "deepseek-ai/DeepSeek-V3.2",
+        "model_options": [
+            "deepseek-ai/DeepSeek-V3.2", "Qwen/Qwen3.6-27B",
+            "Pro/moonshotai/Kimi-K2.6", "Pro/zai-org/GLM-5.1",
+        ],
+    },
+    "Anthropic": {
+        "base_url": "https://api.anthropic.com/v1/",
+        "require_api_key": True,
+        "model": "claude-sonnet-5-5",
+        "model_options": [
+            "claude-fable-5-2", "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5",
+        ],
+        "support_vision": True,
+        "vision_model": "claude-sonnet-5-5",
+        "vision_model_options": [
+            "claude-fable-5-2", "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5",
+        ],
+        "vision_detail_level": "auto",
+    },
+    "Alibaba Bailian": {
+        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "require_api_key": True,
+        "model": "qwen-plus",
+        "model_options": ["qwen-plus", "qwen-flash", "qwen3-max", "qwen3.5-plus"],
+    },
+    "Moonshot": {
+        "base_url": "https://api.moonshot.cn/v1",
+        "require_api_key": True,
+        "model": "kimi-k3",
+        "model_options": ["kimi-k3", "kimi-k3.1-pro"],
+        "support_vision": True,
+        "vision_model": "kimi-k3",
+        "vision_model_options": ["kimi-k3", "kimi-k3.1-pro"],
+        "vision_detail_level": "auto",
+    },
+    # Zhipu/Ark model IDs are unconfirmed (Ark also accepts account endpoint IDs); fetch or enter one.
+    "Zhipu": {
+        "base_url": "https://open.bigmodel.cn/api/paas/v4",
+        "require_api_key": True,
+        "model": "",
+        "model_options": [],
+    },
+    "Volcengine Ark": {
+        "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+        "require_api_key": True,
+        "model": "",
+        "model_options": [],
+    },
+    "Groq": {
+        "base_url": "https://api.groq.com/openai/v1",
+        "require_api_key": True,
+        "model": "openai/gpt-oss-120b",
+        "model_options": [
+            "openai/gpt-oss-120b", "openai/gpt-oss-20b",
+            "llama-3.3-70b-versatile", "llama-3.1-8b-instant",
+        ],
+    },
+    "xAI": {
+        "base_url": "https://api.x.ai/v1",
+        "require_api_key": True,
+        "model": "grok-4.7",
+        "model_options": ["grok-4.7", "grok-4.6", "grok-4.5"],
+    },
+}
+
 DEFAULT_TRANSLATION_PROMPT = (
     "Translate faithfully and fluently. Preserve the original meaning, tone, speaker intent, "
     "and formatting as much as possible. Keep names, honorifics, and terminology consistent."
@@ -252,6 +323,32 @@ class LLMProfile(Config):
                         'thinking_level_options', 'support_text', 'support_vision', 'support_image'):
                 data.pop(key, None)
         return data
+
+
+def provider_template_names() -> List[str]:
+    """List built-in API providers followed by optional custom-profile templates."""
+    return list(PROVIDER_DEFAULTS) + list(EXTRA_PROVIDER_TEMPLATES)
+
+
+def profile_from_template(name: str) -> LLMProfile:
+    """Create an independent custom profile without credentials.
+
+    >>> profile = profile_from_template('Moonshot')
+    >>> (profile.name, profile.model, profile.built_in, profile.api_key)
+    ('Moonshot', 'kimi-k3', False, '')
+    >>> profile.id.startswith('custom-')
+    True
+    """
+    if name in PROVIDER_DEFAULTS:
+        defaults = PROVIDER_DEFAULTS[name]
+    elif name in EXTRA_PROVIDER_TEMPLATES:
+        defaults = EXTRA_PROVIDER_TEMPLATES[name]
+    else:
+        raise KeyError(f'Unknown provider template: {name}')
+    data = copy.deepcopy(defaults)
+    # Match the profile panel's existing custom-profile ID format.
+    data.update(id=f'custom-{uuid.uuid4().hex[:10]}', name=name, built_in=False, api_key='')
+    return LLMProfile(**data)
 
 
 def split_image_model_selection(value: str) -> Tuple[str, str]:
