@@ -1,21 +1,31 @@
 import os
-import sys
+from collections.abc import Iterator
+from typing import TYPE_CHECKING
 
 import cv2
 import numpy as np
 import pytest
 
+if TYPE_CHECKING:
+    from qtpy.QtWidgets import QApplication
+
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
-if sys.platform == 'darwin':
-    os.environ.setdefault('QT_FONT_DPI', '72')
 
 
 @pytest.fixture(scope='module', autouse=True)
-def application():
+def application() -> Iterator['QApplication']:
     from qtpy.QtWidgets import QApplication
+    from ballontranslator.utils import shared
 
     app = QApplication.instance() or QApplication([])
-    yield app
+    previous_dpi = shared.LDPI
+    # Like engine bootstrap, match point/pixel conversion to the actual screen.
+    # A shared QApplication has already fixed Qt's DPI for this process.
+    shared.LDPI = app.primaryScreen().logicalDotsPerInch()
+    try:
+        yield app
+    finally:
+        shared.LDPI = previous_dpi
 
 
 def comic_page():
@@ -341,6 +351,30 @@ def test_search_at_old_minimum_fits_without_any_ink_outside_area():
     area = _area_mask(points, _bounds(points))
     h, w = pixels.shape[:2]
     assert not np.any((pixels[..., 3] != 0) & (area[y - 10:y - 10 + h, x - 10:x - 10 + w] == 0))
+
+
+def test_readable_floor_fallback_fits_large_source_font_deterministically() -> None:
+    import copy
+    from ballontranslator.engine.manga_quality import _fit, _area_mask, _bounds
+
+    block = box_block((10, 10, 75, 130), ('天地玄黃宇宙洪荒日月盈昃辰宿列張' * 4)[:35], size=72)
+    repeated = copy.deepcopy(block)
+    points = np.asarray(block.manga_area, np.int32)
+    rendered = _fit(block, points, True)
+    again = _fit(repeated, points, True)
+    assert rendered is not None and again is not None
+    assert 9 <= block.font_size < 72 * .40
+    assert block.letter_spacing == 1.0
+    assert block.fontformat == repeated.fontformat
+    assert block.bounding_rect() == repeated.bounding_rect()
+    pixels, x, y = rendered
+    assert np.array_equal(pixels, again[0]) and (x, y) == again[1:]
+    assert np.any(pixels[..., 3])
+    x1, y1, x2, y2 = _bounds(points)
+    h, w = pixels.shape[:2]
+    assert x1 <= x and y1 <= y and x + w <= x2 and y + h <= y2
+    area = _area_mask(points, (x1, y1, x2, y2), inset=2)
+    assert not np.any((pixels[..., 3] != 0) & (area[y - y1:y - y1 + h, x - x1:x - x1 + w] == 0))
 
 
 def test_readable_floor_withholds_and_keeps_original_pixels():

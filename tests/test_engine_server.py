@@ -30,6 +30,11 @@ class EngineTests(unittest.TestCase):
         cls.enterClassContext(patch.dict(os.environ,
             BALLOONTRANS_ENGINE_CONFIG=str(Path(cls.root.name) / 'config.json')))
         from ballontranslator.engine.bootstrap import bootstrap
+        from qtpy.QtWidgets import QApplication
+        # Qt retains font DPI even after an earlier QApplication is destroyed.
+        # closingDown distinguishes that case from the first app in a process.
+        cls.bootstrap_created_first_application = (
+            QApplication.instance() is None and not QApplication.closingDown())
         cls.app, cls.window = bootstrap()
         from ballontranslator.engine.server import Server
         from ballontranslator.engine.transport import Writer
@@ -472,7 +477,9 @@ class EngineTests(unittest.TestCase):
             self.assertTrue(28 <= height <= 45)
             self.assertLess(other_height, height)
             self.assertEqual(rich_height, height)
-            self.assertEqual(round(dpi), 72 if sys.platform == 'darwin' else round(self.app.primaryScreen().logicalDotsPerInch()))
+            self.assertEqual(dpi, self.app.primaryScreen().logicalDotsPerInch())
+            if sys.platform == 'darwin' and self.bootstrap_created_first_application:
+                self.assertEqual(round(dpi), 72)
         finally:
             shared.LDPI = dpi
 
