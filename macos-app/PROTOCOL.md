@@ -128,3 +128,18 @@ keeping file names. Text exports write one file into `destination`.
 ## Error codes
 
 `bad_request`, `not_found`, `busy`, `no_project`, `translator_not_ready`, `internal`.
+
+## Engine notes
+
+- On macOS the engine pins Qt's offscreen font DPI to 72 and sets `shared.LDPI`
+  from that screen. Both sides of the px/pt conversion must agree; changing only
+  `LDPI` changes glyph size. This matches the normal Cocoa 72-DPI point convention
+  and preserves GUI HTML point sizes. Projects authored with a custom GUI `--ldpi`
+  or on another platform carry no originating DPI metadata; identical rich-text
+  sizing across those environments cannot be inferred automatically.
+- `models_ready` checks declared dependencies and local model-file presence without
+  loading models. File integrity is verified by the existing preparation path on
+  `run`. Raw provider exception text is omitted from protocol errors and logs.
+- `revision` counts successful engine image writes within the current open project;
+  opening a project starts a new revision sequence. Cancellation waits for active
+  inference or package installation to leave its worker before `run_finished`.
