@@ -469,6 +469,19 @@ MANGA_LINE_MIN_CONFIDENCE = .75
 MANGA_RETRY_CONFIDENCE = .9
 
 
+def symbols_only(block: TextBlock) -> bool:
+    """Keep punctuation/symbol lettering intact, without hiding empty OCR.
+
+    >>> symbols_only(TextBlock(text=['…… !? — ♡']))
+    True
+    >>> any(symbols_only(TextBlock(text=[s])) for s in ('', 'あ…', '1!'))
+    False
+    """
+    # get_text() strips list-backed whitespace; distinguish it from empty OCR.
+    source = block.text if isinstance(block.text, str) else ''.join(block.text)
+    return bool(source) and not any(char.isalnum() for char in source)
+
+
 def source_review(block: TextBlock) -> str | None:
     if block.manga_keep_original:
         return 'protected'
@@ -1266,6 +1279,9 @@ def compose_page(
         block.manga_background_luminance = block.manga_background_spread = None
         block.manga_outline_applied = block.manga_backing_applied = False
         block.manga_review = source_review(block)
+        symbol_source = symbols_only(block)
+        if not block.manga_keep_original and symbol_source:
+            block.manga_review = 'skipped'
         points = _polygon(block, valid.shape)
         inside_bubble = _inside_bubble(block, valid.shape)
         if block.manga_review == 'unreadable' and not inside_bubble:
@@ -1273,7 +1289,7 @@ def compose_page(
         if block.manga_review is None and block.manga_erase_failed:
             block.manga_review = 'geometry'
         region = _region_ink(block, valid, inside_bubble=inside_bubble)
-        if block.manga_review == 'skipped':
+        if block.manga_review == 'skipped' and not symbol_source:
             # An unreadable art detection has no source ink to reserve. Its
             # expanded box can otherwise borrow a neighbouring bubble's mask
             # and veto that bubble's independently verified white repair.
