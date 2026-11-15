@@ -51,6 +51,7 @@ from .llm_modality import (
 from .page_range_progress import PageRangeProgressWidget, PageRangeSpinBox
 from .custom_widget import ExpandingToolButton
 from .custom_widget.combobox import BottomBorderComboBox
+from ballontranslator.utils import shared
 from ballontranslator.utils.config import (
     LLMGlossaryMode,
     LLMTranslateContext,
@@ -439,14 +440,19 @@ class RunPipelineDialog(QDialog):
 
         self.run_button = QPushButton(self.tr('Run'), surface)
         self.run_button.setObjectName('RunPipelinePrimaryButton')
+        self.run_button.setDefault(True)
         self.run_button.clicked.connect(self._finish_run)
 
         self.continue_button = QPushButton(self.tr('Continue'), surface)
         self.continue_button.setObjectName('RunPipelineSecondaryButton')
-        self.continue_button.setDefault(True)
         self.continue_button.clicked.connect(self._finish_continue)
-        button_row.addWidget(self.run_button)
-        button_row.addWidget(self.continue_button)
+        if shared.ON_MACOS:
+            # macOS places the default button last.
+            button_row.addWidget(self.continue_button)
+            button_row.addWidget(self.run_button)
+        else:
+            button_row.addWidget(self.run_button)
+            button_row.addWidget(self.continue_button)
 
         self.render_button = QPushButton(self.tr('Render'), surface)
         self.render_button.setObjectName('RunPipelinePrimaryButton')
@@ -530,6 +536,9 @@ class RunPipelineDialog(QDialog):
         return event.globalPos()
 
     def _resize_edges(self, global_pos):
+        if shared.ON_MACOS:
+            # Frameless edge resize is unavailable here; keep edge clicks live.
+            return Qt.Edge(0)
         pos = self.mapFromGlobal(global_pos)
         edges = Qt.Edge(0)
         if pos.x() < self.RESIZE_BORDER_WIDTH:
@@ -1593,7 +1602,7 @@ class RunPipelineDialog(QDialog):
         self.continue_button.setVisible(not rendering)
         self.render_button.setVisible(rendering)
         self.render_button.setDefault(rendering)
-        self.continue_button.setDefault(not rendering)
+        self.run_button.setDefault(not rendering)
         self._fit_to_current_workflow()
 
     def _on_render_without_text_style_update_changed(self, checked: bool):

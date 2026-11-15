@@ -48,6 +48,7 @@ from ballontranslator.ui.text_engine.pipeline_formatting import (
     AutoTateChuYokoThread,
     apply_auto_tate_chu_yoko,
 )
+from ballontranslator.utils import shared
 from ballontranslator.utils.config import (
     AutoTateChuYokoConfig,
     LLMTranslateContext,
@@ -544,7 +545,8 @@ class RunPipelineDialogTests(unittest.TestCase):
         progress.set_range(1, 4)
         self.assertEqual(range_start.value(), 1)
         self.assertEqual(range_end.value(), 4)
-        self.assertTrue(dialog.continue_button.isDefault())
+        self.assertTrue(dialog.run_button.isDefault())
+        self.assertFalse(dialog.continue_button.isDefault())
         self.assertFalse(dialog.run_button.isHidden())
         self.assertFalse(dialog.continue_button.isHidden())
         self.assertTrue(dialog.render_button.isHidden())
@@ -1057,7 +1059,11 @@ class RunPipelineDialogTests(unittest.TestCase):
                 pos=QPoint(1, dialog.height() // 2),
             )
             self.app.processEvents()
-            start_resize.assert_called_once()
+            if shared.ON_MACOS:
+                # Edge presses stay ordinary clicks without frameless resize.
+                start_resize.assert_not_called()
+            else:
+                start_resize.assert_called_once()
 
         dialog.close()
         self.assertFalse(dialog._app_event_filter_installed)
@@ -1081,7 +1087,10 @@ class RunPipelineDialogTests(unittest.TestCase):
                 pass
 
         owner = SimpleNamespace(
-            imgtrans_proj=SimpleNamespace(is_all_pages_no_text=True),
+            imgtrans_proj=SimpleNamespace(
+                is_all_pages_no_text=True,
+                is_empty=False,
+            ),
             on_run_imgtrans=lambda **kwargs: calls.append(kwargs),
             module_manager=SimpleNamespace(
                 translator_metadata=lambda: {},
@@ -1191,18 +1200,18 @@ class RunPipelineDialogTests(unittest.TestCase):
             [action.text() for action in title_bar.sponsorToolBtn.menu().actions()],
             ['Patreon', 'Afdian'],
         )
-        self.assertTrue(
-            {
-                action.text()
-                for action in title_bar.toolsToolBtn.menu().actions()
-                if not action.isSeparator()
-            }.issuperset({
-                '区域合并工具',
-                'Photoshop Bridge',
-                'Path Reorder',
-                'Font Exclusion',
-            })
-        )
+        tool_texts = {
+            action.text()
+            for action in title_bar.toolsToolBtn.menu().actions()
+            if not action.isSeparator()
+        }
+        self.assertTrue(tool_texts.issuperset({
+            'Region Merge Tool',
+            'Path Reorder',
+            'Font Exclusion',
+        }))
+        # The bridge depends on Windows-only APIs and is not offered on macOS.
+        self.assertEqual('Photoshop Bridge' in tool_texts, not shared.ON_MACOS)
         self.assertTrue(hasattr(title_bar, 'font_exclusion_trigger'))
         with patch(
             'ballontranslator.ui.mainwindowbars.QDesktopServices.openUrl'

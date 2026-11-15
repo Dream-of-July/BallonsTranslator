@@ -1,5 +1,5 @@
 import os.path as osp
-from typing import List, Union
+from typing import List, Optional, Union
 
 from qtpy.QtWidgets import (
     QCheckBox,
@@ -46,6 +46,18 @@ if shared.FLAG_QT6:
     from qtpy.QtGui import QAction
 else:
     from qtpy.QtWidgets import QAction
+
+
+def _native_shortcut_text(shortcut: str) -> str:
+    """Return a portable shortcut as the platform displays it.
+
+    >>> _native_shortcut_text('F5')
+    'F5'
+    """
+    return QKeySequence(shortcut).toString(
+        QKeySequence.SequenceFormat.NativeText
+    )
+
 
 class ShowPageListChecker(QCheckBox):
     ...
@@ -109,14 +121,19 @@ class LeftBar(Widget):
 
         self.globalSearchChecker = QCheckBox()
         self.globalSearchChecker.setObjectName('GlobalSearchChecker')
-        self.globalSearchChecker.setToolTip(self.tr('Global Search (Ctrl+G)'))
+        # The translated source string embeds the portable shortcut name.
+        self.globalSearchChecker.setToolTip(
+            self.tr('Global Search (Ctrl+G)').replace(
+                'Ctrl+G', _native_shortcut_text('Ctrl+G')
+            )
+        )
 
         self.configChecker = StateChecker('config', uncheckable=True)
         self.configChecker.setObjectName('ConfigChecker')
         self.configChecker.checked.connect(self.configCheckerChanged)
         self.configChecker.unchecked.connect(self.configCheckerChanged)
 
-        actionOpenFolder = QAction(self.tr("Open Folder ..."), self)
+        self.openFolderAction = actionOpenFolder = QAction(self.tr("Open Folder ..."), self)
         actionOpenFolder.triggered.connect(self.onOpenFolder)
         actionOpenFolder.setShortcut(QKeySequence.Open)
 
@@ -148,7 +165,7 @@ class LeftBar(Widget):
         self.openBtn = OpenBtn()
         self.openBtn.setFixedSize(LEFTBTN_WIDTH, LEFTBTN_WIDTH)
 
-        openMenu = QMenu(self.openBtn)
+        self.fileMenu = openMenu = QMenu(self.openBtn)
         # Keep submenu ownership aligned with the visual popup chain for Wayland.
         self.recentMenu = QMenu(self.tr("Open Recent"), openMenu)
         openMenu.addActions([actionOpenFolder, actionOpenProj])
@@ -172,10 +189,22 @@ class LeftBar(Widget):
         self.runImgtransBtn.setIcon(QIcon(themed_icon_path('run.svg')))
         self.runImgtransBtn.setIconSize(QSize(LEFTBTN_WIDTH + 3, LEFTBTN_WIDTH + 3))
         self.runImgtransBtn.setFixedSize(LEFTBTN_WIDTH + 4, LEFTBTN_WIDTH + 4)
-        self.runImgtransBtn.setToolTip('{} (F5)'.format(self.tr('Run')))
+        run_shortcuts = ['Ctrl+R', 'F5'] if shared.ON_MACOS else ['F5']
+        self.runImgtransBtn.setToolTip('{} ({})'.format(
+            self.tr('Run'), _native_shortcut_text(run_shortcuts[0])
+        ))
         self.runImgtransBtn.setAccessibleName(self.tr('Run'))
-        self.runImgtransBtn.setShortcut(QKeySequence('F5'))
         self.runImgtransBtn.clicked.connect(self.run_imgtrans_clicked.emit)
+        self.runAction: Optional[QAction] = None
+        if shared.ON_MACOS:
+            # A button holds one shortcut; the menu-bar action carries both.
+            self.runAction = QAction(self.tr('Run'), self)
+            self.runAction.setShortcuts(
+                [QKeySequence(shortcut) for shortcut in run_shortcuts]
+            )
+            self.runAction.triggered.connect(self.run_imgtrans_clicked)
+        else:
+            self.runImgtransBtn.setShortcut(QKeySequence(run_shortcuts[0]))
         
         vlayout = QVBoxLayout(self)
         vlayout.addWidget(self.openBtn)
@@ -325,7 +354,7 @@ class TitleBar(Widget):
         replaceOCRkeyword = QAction(self.tr("Keyword substitution for source text"), self)
         self.replaceOCRkeyword_trigger = replaceOCRkeyword.triggered
 
-        editMenu = QMenu(self.editToolBtn)
+        self.editMenu = editMenu = QMenu(self.editToolBtn)
         editMenu.addActions([undoAction, redoAction])
         editMenu.addSeparator()
         editMenu.addActions([pageSearchAction, globalSearchAction, replaceOCRkeyword, replacePreMTkeyword, replaceMTkeyword])
@@ -397,7 +426,7 @@ class TitleBar(Widget):
         # prevPageAction.setShortcuts([QKeySequence.StandardKey.MoveToPreviousPage, QKeySequence('A')])
         nextPageAction = QAction(self.tr('Next Page'), self)
         # nextPageAction.setShortcuts([QKeySequence.StandardKey.MoveToNextPage, QKeySequence('D')])
-        goMenu = QMenu(self.goToolBtn)
+        self.goMenu = goMenu = QMenu(self.goToolBtn)
         goMenu.addActions([prevPageAction, nextPageAction])
         self.goToolBtn.setMenu(goMenu)
         self.goToolBtn.setPopupMode(QToolButton.InstantPopup)
@@ -409,7 +438,7 @@ class TitleBar(Widget):
         self.toolsToolBtn.setText(self.tr('Tools'))
         
         # Merge Tool
-        mergeToolAction = QAction('区域合并工具', self)
+        mergeToolAction = QAction(self.tr('Region Merge Tool'), self)
         mergeToolAction.setShortcut(QKeySequence('Ctrl+Shift+M'))
         self.merge_tool_trigger = mergeToolAction.triggered
 
@@ -425,9 +454,11 @@ class TitleBar(Widget):
         fontExclusionAction = QAction(self.tr('Font Exclusion'), self)
         self.font_exclusion_trigger = fontExclusionAction.triggered
         
-        toolsMenu = QMenu(self.toolsToolBtn)
+        self.toolsMenu = toolsMenu = QMenu(self.toolsToolBtn)
         toolsMenu.addAction(mergeToolAction)
-        toolsMenu.addAction(psBridgeAction)
+        if not shared.ON_MACOS:
+            # The bridge drives Photoshop through Windows-only APIs.
+            toolsMenu.addAction(psBridgeAction)
         toolsMenu.addAction(self.path_reorder_action)
         toolsMenu.addSeparator()
         toolsMenu.addAction(fontExclusionAction)
@@ -462,10 +493,7 @@ class TitleBar(Widget):
         self.sponsorToolBtn.setPopupMode(QToolButton.InstantPopup)
 
         self.iconLabel = QLabel(self)
-        if not shared.ON_MACOS:
-            self.iconLabel.setFixedWidth(LEFTBAR_WIDTH - 12)
-        else:
-            self.iconLabel.setFixedWidth(LEFTBAR_WIDTH + 8)
+        self.iconLabel.setFixedWidth(LEFTBAR_WIDTH - 12)
 
         self.titleLabel = QLabel('BallonTranslator')
         self.titleLabel.setObjectName('TitleLabel')
@@ -582,6 +610,13 @@ class TitleBar(Widget):
         if self.save_state != '':
             title += ' - '  + self.save_state
         self.titleLabel.setText(title)
+        if shared.ON_MACOS:
+            # The custom bar is hidden; the system title bar shows the state.
+            self.mainwindow.setWindowTitle(' - '.join(
+                part
+                for part in (self.proj_name, self.page_name, self.save_state)
+                if part
+            ))
 
 
 

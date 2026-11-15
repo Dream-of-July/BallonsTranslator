@@ -353,7 +353,7 @@ class BulkPageSummaryDialog(OutsideClickFramelessMixin, FramelessWindow):
         opaque_frame = ON_WINDOWS or ON_MACOS
         self.setObjectName('BulkPageSummaryDialog')
         self.setProperty('opaqueFrame', opaque_frame)
-        self.setProperty('nativeFrame', ON_WINDOWS)
+        self.setProperty('nativeFrame', ON_WINDOWS or ON_MACOS)
         self.setWindowTitle(self.tr('Page Summaries'))
         self.setWindowModality(Qt.WindowModality.NonModal)
         self.setMinimumSize(620, 440)
@@ -363,8 +363,6 @@ class BulkPageSummaryDialog(OutsideClickFramelessMixin, FramelessWindow):
             self.setAttribute(widget_attribute.WA_TranslucentBackground)
         self.setAttribute(widget_attribute.WA_StyledBackground)
         self.setAttribute(widget_attribute.WA_DeleteOnClose)
-        if ON_MACOS:
-            self.windowEffect.removeShadowEffect(self.winId())
 
         self._project = project
         self._push_command = push_command
@@ -398,6 +396,9 @@ class BulkPageSummaryDialog(OutsideClickFramelessMixin, FramelessWindow):
         self.close_button.clicked.connect(self.close)
         title_layout.addWidget(self.close_button)
         layout.addWidget(self.title_bar)
+        if ON_MACOS:
+            # The system title bar already carries the title and close button.
+            self.title_bar.hide()
 
         self.editor = PageSummaryMarkdownEditor(surface)
         self.editor.setPlainText(page_summary_markdown(project))

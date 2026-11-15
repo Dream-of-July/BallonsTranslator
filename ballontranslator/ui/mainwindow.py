@@ -7,8 +7,8 @@ from functools import partial
 import time
 
 from tqdm import tqdm
-from qtpy.QtWidgets import QAction, QFileDialog, QMenu, QHBoxLayout, QVBoxLayout, QApplication, QStackedWidget, QSplitter, QListWidget, QShortcut, QListWidgetItem, QMessageBox, QTextEdit, QPlainTextEdit, QDialog, QWidget, QColorDialog
-from qtpy.QtCore import Qt, QPoint, QSize, QEvent, Signal, QTimer
+from qtpy.QtWidgets import QAction, QFileDialog, QMenu, QHBoxLayout, QVBoxLayout, QApplication, QStackedWidget, QSplitter, QListWidget, QShortcut, QListWidgetItem, QMenuBar, QMessageBox, QTextEdit, QPlainTextEdit, QDialog, QWidget, QColorDialog
+from qtpy.QtCore import Qt, QByteArray, QPoint, QRect, QSize, QEvent, Signal, QTimer
 from qtpy.QtGui import QContextMenuEvent, QTextCursor, QGuiApplication, QIcon, QCloseEvent, QKeySequence, QPainter, QClipboard, QColor
 
 from ballontranslator.utils.logger import logger as LOGGER
@@ -36,6 +36,7 @@ from ballontranslator.utils.config import (
     text_styles,
 )
 from ballontranslator.utils.proj_imgtrans import ProjImgTrans
+from ballontranslator.utils.version import APP_VERSION
 from .canvas import Canvas
 from .configpanel import ConfigPanel
 from .module_manager import ModuleManager
@@ -120,6 +121,11 @@ class PageListView(QListWidget):
 
 mainwindow_cls = Widget if shared.HEADLESS else FramelessWindow
 
+MAC_MIN_WINDOW_WIDTH = 960
+MAC_DEFAULT_WINDOW_SIZE = QSize(1440, 900)
+# Cmd+Q quits on macOS; Control+Q keeps the same physical keys there.
+CAPITALIZE_SHORTCUT = 'Meta+Q' if shared.ON_MACOS else 'Ctrl+Q'
+
 
 class MainWindow(mainwindow_cls):
 
@@ -171,7 +177,11 @@ class MainWindow(mainwindow_cls):
         self.setupConfig()
         self.setupShortcuts()
         self.setupRegisterWidget()
-        if not shared.ON_WINDOWS:
+        if shared.ON_MACOS:
+            if not shared.HEADLESS:
+                self.setupMacMenuBar()
+            self.restoreMacWindowGeometry()
+        elif not shared.ON_WINDOWS:
             FramelessMoveResize.toggleMaxState(self)
         self.setAcceptDrops(True)
 
@@ -185,11 +195,6 @@ class MainWindow(mainwindow_cls):
 
         if shared.HEADLESS:
             self.run_batch(**exec_args)
-
-        if shared.ON_MACOS:
-            # https://bugreports.qt.io/browse/QTBUG-133215
-            self.hideSystemTitleBar()
-            self.showMaximized()
 
         show_release_info = exec_args.get('show_release_info', False)
         if not shared.HEADLESS and (show_release_info or pcfg.check_update_on_startup):
@@ -249,7 +254,10 @@ class MainWindow(mainwindow_cls):
 
     def setupUi(self):
         screen_size = QGuiApplication.primaryScreen().geometry().size()
-        self.setMinimumWidth(screen_size.width() // 2)
+        if shared.ON_MACOS:
+            self.setMinimumWidth(min(MAC_MIN_WINDOW_WIDTH, screen_size.width()))
+        else:
+            self.setMinimumWidth(screen_size.width() // 2)
         self.configPanel = ConfigPanel(self)
         self.configPanel.show_pre_MT_keyword_window.connect(
             self.show_pre_MT_keyword_window
@@ -381,7 +389,12 @@ class MainWindow(mainwindow_cls):
         self.centralStackWidget.addWidget(self.comicTransSplitter)
 
         mainVBoxLayout = QVBoxLayout(self)
-        mainVBoxLayout.addWidget(self.titleBar)
+        if shared.ON_MACOS:
+            # The system title bar and menu bar replace the custom bar, which
+            # still owns the menu actions.
+            self.titleBar.hide()
+        else:
+            mainVBoxLayout.addWidget(self.titleBar)
         mainVBoxLayout.addLayout(mainHLayout)
         mainVBoxLayout.addWidget(self.bottomBar)
         margin = mainVBoxLayout.contentsMargins()
@@ -643,6 +656,108 @@ class MainWindow(mainwindow_cls):
     def setupConfigUI(self) -> None:
         self.configPanel.showConfigDialog()
 
+    def setupMacMenuBar(self) -> None:
+        """Expose the bar menus through the macOS system menu bar."""
+        # Parentless, so Qt shows it for every window, including Settings.
+        self.macMenuBar = menubar = QMenuBar(None)
+        self.destroyed.connect(menubar.deleteLater)
+
+        title_bar = self.titleBar
+        file_menu = self.leftBar.fileMenu
+        file_menu.setTitle(self.tr('File'))
+        for menu, button in (
+            (title_bar.editMenu, title_bar.editToolBtn),
+            (title_bar.viewMenu, title_bar.viewToolBtn),
+            (title_bar.goMenu, title_bar.goToolBtn),
+            (title_bar.toolsMenu, title_bar.toolsToolBtn),
+        ):
+            menu.setTitle(button.text())
+        tools_menu = title_bar.toolsMenu
+        first_tool = tools_menu.actions()[0]
+        tools_menu.insertAction(first_tool, self.leftBar.runAction)
+        tools_menu.insertSeparator(first_tool)
+
+        window_menu = QMenu(self.tr('Window'), menubar)
+        minimize_action = window_menu.addAction(self.tr('Minimize'))
+        minimize_action.setShortcut(QKeySequence('Ctrl+M'))
+        minimize_action.triggered.connect(self.on_window_minimize)
+        zoom_action = window_menu.addAction(self.tr('Zoom'))
+        zoom_action.triggered.connect(self.on_window_zoom)
+        window_menu.addSeparator()
+        close_action = window_menu.addAction(self.tr('Close'))
+        close_action.setShortcut(QKeySequence('Ctrl+W'))
+        close_action.triggered.connect(self.on_window_close)
+
+        help_menu = QMenu(self.tr('Help'), menubar)
+        help_menu.addActions([
+            title_bar.patreonSponsorAction,
+            title_bar.afdianSponsorAction,
+        ])
+        # macOS moves the role actions below into the application menu.
+        about_action = help_menu.addAction(self.tr('About'))
+        about_action.setMenuRole(QAction.MenuRole.AboutRole)
+        about_action.triggered.connect(self.on_about)
+        settings_action = help_menu.addAction(self.tr('Settings…'))
+        settings_action.setMenuRole(QAction.MenuRole.PreferencesRole)
+        settings_action.setShortcut(QKeySequence('Ctrl+,'))
+        settings_action.triggered.connect(self.setupConfigUI)
+        quit_action = help_menu.addAction(self.tr('Quit'))
+        quit_action.setMenuRole(QAction.MenuRole.QuitRole)
+        quit_action.setShortcut(QKeySequence('Ctrl+Q'))
+        quit_action.triggered.connect(self.on_closebtn_clicked)
+
+        for menu in (
+            file_menu,
+            title_bar.editMenu,
+            title_bar.viewMenu,
+            title_bar.goMenu,
+            tools_menu,
+            window_menu,
+            help_menu,
+        ):
+            menubar.addMenu(menu)
+            # The bar buttons that carried these shortcuts are hidden.
+            self.addActions(menu.actions())
+
+    def restoreMacWindowGeometry(self) -> None:
+        saved = pcfg.window_geometry
+        if saved:
+            geometry = QByteArray.fromBase64(saved.encode('ascii', 'ignore'))
+            if self.restoreGeometry(geometry):
+                return
+            LOGGER.warning('Discard invalid window_geometry config.')
+        available = QGuiApplication.primaryScreen().availableGeometry()
+        frame = QRect(
+            QPoint(),
+            MAC_DEFAULT_WINDOW_SIZE.boundedTo(available.size() * 0.9),
+        )
+        frame.moveCenter(available.center())
+        self.setGeometry(frame)
+
+    def _active_window(self) -> QWidget:
+        return QApplication.activeWindow() or self
+
+    def on_window_minimize(self) -> None:
+        self._active_window().showMinimized()
+
+    def on_window_zoom(self) -> None:
+        window = self._active_window()
+        if window.isMaximized():
+            window.showNormal()
+        else:
+            window.showMaximized()
+
+    def on_window_close(self) -> None:
+        window = self._active_window()
+        if window is self:
+            self.on_closebtn_clicked()
+        else:
+            window.close()
+
+    def on_about(self) -> None:
+        name = QApplication.applicationName()
+        QMessageBox.about(self, name, f'{name} {APP_VERSION}')
+
     def on_llm_context_project_changed(self) -> None:
         """Join editor changes to the window's normal project-save flow."""
         if self._llm_context_dirty:
@@ -802,6 +917,8 @@ class MainWindow(mainwindow_cls):
             )
             self.canvas.clear_undostack(update_saved_step=True)
             self.titleBar.setTitleContent(osp.basename(directory))
+            if shared.ON_MACOS:
+                self.setWindowFilePath(directory)
             self.updatePageList()
             self._llm_context_dirty = False
             self.opening_dir = False
@@ -849,6 +966,8 @@ class MainWindow(mainwindow_cls):
             self.leftBar.updateRecentProjList(self.imgtrans_proj.proj_path)
             self.updatePageList()
             self.titleBar.setTitleContent(osp.basename(self.imgtrans_proj.proj_path))
+            if shared.ON_MACOS:
+                self.setWindowFilePath(self.imgtrans_proj.proj_path)
             self._llm_context_dirty = False
             self.opening_dir = False
         except Exception as e:
@@ -918,6 +1037,10 @@ class MainWindow(mainwindow_cls):
         self.st_manager.blockSignals(True)
         self.canvas.prepareClose()
         pcfg.custom_colors = _current_custom_colors()
+        if shared.ON_MACOS and not shared.HEADLESS:
+            pcfg.window_geometry = bytes(
+                self.saveGeometry().toBase64()
+            ).decode('ascii')
         self.save_config()
         return super().closeEvent(event)
 
@@ -934,7 +1057,7 @@ class MainWindow(mainwindow_cls):
     def retranslateUI(self):
         # according to https://stackoverflow.com/questions/27635068/how-to-retranslate-dynamically-created-widgets
         # we got to do it manually ... I'd rather restart the program
-        msg = QMessageBox()
+        msg = QMessageBox(self)
         msg.setText(self.tr('Restart to apply changes? \n'))
         msg.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         ret = msg.exec_()
@@ -1058,7 +1181,7 @@ class MainWindow(mainwindow_cls):
         shortcutItalic.activated.connect(self.shortcutItalic)
         shortcutUnderline = QShortcut(QKeySequence.StandardKey.Underline, self)
         shortcutUnderline.activated.connect(self.shortcutUnderline)
-        shortcutCapitalize = QShortcut(QKeySequence("Ctrl+Q"), self)
+        shortcutCapitalize = QShortcut(QKeySequence(CAPITALIZE_SHORTCUT), self)
         shortcutCapitalize.activated.connect(
             self.st_manager.capitalize_selected_textitems
         )
@@ -2124,6 +2247,8 @@ class MainWindow(mainwindow_cls):
             return
         save_state = self.tr('unsaved') if unsaved else self.tr('saved')
         self.titleBar.setTitleContent(save_state=save_state)
+        if shared.ON_MACOS:
+            self.setWindowModified(unsaved)
 
     def on_textstack_changed(self):
         if not self.page_changing:
@@ -2183,6 +2308,11 @@ class MainWindow(mainwindow_cls):
             msgbox = self.module_manager.progress_msgbox
         if hasattr(msgbox, 'fit_to_content'):
             msgbox.fit_to_content()
+        if shared.ON_MACOS:
+            geometry = msgbox.frameGeometry()
+            geometry.moveCenter(self.frameGeometry().center())
+            msgbox.move(geometry.topLeft())
+            return
         msg_size = msgbox.size()
         size = self.size()
         p = self.mapToGlobal(QPoint(size.width() - msg_size.width(),
@@ -2192,7 +2322,7 @@ class MainWindow(mainwindow_cls):
     def on_closebtn_clicked(self):
         if self.imsave_thread.isRunning():
             self.imsave_thread.finished.connect(self.close)
-            mb = FrameLessMessageBox()
+            mb = FrameLessMessageBox(self)
             mb.setText(self.tr('Saving image...'))
             self.imsave_thread.finished.connect(mb.close)
             mb.exec()
@@ -2204,7 +2334,28 @@ class MainWindow(mainwindow_cls):
             pcfg.display_lang = lang
             self.set_display_lang(lang)
     
+    def _prompt_open_folder_for_run(self) -> None:
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.Icon.Information)
+        msg.setWindowTitle(self.tr('Run'))
+        msg.setText(self.tr('Open a folder of images first.'))
+        open_button = msg.addButton(
+            self.leftBar.openFolderAction.text(),
+            QMessageBox.ButtonRole.AcceptRole,
+        )
+        msg.addButton(QMessageBox.StandardButton.Cancel)
+        try:
+            msg.exec()
+            open_requested = msg.clickedButton() is open_button
+        finally:
+            msg.deleteLater()
+        if open_requested:
+            self.leftBar.openFolderAction.trigger()
+
     def run_imgtrans(self) -> None:
+        if self.imgtrans_proj.is_empty:
+            self._prompt_open_folder_for_run()
+            return
         dialog = RunPipelineDialog(
             self,
             project=self.imgtrans_proj,
@@ -2312,6 +2463,7 @@ class MainWindow(mainwindow_cls):
             ]
         )
         if has_explicit_range and not requested_pages and not render_only:
+            create_info_dialog(self.tr('No pages in the selected range.'))
             return
 
         pipeline_pages = None
@@ -2322,6 +2474,9 @@ class MainWindow(mainwindow_cls):
                 if not self.imgtrans_proj.get_page_progress(page_name)
             ]
             if not pipeline_pages:
+                create_info_dialog(self.tr(
+                    'Every page is already processed. Choose Run to process them again.'
+                ))
                 return
             requested_pages = pipeline_pages
         elif not render_only:
@@ -2500,7 +2655,7 @@ class MainWindow(mainwindow_cls):
             self._set_left_panel_content(None)
 
     def on_fin_export_doc(self):
-        msg = QMessageBox()
+        msg = QMessageBox(self)
         msg.setText(self.tr('Export to ') + self.imgtrans_proj.doc_path())
         msg.exec_()
 
@@ -2603,7 +2758,7 @@ class MainWindow(mainwindow_cls):
         try:
             if exception_type != '':
                 shared.showed_exception.add(exception_type)
-            err = QMessageBox()
+            err = QMessageBox(self)
             err.setText(error_msg)
             err.setDetailedText(detail_traceback)
             err.exec()
@@ -2617,7 +2772,7 @@ class MainWindow(mainwindow_cls):
 
     def on_create_infodialog(self, info_dict: dict):
         QMessageBox.StandardButton.NoButton
-        dialog = MessageBox(**info_dict)
+        dialog = MessageBox(parent=self, **info_dict)
         dialog.show()   # exec_ will block main thread
 
     def on_show_llm_key_dialog(self, profile_id: str, profile_name: str):

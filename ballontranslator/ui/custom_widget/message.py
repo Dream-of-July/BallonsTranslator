@@ -18,7 +18,8 @@ class MessageBox(QMessageBox):
         add_to_runtime_widget_set(self)
 
         if frame_less:
-            self.setWindowFlags(Qt.WindowType.FramelessWindowHint)
+            # Keep the dialog type so a parented box stays a separate window.
+            self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint)
         if modal:
             self.setModal(modal)
         if btn_type is not None:
@@ -122,7 +123,8 @@ class TaskProgressBar(Widget):
 class FrameLessMessageBox(QMessageBox):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        self.setWindowFlags(Qt.WindowType.FramelessWindowHint)
+        # Keep the dialog type so a parented box stays a separate window.
+        self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint)
         
 
 class ProgressMessageBox(QDialog):

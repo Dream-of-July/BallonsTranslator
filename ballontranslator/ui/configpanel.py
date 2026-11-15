@@ -714,15 +714,13 @@ class ConfigPanel(OutsideClickFramelessMixin, FramelessWindow):
         # QNSWindow composites a transparent outer inset as an opaque black band.
         opaque_frame = ON_WINDOWS or ON_MACOS
         self.setProperty('opaqueFrame', opaque_frame)
-        self.setProperty('nativeFrame', ON_WINDOWS)
+        self.setProperty('nativeFrame', ON_WINDOWS or ON_MACOS)
         self.setWindowTitle(self.tr('Settings'))
         self.setWindowModality(Qt.WindowModality.NonModal)
         widget_attribute = getattr(Qt, 'WidgetAttribute', Qt)
         if not opaque_frame:
             self.setAttribute(widget_attribute.WA_TranslucentBackground)
         self.setAttribute(widget_attribute.WA_StyledBackground)
-        if ON_MACOS:
-            self.windowEffect.removeShadowEffect(self.winId())
         self.resize(900, 720)
         self.setMinimumSize(720, 520)
         self.configTable = ConfigTable()
@@ -1399,7 +1397,7 @@ class ConfigPanel(OutsideClickFramelessMixin, FramelessWindow):
 
         window_layout = QVBoxLayout(surface)
         window_layout.setSpacing(0)
-        window_layout.setContentsMargins(6, 0, 6, 6)
+        window_layout.setContentsMargins(6, 6 if ON_MACOS else 0, 6, 6)
 
         self.title_bar = QWidget(surface)
         self.title_bar.setObjectName('ConfigPanelTitleBar')
@@ -1423,6 +1421,9 @@ class ConfigPanel(OutsideClickFramelessMixin, FramelessWindow):
         title_layout.addWidget(self.close_button, 0, 2)
 
         window_layout.addWidget(self.title_bar)
+        if ON_MACOS:
+            # The system title bar already carries the title and close button.
+            self.title_bar.hide()
         window_layout.addWidget(splitter, 1)
 
         self.configTable.expandAll()
@@ -1788,6 +1789,11 @@ class ConfigPanel(OutsideClickFramelessMixin, FramelessWindow):
             self.llm_profiles_panel.collapseProfiles()
         self.save_config.emit()
         return super().hideEvent(e)
+
+    def _install_outside_click_filter(self) -> None:
+        # On macOS this is an ordinary Settings window, not a transient popup.
+        if not ON_MACOS:
+            super()._install_outside_click_filter()
 
     def _preserve_on_outside_click(self) -> bool:
         return self._activeWidgetInWhitelist()

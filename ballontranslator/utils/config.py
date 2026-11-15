@@ -480,6 +480,8 @@ class ProgramConfig(Config):
     expand_ttransform_panel: bool = True
     excluded_fonts: List[str] = field(default_factory=list)
     custom_colors: List[str] = field(default_factory=list)
+    # Base64 QWidget.saveGeometry() of the main window; written on macOS only.
+    window_geometry: str = ''
 
     @staticmethod
     def load(cfg_path: str):
@@ -532,6 +534,12 @@ class ProgramConfig(Config):
                         'Discard invalid or duplicate entries in excluded_fonts config.'
                     )
                 config_dict['excluded_fonts'] = normalized_fonts
+
+        if not isinstance(config_dict.get('window_geometry', ''), str):
+            LOGGER.warning(
+                'Discard invalid window_geometry config: expected a string.'
+            )
+            config_dict.pop('window_geometry')
 
         if 'custom_colors' in config_dict:
             custom_colors = config_dict['custom_colors']

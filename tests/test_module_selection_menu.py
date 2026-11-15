@@ -52,6 +52,9 @@ class SelectionWindow(QWidget):
     def __init__(self) -> None:
         super().__init__()
         self.imgtrans_proj = ProjImgTrans()
+        # RUN only opens its dialog for a project that has pages.
+        self.imgtrans_proj.pages['001.png'] = []
+        self.imgtrans_proj._image_info['001.png'] = {'finish_code': 0}
         self.module_manager = ModuleManager(self.imgtrans_proj, self)
         self.module_manager.translate_thread = SimpleNamespace(translator=None)
         self.configPanel = SelectionConfigPanel(
