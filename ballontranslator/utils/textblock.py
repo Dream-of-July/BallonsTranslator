@@ -135,6 +135,12 @@ class TextBlock:
     manga_complex_background: bool = False
     manga_residue_retried: bool = False
     manga_erase_failed: bool = False
+    manga_contrast_before: Optional[float] = None
+    manga_contrast_after: Optional[float] = None
+    manga_background_luminance: Optional[float] = None
+    manga_background_spread: Optional[float] = None
+    manga_outline_applied: bool = False
+    manga_backing_applied: bool = False
 
     region_mask: np.ndarray = None
     region_inpaint_dict: Dict = None
