@@ -83,7 +83,7 @@ class EngineTests(unittest.TestCase):
     def test_hello_page_fonts(self):
         hello = self.call('hello')['result']
         self.assertEqual(hello['protocol'], 1)
-        self.assertEqual(hello['capabilities'], ['keep_original', 'vision_probe'])
+        self.assertEqual(hello['capabilities'], ['keep_original', 'vision_probe', 'enhance'])
         self.assertIn(hello['device'], ('cpu', 'mps', 'cuda', None))
         page = self.call('get_page', {'name': '001.png'})['result']
         self.assertEqual((page['width'], page['height']), (480, 320))

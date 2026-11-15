@@ -159,7 +159,7 @@ class Server(QObject):
             allowed = {
                 'open_project': {'path'}, 'get_page': {'name'}, 'run': {'pages', 'mode'},
                 'update_blocks': {'page', 'edits', 'autofit'}, 'delete_blocks': {'page', 'indexes'},
-                'set_settings': {'source_language', 'target_language', 'translator', 'output'},
+                'set_settings': {'source_language', 'target_language', 'translator', 'output', 'enhance'},
                 'create_profile': {'template'}, 'update_profile': {'id', 'name', 'base_url', 'model', 'api_key'},
                 'delete_profile': {'id'}, 'test_profile': {'id'}, 'probe_vision': {'profile_id'},
                 'export': {'destination', 'what'},
@@ -240,7 +240,7 @@ class Server(QObject):
             device = module_runtime.DEFAULT_DEVICE
         ready = self.models_ready()
         return dict(protocol=1, engine_version=APP_VERSION,
-                    capabilities=['keep_original', 'vision_probe'],
+                    capabilities=['keep_original', 'vision_probe', 'enhance'],
                     device=device,
                     torch_installed=installed, models_ready=ready)
 
@@ -326,6 +326,10 @@ class Server(QObject):
         self.stalled = False
         self.last_progress = time.monotonic()
         self.stage_counts.clear()
+        from .manga_enhance import EnhanceSession
+        self.window.enhance_session = EnhanceSession(config.pcfg.module, self.enhance_event)
+        self.manager.imgtrans_thread.quality_page_processor = (
+            self.window.process_quality_page if self.window.enhance_session.profile is not None else None)
         try:
             seconds = float(os.environ.get('BALLOONTRANS_ENGINE_STALL_SECONDS', '600'))
         except (ValueError, OverflowError):
@@ -404,6 +408,12 @@ class Server(QObject):
                 self.stage_counts[stage] = done
                 self.last_progress = time.monotonic()
             self.writer.send(dict(event='stage_progress', stage=stage, done=done, total=len(self.pages)))
+
+    def enhance_event(self, payload: dict) -> None:
+        if payload['event'] == 'stage_progress':
+            payload = {**payload, 'total': len(self.pages)}
+            self.last_progress = time.monotonic()
+        self.writer.send(payload)
 
     @Slot(str, dict)
     def prepare_progress(self, module: str, payload: dict) -> None:
@@ -594,9 +604,11 @@ class Server(QObject):
         fmt = blk.fontformat
         if 'keep_original' in edit:
             blk.manga_keep_original = edit['keep_original']
+            blk.manga_non_dialogue = False
             blk.manga_review = 'protected' if edit['keep_original'] else None
         if 'source_text' in edit:
             blk.text = [edit['source_text']]
+            blk.manga_non_dialogue = False
             blk.manga_ocr_confidence = None
         for key in ('translation', 'angle'):
             if key in edit:
@@ -631,7 +643,8 @@ class Server(QObject):
                                     module=cfg.translator, profile_id=cfg.translator_llm_id if cfg.translator == 'LLMTranslator' else None),
                     profiles=[self.public_profile(p) for p in cfg.llm_profiles if p.backend != 'codex'],
                     provider_templates=llm_profiles.provider_template_names(),
-                    output=dict(format=config.pcfg.imgsave_ext, quality=config.pcfg.imgsave_quality))
+                    output=dict(format=config.pcfg.imgsave_ext, quality=config.pcfg.imgsave_quality),
+                    enhance=dict(enabled=cfg.enhance_enabled, profile_id=cfg.enhance_profile_id))
 
     def persist(self) -> None:
         if not config.save_config():
@@ -641,6 +654,19 @@ class Server(QObject):
         self.idle()
         cfg = config.pcfg.module
         candidate = copy.deepcopy(cfg)
+        enhance = params.get('enhance', {})
+        if not isinstance(enhance, dict) or set(enhance) - {'enabled', 'profile_id'}:
+            raise ValueError('enhance')
+        if 'enabled' in enhance:
+            if type(enhance['enabled']) is not bool:
+                raise ValueError('enhance.enabled')
+            candidate.enhance_enabled = enhance['enabled']
+        if 'profile_id' in enhance:
+            profile_id = enhance['profile_id']
+            if profile_id is not None and (not isinstance(profile_id, str) or not any(
+                    p.id == profile_id and p.backend == 'openai' for p in cfg.llm_profiles)):
+                raise ProtocolError('bad_request', 'Unknown enhance profile.')
+            candidate.enhance_profile_id = profile_id
         translator = params.get('translator', {})
         if translator:
             kind = translator['kind']
@@ -664,7 +690,8 @@ class Server(QObject):
         if loaded is not None and loaded.name == candidate.translator:
             loaded.set_source(candidate.translate_source)
             loaded.set_target(candidate.translate_target)
-        for attr in ('translator', 'translator_llm_id', 'translate_source', 'translate_target'):
+        for attr in ('translator', 'translator_llm_id', 'translate_source', 'translate_target',
+                     'enhance_enabled', 'enhance_profile_id'):
             setattr(cfg, attr, getattr(candidate, attr))
         config.pcfg.imgsave_ext, config.pcfg.imgsave_quality = ext, quality
         self.persist()

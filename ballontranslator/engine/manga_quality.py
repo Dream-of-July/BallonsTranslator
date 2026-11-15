@@ -472,6 +472,8 @@ MANGA_RETRY_CONFIDENCE = .9
 def source_review(block: TextBlock) -> str | None:
     if block.manga_keep_original:
         return 'protected'
+    if block.manga_non_dialogue:
+        return 'skipped'
     source = block.get_text().strip()
     if not source:
         return 'unreadable'
@@ -586,7 +588,7 @@ def _residue_found(
 
 def _repair_complex(
     original: np.ndarray, block: TextBlock, bounds: tuple[int, int, int, int],
-    seed: np.ndarray, area: np.ndarray, inpainter: object,
+    seed: np.ndarray, area: np.ndarray, inpainter: object, *, widened: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Try a crop twice; publish nothing when the second repair still has ink."""
     from ballontranslator.modules.inpaint.base import enlarge_window
@@ -596,8 +598,8 @@ def _repair_complex(
     radius = _erase_radius(block, bounds)
     ink, source = _complete_complex_ink(block, crop, seed, area, bounds, radius,
                                       _inside_bubble(block, original.shape[:2]))
-    for attempt in range(2):
-        if attempt:
+    for attempt in range(1 if widened else 2):
+        if attempt or widened:
             block.manga_residue_retried = True
             ink = _grow(ink, radius * 2) & area
         zone = _grow(ink, radius) & area
@@ -644,6 +646,7 @@ def _repair_complex(
 
 def prepare_background(
     image: np.ndarray, mask: np.ndarray, blocks: list[TextBlock], inpainter: object,
+    *, force_reerase: set[int] | None = None,
 ) -> np.ndarray:
     """Stage possible repairs. The last channel records actual candidate ink."""
     original = image[..., :3]
@@ -683,7 +686,8 @@ def prepare_background(
         if source_review(block) == 'protected':
             continue
         inside_bubble = _inside_bubble(block, mask.shape)
-        if not inside_bubble:
+        force = force_reerase is not None and index in force_reerase
+        if not inside_bubble and not force:
             white = _unframed_white_ink(block, original, mask)
             if white is not None:
                 (left, top, right, bottom), complete, backing = white
@@ -706,7 +710,7 @@ def prepare_background(
         verified_pale = (np.count_nonzero(backing) >= 24
                          and np.count_nonzero(backing_pale) >= .9 * np.count_nonzero(backing))
         flat_limit = 8 if inside_bubble else 2
-        if (verified_pale and pale_fraction >= .58
+        if (not force and verified_pale and pale_fraction >= .58
                 and np.max(np.ptp(np.percentile(samples, (12, 88), axis=0), axis=0)) <= flat_limit):
             base = np.median(samples, axis=0).astype(np.int16)
             stroke = (np.max(np.abs(crop.astype(np.int16) - base), axis=2) > 10) & interior
@@ -722,7 +726,7 @@ def prepare_background(
             ink &= area
             if not ink.any():
                 continue
-            repaired, ink = _repair_complex(original, block, (x1, y1, x2, y2), ink, area, inpainter)
+            repaired, ink = _repair_complex(original, block, (x1, y1, x2, y2), ink, area, inpainter, widened=force)
             # Ownership limits publication, not the available backing samples.
             ink &= owners[y1:y2, x1:x2] == index
             filled[y1:y2, x1:x2][ink] = repaired[ink]
@@ -978,7 +982,7 @@ def _source_outline(image: np.ndarray, background: np.ndarray, block: TextBlock)
 
 def _lettering_style(
     block: TextBlock, pixels: np.ndarray, background: np.ndarray,
-    source_outline: list[int] | None,
+    source_outline: list[int] | None, *, force_outline: bool = False,
 ) -> None:
     """Select editable fill/stroke from the cleaned glyph footprint and rim.
 
@@ -1007,7 +1011,7 @@ def _lettering_style(
     # A pale, flat bubble retains its original fill and zero stroke. Texture
     # and removed source halos are evidence for a stroke, not OCR's bg colour
     # alone (OCR commonly reports the same colour for fill and outline).
-    outline = (block.manga_background_spread > .08 or insufficient
+    outline = (force_outline or block.manga_background_spread > .08 or insufficient
                or source_outline is not None or block.stroke_width > 0)
     if outline:
         stroke = [255, 255, 255] if _luminance(fill) < .179 else [0, 0, 0]
@@ -1024,7 +1028,7 @@ def _fit(
     block: TextBlock, points: np.ndarray, refit: bool, font: FontChoice | None = None,
     available: np.ndarray | None = None,
     *, background: np.ndarray | None = None, erased: np.ndarray | None = None,
-    source_outline: list[int] | None = None,
+    source_outline: list[int] | None = None, force_outline: bool = False,
 ) -> tuple[np.ndarray, int, int] | None:
     """Fit the native painted silhouette, including its editable stroke.
 
@@ -1132,7 +1136,8 @@ def _fit(
                     px, py, ph, pw = x, y, h, w
                     if background is not None:
                         styled = copy.deepcopy(candidate)
-                        _lettering_style(styled, pixels, background[y:y + h, x:x + w], source_outline)
+                        _lettering_style(styled, pixels, background[y:y + h, x:x + w], source_outline,
+                                         force_outline=force_outline)
                         if (styled.stroke_width != candidate.stroke_width
                                 or list(styled.fontformat.frgb) != list(candidate.fontformat.frgb)
                                 or list(styled.fontformat.srgb) != list(candidate.fontformat.srgb)):
@@ -1164,7 +1169,7 @@ def _fit(
 
 def _soft_backing(
     block: TextBlock, points: np.ndarray, rendered: tuple[np.ndarray, int, int],
-    cleaned: np.ndarray, applied: np.ndarray, forbidden: np.ndarray,
+    cleaned: np.ndarray, applied: np.ndarray, forbidden: np.ndarray, *, force: bool = False,
 ) -> None:
     """Publish a feathered text-sized veil, clipped to the bubble interior."""
     if not block.manga_outline_applied or not _inside_bubble(block, applied.shape):
@@ -1179,7 +1184,7 @@ def _soft_backing(
     mean = cv2.blur(luminance, (5, 5))
     spread = np.sqrt(np.maximum(0, cv2.blur(luminance ** 2, (5, 5)) - mean ** 2))
     weak = (_contrast(_luminance(block.fontformat.srgb), luminance) < 3) | (spread > .06)
-    if np.mean(weak[edge]) < .20:
+    if not force and np.mean(weak[edge]) < .20:
         return
     left, top, right, bottom = bounds = _bounds(points)
     inside = _area_mask(points, bounds, inset=2) != 0
@@ -1230,6 +1235,7 @@ def _drawn_contrast(block: TextBlock, rendered: np.ndarray, backing: np.ndarray)
 
 def compose_page(
     image: np.ndarray, draft: np.ndarray, blocks: list[TextBlock], refit: set[int] | None = None,
+    *, force_outline: set[int] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Commit an erasure and its replacement together only if both fit safely."""
     if draft.shape[:2] != image.shape[:2] or draft.ndim != 3 or draft.shape[2] != 4:
@@ -1289,7 +1295,8 @@ def compose_page(
             resize = refit is None or index in refit
             candidate = copy.deepcopy(block)
             rendered = _fit(candidate, points, resize, fonts.get(index),
-                            background=draft, erased=valid, source_outline=source_outlines[index])
+                            background=draft, erased=valid, source_outline=source_outlines[index],
+                            force_outline=force_outline is not None and index in force_outline)
             if rendered is not None:
                 overlays.append([index, block, candidate, region, rendered])
                 continue
@@ -1315,7 +1322,8 @@ def compose_page(
             # and spacing. Source erasure itself may never cross protected ink.
             retried.add(index)
             retry = _fit(candidate, points, refit is None or index in refit, fonts.get(index), remaining,
-                         background=draft, erased=valid, source_outline=source_outlines[index])
+                         background=draft, erased=valid, source_outline=source_outlines[index],
+                         force_outline=force_outline is not None and index in force_outline)
             if source_collision or retry is None:
                 block.manga_review = 'geometry'
                 reserved[y1:y2, x1:x2] |= ink
@@ -1348,7 +1356,8 @@ def compose_page(
                     remaining = ~(reserved[top:bottom, left:right] | lettering[top:bottom, left:right])
                     candidate = copy.deepcopy(block)
                     retry = _fit(candidate, points, refit is None or index in refit, fonts.get(index), remaining,
-                                 background=draft, erased=valid, source_outline=source_outlines[index])
+                                 background=draft, erased=valid, source_outline=source_outlines[index],
+                                 force_outline=force_outline is not None and index in force_outline)
                 if retry is not None and not np.any(ink & reserved[y1:y2, x1:x2]):
                     entry[2], entry[4] = candidate, retry
                     pixels, x, y = retry
@@ -1371,9 +1380,10 @@ def compose_page(
         block.manga_background_spread = candidate.manga_background_spread
         block.manga_outline_applied = candidate.manga_outline_applied
     cleaned[applied != 0, :3] = draft[applied != 0, :3]
-    for _, block, _, _, rendered in overlays:
+    for index, block, _, _, rendered in overlays:
         if not block.manga_review:
-            _soft_backing(block, _polygon(block, valid.shape), rendered, cleaned, applied, reserved)
+            _soft_backing(block, _polygon(block, valid.shape), rendered, cleaned, applied, reserved,
+                          force=force_outline is not None and index in force_outline)
     result = cleaned.copy()
     for _, block, _, _, (pixels, x, y) in overlays:
         if block.manga_review:
@@ -1386,13 +1396,17 @@ def compose_page(
     return cleaned, result, applied
 
 
-def save_page(window: object, name: str, draft: np.ndarray, refit: set[int] | None = None) -> None:
+def save_page(
+    window: object, name: str, draft: np.ndarray, refit: set[int] | None = None,
+    *, composed: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
+) -> None:
     """Publish the same page generation through the existing image-save worker."""
     from ballontranslator.utils.config import pcfg
 
     project = window.imgtrans_proj
-    original = project.read_img(name)
-    cleaned, result, mask = compose_page(original, draft, project.pages[name], refit)
+    if composed is None:
+        composed = compose_page(project.read_img(name), draft, project.pages[name], refit)
+    cleaned, result, mask = composed
     project.save()
     saver = window.imsave_thread
     saver.saveImg(str(draft_path(project.directory, name)), draft)
