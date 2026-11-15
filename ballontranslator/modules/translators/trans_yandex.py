@@ -6,6 +6,7 @@ class YandexTranslator(BaseTranslator):
     concate_text = False
     params: Dict = {
         'api_key': {
+            'type': 'secret',
             'value': '',
             'display_name': 'API Key'
         },

@@ -43,7 +43,8 @@ if not osp.exists(DEFAULT_TEXTSTYLE_DIR):
 CONFIG_FONTSIZE_HEADER = 15
 CONFIG_FONTSIZE_TABLE = 13
 CONFIG_FONTSIZE_CONTENT = 13
-CONFIG_CONTENT_MARGIN = 27
+# macOS settings pages use the tighter system-settings rhythm.
+CONFIG_CONTENT_MARGIN = 20 if sys.platform == 'darwin' else 27
 CONFIG_CONTENT_MARGINS = (CONFIG_CONTENT_MARGIN,) * 4
 CONFIG_CONTENT_ROW_SPACING = 6
 
@@ -81,7 +82,9 @@ DPI = 188.75
 SCREEN_H = 2160
 SCREEN_W = 3840
 
-DEFAULT_FONT_FAMILY = 'Microsoft YaHei UI'
+# Initial text font of new configs and text styles; saved choices are kept.
+# PingFang SC ships with macOS and covers CJK.
+DEFAULT_FONT_FAMILY = 'PingFang SC' if sys.platform == 'darwin' else 'Microsoft YaHei UI'
 APP_DEFAULT_FONT = 'Microsoft YaHei UI'
 
 WINDOW_BORDER_WIDTH = 4

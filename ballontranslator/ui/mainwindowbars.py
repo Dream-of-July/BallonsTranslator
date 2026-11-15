@@ -40,7 +40,12 @@ from ballontranslator.utils.shared import (
     WINDOW_BORDER_WIDTH,
 )
 from .framelesswindow import FramelessMoveResize
-from ballontranslator.utils.config import pcfg
+from ballontranslator.utils.config import (
+    APPEARANCE_DARK,
+    APPEARANCE_LIGHT,
+    APPEARANCE_SYSTEM,
+    pcfg,
+)
 from ballontranslator.utils import shared
 if shared.FLAG_QT6:
     from qtpy.QtGui import QAction
@@ -317,6 +322,7 @@ class TitleBar(Widget):
 
     closebtn_clicked = Signal()
     display_lang_changed = Signal(str)
+    appearance_changed = Signal(str)
     show_module = Signal(int, bool)
 
     def __init__(self, parent, *args, **kwargs) -> None:
@@ -403,7 +409,25 @@ class TitleBar(Widget):
             action.setChecked(visible)
             action.triggered.connect(self.moduleVisibilityStateChanged)
 
-        viewMenu.addAction(darkModeAction)
+        if shared.ON_MACOS:
+            self.appearanceMenu = QMenu(self.tr('Appearance'), viewMenu)
+            self.appearance_ac_group = QActionGroup(self)
+            self.appearance_ac_group.setExclusive(True)
+            for text, appearance in (
+                (self.tr('Follow System'), APPEARANCE_SYSTEM),
+                (self.tr('Light'), APPEARANCE_LIGHT),
+                (self.tr('Dark'), APPEARANCE_DARK),
+            ):
+                action = QAction(text, self)
+                action.setCheckable(True)
+                action.setData(appearance)
+                action.setChecked(appearance == pcfg.appearance)
+                action.triggered.connect(self.on_appearance_triggered)
+                self.appearance_ac_group.addAction(action)
+                self.appearanceMenu.addAction(action)
+            viewMenu.addMenu(self.appearanceMenu)
+        else:
+            viewMenu.addAction(darkModeAction)
         viewMenu.addMenu(self.displayLanguageMenu)
         viewMenu.addSeparator()
         viewMenu.addActions(module_visibility_actions)
@@ -553,6 +577,10 @@ class TitleBar(Widget):
 
     def onMinBtnClicked(self):
         self.mainwindow.showMinimized()
+
+    def on_appearance_triggered(self) -> None:
+        action = self.appearance_ac_group.checkedAction()
+        self.appearance_changed.emit(action.data())
 
     def on_displaylang_triggered(self):
         ac = self.lang_ac_group.checkedAction()

@@ -24,7 +24,8 @@ from ballontranslator.utils.text_effects import (
 from ballontranslator.utils import shared
 from ballontranslator.utils.message import create_error_dialog, create_info_dialog
 from ballontranslator.modules import GET_VALID_TEXTDETECTORS, GET_VALID_INPAINTERS, GET_VALID_TRANSLATORS, GET_VALID_OCR
-from .misc import parse_stylesheet, set_html_family, QKEY
+from .misc import parse_stylesheet, refresh_live_icons, set_html_family, QKEY
+from .appearance import apply_appearance_override, current_theme, sync_darkmode
 from ballontranslator.utils.config import (
     FontFormat,
     ProgramConfig,
@@ -104,7 +105,9 @@ class PageListView(QListWidget):
         self.setHorizontalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAsNeeded
         )
-        self.horizontalScrollBar().hide()
+        if not shared.ON_MACOS:
+            # macOS shows the native bar instead of the custom one.
+            self.horizontalScrollBar().hide()
         self.scrollbar_v = ScrollBar(
             Qt.Orientation.Vertical, self, fadeout=True
         )
@@ -122,6 +125,7 @@ class PageListView(QListWidget):
 mainwindow_cls = Widget if shared.HEADLESS else FramelessWindow
 
 MAC_MIN_WINDOW_WIDTH = 960
+MAC_RIGHT_PANEL_MIN_WIDTH = 372
 MAC_DEFAULT_WINDOW_SIZE = QSize(1440, 900)
 # Cmd+Q quits on macOS; Control+Q keeps the same physical keys there.
 CAPITALIZE_SHORTCUT = 'Meta+Q' if shared.ON_MACOS else 'Ctrl+Q'
@@ -150,6 +154,7 @@ class MainWindow(mainwindow_cls):
         self.app = app
         _restore_custom_colors(pcfg.custom_colors)
         install_app_style_filters(self.app)
+        self.setupAppearance()
         self.resetStyleSheet()
 
         shared.create_errdialog_in_mainthread = self.create_errdialog.emit
@@ -246,9 +251,33 @@ class MainWindow(mainwindow_cls):
             self.on_imgtrans_progressbox_showed
         )
 
+    def setupAppearance(self) -> None:
+        """Resolve the macOS appearance preference and follow system changes."""
+        if not shared.ON_MACOS:
+            return
+        apply_appearance_override()
+        sync_darkmode()
+        hints = QGuiApplication.styleHints()
+        # colorSchemeChanged needs Qt >= 6.5; older Qt keeps the startup result.
+        if hasattr(hints, 'colorSchemeChanged'):
+            hints.colorSchemeChanged.connect(self.on_color_scheme_changed)
+
+    def on_color_scheme_changed(self, *_args) -> None:
+        if sync_darkmode():
+            self.resetStyleSheet()
+
+    def on_appearance_changed(self, appearance: str) -> None:
+        pcfg.appearance = appearance
+        apply_appearance_override()
+        sync_darkmode()
+        self.resetStyleSheet()
+        self.save_config()
+
     def resetStyleSheet(self):
-        theme = 'eva-dark' if pcfg.darkmode else 'eva-light'
-        application_stylesheet = parse_stylesheet(theme)
+        if shared.ON_MACOS:
+            # Icons loaded at construction time follow the theme as well.
+            refresh_live_icons()
+        application_stylesheet = parse_stylesheet(current_theme())
         if self.styleSheet() != application_stylesheet:
             self.setStyleSheet(application_stylesheet)
 
@@ -385,6 +414,9 @@ class MainWindow(mainwindow_cls):
         self.comicTransSplitter.addWidget(self.llmContextEditor)
         self.comicTransSplitter.addWidget(self.canvas.gv)
         self.comicTransSplitter.addWidget(self.rightComicTransStackPanel)
+        if shared.ON_MACOS:
+            # The splitter otherwise shrinks the panel below its content width.
+            self.rightComicTransStackPanel.setMinimumWidth(MAC_RIGHT_PANEL_MIN_WIDTH)
 
         self.centralStackWidget.addWidget(self.comicTransSplitter)
 
@@ -1139,6 +1171,7 @@ class MainWindow(mainwindow_cls):
         self.titleBar.importtstyle_trigger.connect(self.import_tstyles)
         self.titleBar.exporttstyle_trigger.connect(self.export_tstyles)
         self.titleBar.darkmode_trigger.connect(self.on_darkmode_triggered)
+        self.titleBar.appearance_changed.connect(self.on_appearance_changed)
         self.titleBar.merge_tool_trigger.connect(self.on_open_merge_tool)
         self.titleBar.ps_bridge_trigger.connect(self.on_open_photoshop_bridge)
         self.titleBar.path_reorder_trigger.connect(self.on_path_reorder)
@@ -2372,6 +2405,14 @@ class MainWindow(mainwindow_cls):
         )
         try:
             result = dialog.exec_()
+            if result == RunPipelineDialog.SETUP:
+                profile_id, target = dialog.llm_setup_target
+                self.focus_llm_profile(
+                    profile_id,
+                    expand_details=target == 'base_url',
+                    target=target,
+                )
+                return
             if result == RunPipelineDialog.CONTINUE:
                 self._run_imgtrans_wo_textstyle_update = False
                 self.on_run_imgtrans(continue_mode=True)

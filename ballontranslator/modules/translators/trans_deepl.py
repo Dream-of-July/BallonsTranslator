@@ -11,6 +11,7 @@ class DeeplTranslator(BaseTranslator):
     cht_require_convert = True
     params: Dict = {
         'api_key': {
+            'type': 'secret',
             'value': '',
             'display_name': 'API Key'
         },

@@ -98,6 +98,22 @@ ConfigTable::item:selected:!active {
     background-color: rgb(30, 147, 229);
 }
 
+/* @macos-begin */
+ConfigTable {
+    padding: 10px 8px;
+    outline: none;
+}
+
+ConfigTable::item {
+    padding: 0px 6px;
+    border-radius: 6px;
+}
+
+ConfigTable::item:has-children {
+    color: @titleBarColor;
+}
+/* @macos-end */
+
 QStackedWidget#ConfigContent,
 QScrollArea#ConfigContentScrollArea,
 QWidget#ConfigContentViewport,
@@ -228,6 +244,40 @@ QWidget#ConfigContentScrollContent QListWidget#SpellCheckDictionaryList:focus {
     border-bottom: 1px solid rgb(30, 147, 229);
 }
 
+/* @macos-begin */
+QWidget#ConfigContentScrollContent QLineEdit,
+QWidget#ConfigContentScrollContent QComboBox,
+QWidget#ConfigContentScrollContent QPlainTextEdit,
+QWidget#ModuleParamContent QLineEdit,
+QWidget#ModuleParamContent QComboBox,
+QWidget#ModuleParamContent QPlainTextEdit,
+QWidget#DrawingPanel QComboBox,
+QWidget#DrawingPanel QPlainTextEdit,
+QWidget#ConfigContentScrollContent QComboBox:hover,
+QWidget#ModuleParamContent QComboBox:hover,
+QWidget#DrawingPanel QComboBox:hover,
+QWidget#ConfigContentScrollContent QSpinBox#SpellCheckDistanceSpin,
+QWidget#ConfigContentScrollContent QSpinBox#AutoTateChuYokoMaxLength,
+QWidget#ConfigContentScrollContent QListWidget#SpellCheckDictionaryList {
+    border: 1px solid @borderColor;
+    border-radius: 5px;
+}
+
+QWidget#ConfigContentScrollContent QLineEdit:focus,
+QWidget#ConfigContentScrollContent QComboBox:focus,
+QWidget#ConfigContentScrollContent QPlainTextEdit:focus,
+QWidget#ModuleParamContent QLineEdit:focus,
+QWidget#ModuleParamContent QComboBox:focus,
+QWidget#ModuleParamContent QPlainTextEdit:focus,
+QWidget#DrawingPanel QComboBox:focus,
+QWidget#DrawingPanel QPlainTextEdit:focus,
+QWidget#ConfigContentScrollContent QSpinBox#SpellCheckDistanceSpin:focus,
+QWidget#ConfigContentScrollContent QSpinBox#AutoTateChuYokoMaxLength:focus,
+QWidget#ConfigContentScrollContent QListWidget#SpellCheckDictionaryList:focus {
+    border: 1px solid rgb(@macAccentRgb);
+}
+/* @macos-end */
+
 QWidget#ConfigContentScrollContent QListWidget#SpellCheckDictionaryList::indicator {
     width: 13px;
     height: 13px;
@@ -263,6 +313,16 @@ QWidget#ConfigContentScrollContent QPushButton {
     padding: 1px 10px;
     border-radius: 4px;
 }
+
+/* @macos-begin */
+QWidget#ConfigContentScrollContent QPushButton {
+    min-height: 22px;
+    max-height: 22px;
+    height: 22px;
+    padding: 1px 12px;
+    border-radius: 6px;
+}
+/* @macos-end */
 
 QWidget#ConfigContentScrollContent NoBorderPushBtn {
     border: none;
@@ -333,6 +393,12 @@ QWidget#DrawingPanel QComboBox:disabled {
     border-bottom: 1px solid @borderColor;
 }
 
+/* @macos-begin */
+QWidget#DrawingPanel QComboBox:disabled {
+    border: 1px solid @borderColor;
+}
+/* @macos-end */
+
 QWidget#DrawingPanel QLabel:disabled {
     color: @borderColor;
 }
@@ -365,6 +431,32 @@ QCheckBox::indicator:disabled {
     border: 1px solid @borderColor;
     background-color: @emptyContentBackgroundColor;
 }
+
+/* @macos-begin */
+QCheckBox {
+    spacing: 6px;
+}
+
+QCheckBox::indicator {
+    width: 14px;
+    height: 14px;
+}
+
+QCheckBox::indicator:hover {
+    border: 1px solid @borderColor;
+}
+
+QCheckBox::indicator:checked {
+    border: 1px solid rgb(@macAccentRgb);
+    background-color: rgb(@macAccentRgb);
+    image: url(resources/icons/checkbox_checked_mac.svg);
+}
+
+QCheckBox::indicator:disabled {
+    border: 1px solid @borderColor;
+    background-color: @borderColor;
+}
+/* @macos-end */
 
 /* Icon-led checkboxes keep their dedicated toolbar/titlebar visuals. */
 AlignmentChecker::indicator,
@@ -444,6 +536,18 @@ QComboBox::drop-down {
 QComboBox::hover {
     border: 1px solid rgb(30, 147, 229);
 }
+
+/* @macos-begin */
+QComboBox,
+QLineEdit,
+QPlainTextEdit {
+    border-radius: 5px;
+}
+
+QComboBox::hover {
+    border: 1px solid @borderColor;
+}
+/* @macos-end */
 
 QComboBox::down-arrow {
     image: url(resources/icons/combobox_arrow.svg);
@@ -555,6 +659,12 @@ SizeControlLabel {
     font-size: 14px;
 }
 
+/* @macos-begin */
+SizeControlLabel {
+    font-size: 13px;
+}
+/* @macos-end */
+
 
 SmallSizeControlLabel {
     font-size: 12px;
@@ -578,6 +688,12 @@ QGroupBox {
     margin-top: 9px;
     border-radius: 6px;
 }
+
+/* @macos-begin */
+QGroupBox {
+    font-size: 13px;
+}
+/* @macos-end */
 
 QGroupBox::title {
     subcontrol-origin: margin;
@@ -1364,6 +1480,18 @@ QPushButton#RunPipelineSecondaryButton:hover {
     border-color: rgb(30, 147, 229);
 }
 
+/* @macos-begin */
+QPushButton#RunPipelinePrimaryButton:disabled {
+    color: @titleBarColor;
+    border: 1px solid @borderColor;
+    background-color: @noboderPushBtnBackgroundColor;
+}
+
+QPushButton#RunPipelineSecondaryButton:disabled {
+    color: @borderColor;
+}
+/* @macos-end */
+
 QWidget#CodexAccountControls QPushButton#CodexSignInButton,
 QWidget#CodexAccountControls QPushButton#CodexSignOutButton {
     border-radius: 12px;
@@ -1484,6 +1612,28 @@ AlignmentChecker::indicator:disabled {
     background-color: transparent;
 }
 
+/* @macos-begin */
+/* Rounded toggles instead of flat bordered blocks. */
+AlignmentChecker::indicator {
+    border: 2px solid transparent;
+    border-radius: 6px;
+}
+
+AlignmentChecker::indicator:checked {
+    border: 2px solid rgb(@macAccentRgb);
+    background-color: rgb(@macAccentRgb);
+}
+
+AlignmentChecker::indicator:hover {
+    border: 2px solid @borderColor;
+}
+
+AlignmentChecker::indicator:disabled {
+    border: 2px solid transparent;
+    background-color: transparent;
+}
+/* @macos-end */
+
 AlignmentChecker#AlignLeftChecker::indicator {
     border-right: none;
     min-width: 32px;
@@ -1537,6 +1687,22 @@ QFontChecker::indicator::checked {
     border: 2px solid rgb(30, 147, 229);
     background-color: rgb(30, 147, 229);
 }
+
+/* @macos-begin */
+QFontChecker::indicator {
+    border: 2px solid transparent;
+    border-radius: 6px;
+}
+
+QFontChecker::indicator::hover {
+    border: 2px solid @borderColor;
+}
+
+QFontChecker::indicator::checked {
+    border: 2px solid rgb(@macAccentRgb);
+    background-color: rgb(@macAccentRgb);
+}
+/* @macos-end */
 
 QToolButton#RefreshButton {
     min-width: 19px;
@@ -1734,14 +1900,73 @@ QMenu::right-arrow {
     right: 7px;
 }
 
+/* @macos-begin */
+QMenu {
+    border-radius: 6px;
+    padding: 4px;
+}
+
+QMenu::item {
+    height: 22px;
+    padding-left: 24px;
+    padding-right: 20px;
+    border-radius: 4px;
+    background-color: transparent;
+}
+
+QMenu::item:selected {
+    color: white;
+    background-color: rgb(@macAccentRgb);
+}
+
+QMenu::item:disabled {
+    color: @borderColor;
+    background-color: transparent;
+}
+
+QMenu::separator {
+    margin: 4px 8px;
+}
+
+/* Check marks sit in the leading gutter like native macOS menus. */
+QMenu::indicator {
+    width: 12px;
+    height: 12px;
+    margin-left: 6px;
+    margin-right: 0px;
+    subcontrol-position: left center;
+    right: 0px;
+}
+
+QMenu::indicator:checked {
+    image: url(resources/icons/menu_check.svg);
+}
+
+QMenu::indicator:checked:selected {
+    image: url(resources/icons/checkbox_checked_mac.svg);
+}
+/* @macos-end */
+
 QDialog {
     font-size: 14px;
     background-color: @widgetBackgroundColor;
 }
 
+/* @macos-begin */
+QDialog {
+    font-size: 13px;
+}
+/* @macos-end */
+
 QDialog QPushButton {
     padding: 5px 15px;
 }
+
+/* @macos-begin */
+QDialog QPushButton {
+    padding: 2px 14px;
+}
+/* @macos-end */
 
 QGroupBox {
     background-color: @emptyContentBackgroundColor;
@@ -1756,6 +1981,14 @@ QPushButton {
     border-radius: 4px;
 }
 
+/* @macos-begin */
+QPushButton {
+    height: 22px;
+    font-size: 13px;
+    border-radius: 6px;
+}
+/* @macos-end */
+
 NoBorderPushBtn {
     background-color: @noboderPushBtnBackgroundColor;
     border: none;
@@ -1768,6 +2001,17 @@ QPushButton::hover {
 QPushButton:pressed {
     border: 1px solid royalblue;
 }
+
+/* @macos-begin */
+QPushButton::hover {
+    background-color: @pushBtnBackgroundColor;
+}
+
+QPushButton:pressed {
+    border: 1px solid @borderColor;
+    background-color: @noboderPushBtnBackgroundColor;
+}
+/* @macos-end */
 
 QPushButton#minBtn {
     border-radius: 0px;
@@ -2178,6 +2422,8 @@ QProgressBar::chunk {
 }
 
 
+/* macOS themes drop this block (see ui/misc.py) to keep native scrollbars. */
+/* @non-macos-begin */
 /*https://github.com/PyQt5/PyQt/blob/master/QScrollBar/StyleScrollBar.py*/
 /*纵向滚动条*/
 QScrollBar:vertical {
@@ -2257,6 +2503,7 @@ QScrollBar::add-line {
     background: transparent;
     subcontrol-position: top;
 }
+/* @non-macos-end */
 
 
 .IncrementalBtn#FsizeIncrementUp {
@@ -2480,6 +2727,12 @@ TitleBarToolBtn {
     color: @titleBarColor;
 }
 
+/* @macos-begin */
+TitleBarToolBtn {
+    font-size: 13px;
+}
+/* @macos-end */
+
 TitleBarToolBtn::hover {
     background-color: rgb(30, 147, 229);
     color: whitesmoke;
@@ -2499,6 +2752,18 @@ QProgressBar {
 QProgressBar::chunk {
     background-color: rgb(30, 147, 229);
 }
+
+/* @macos-begin */
+QProgressBar {
+    min-height: 6px;
+    max-height: 6px;
+    border-radius: 3px;
+}
+
+QProgressBar::chunk {
+    border-radius: 3px;
+}
+/* @macos-end */
 
 
 TextAreaStyleButton {
@@ -3097,3 +3362,59 @@ QWidget#suggestion_popup QScrollBar::sub-page:horizontal {
     width: 0px;
     background: transparent;
 }
+
+/* @macos-begin */
+/* A rule without a drawable part lets QMacStyle draw native overlay scrollbars. */
+QScrollBar {
+    background: none;
+    border: none;
+}
+
+/* Type scale: 11 / 12 / 13 / 15 / 17. */
+QLabel#UpdateReleaseTitle,
+QLabel#ModuleParamTitle,
+QLabel#FontExcludeTitle,
+QLabel#RunPipelineTitle,
+QLabel#BulkPageSummaryTitle,
+QLabel#angleLabel,
+.FadeLabel {
+    font-size: 17px;
+}
+
+QLabel#UpdateReleaseVersion,
+QTextBrowser#UpdateReleaseNotes {
+    font-size: 13px;
+}
+
+/* Fold / Source / Translation read as one quiet segmented control. */
+QLabel#FontFormatActionLabel {
+    min-height: 22px;
+    border-radius: 6px;
+    color: @titleBarColor;
+    font-size: 13px;
+}
+
+TextCheckerLabel#FontFormatActionLabel:hover {
+    background-color: @pushBtnBackgroundColor;
+}
+
+TextCheckerLabel#FontFormatActionLabel[checked="true"] {
+    color: @qwidgetForegroundColor;
+    background-color: @noboderPushBtnBackgroundColor;
+}
+
+CustomGV {
+    background-color: @canvasBackgroundColor;
+}
+
+/* Hollow, so a busy button such as Test Connection reads as unavailable. */
+QWidget#ConfigContentScrollContent QPushButton:disabled {
+    color: @titleBarColor;
+    border: 1px solid @borderColor;
+    background-color: transparent;
+}
+
+QWidget#ConfigPanel QSplitter::handle {
+    background: @borderColor;
+}
+/* @macos-end */

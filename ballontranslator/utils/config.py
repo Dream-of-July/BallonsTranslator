@@ -396,6 +396,12 @@ class AutoTateChuYokoConfig(Config):
                 setattr(self, setting.name, setting.default)
 
 
+APPEARANCE_SYSTEM = 'system'
+APPEARANCE_LIGHT = 'light'
+APPEARANCE_DARK = 'dark'
+APPEARANCE_CHOICES = (APPEARANCE_SYSTEM, APPEARANCE_LIGHT, APPEARANCE_DARK)
+
+
 @nested_dataclass
 class ProgramConfig(Config):
 
@@ -458,7 +464,10 @@ class ProgramConfig(Config):
     gsearch_regex: bool = False
     gsearch_range: int = 0
 
+    # On macOS `darkmode` is the resolved result of `appearance`; elsewhere
+    # the View > Dark Mode toggle writes it directly.
     darkmode: bool = False
+    appearance: str = APPEARANCE_SYSTEM
     fold_textarea: bool = False
     show_source_text: bool = True
     show_trans_text: bool = True
@@ -534,6 +543,17 @@ class ProgramConfig(Config):
                         'Discard invalid or duplicate entries in excluded_fonts config.'
                     )
                 config_dict['excluded_fonts'] = normalized_fonts
+
+        if 'appearance' not in config_dict:
+            # Saved before the preference existed: an explicit dark choice
+            # stays dark, everything else follows the system.
+            if config_dict.get('darkmode') is True:
+                config_dict['appearance'] = APPEARANCE_DARK
+        elif config_dict['appearance'] not in APPEARANCE_CHOICES:
+            LOGGER.warning(
+                'Discard invalid appearance config %r.', config_dict['appearance']
+            )
+            config_dict.pop('appearance')
 
         if not isinstance(config_dict.get('window_geometry', ''), str):
             LOGGER.warning(

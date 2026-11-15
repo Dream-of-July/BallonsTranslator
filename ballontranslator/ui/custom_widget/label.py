@@ -220,7 +220,13 @@ class TextCheckerLabel(QLabel):
 
     def setCheckState(self, checked: bool):
         self.checked = checked
-        if checked:
+        if shared.ON_MACOS:
+            # The mac theme styles the checked state, so it follows the
+            # appearance instead of a fixed inline color.
+            self.setProperty('checked', checked)
+            self.style().unpolish(self)
+            self.style().polish(self)
+        elif checked:
             self.setStyleSheet("QLabel { background-color: rgb(30, 147, 229); color: white; }")
         else:
             self.setStyleSheet("")

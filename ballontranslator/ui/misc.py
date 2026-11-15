@@ -2,10 +2,11 @@ import cv2, re, json, os
 from pathlib import Path
 import numpy as np
 import os.path as osp
-from qtpy.QtGui import QPixmap,  QColor, QImage, QTextDocument, QTextCursor
+from qtpy.QtGui import QPixmap,  QColor, QImage, QPixmapCache, QTextDocument, QTextCursor
 from qtpy.QtCore import Qt, QPointF
 
 from ballontranslator.utils.config import pcfg
+from .appearance import DEFAULT_ACCENT_RGB, accent_rgb, current_theme
 from ballontranslator.utils import shared
 from ballontranslator.utils.structures import Tuple, Union, List, Dict, Config, field, nested_dataclass
 
@@ -152,13 +153,34 @@ ICONREVERSE_DICT_LIGHT2DARK = {LIGHTFILL_ACTIVE: DARKFILL_ACTIVE, LIGHTFILL: DAR
 ICONREVERSE_DICT_DARK2LIGHT = {DARKFILL_ACTIVE: LIGHTFILL_ACTIVE, DARKFILL: LIGHTFILL}
 THEMED_ICON_LIST = []
 THEMED_ICON_READY = set()
+# stylesheet.css keeps platform variants next to the rules they replace so the
+# cascade order stays the same: mac themes drop the non-macos blocks (rules
+# that would stop Qt from drawing native scrollbars), every other theme drops
+# the macos blocks.
+NON_MACOS_STYLE_PATTERN = re.compile(
+    r'/\* @non-macos-begin \*/.*?/\* @non-macos-end \*/', re.DOTALL
+)
+MACOS_STYLE_PATTERN = re.compile(
+    r'/\* @macos-begin \*/.*?/\* @macos-end \*/', re.DOTALL
+)
 STYLESHEET_ICON_PATTERN = re.compile(r'url\((["\']?)(?:resources/)?icons/([^)"\']+)\1\)')
 
-def _default_theme() -> str:
-    return 'eva-dark' if pcfg.darkmode else 'eva-light'
+# macOS themes use neutral greys instead of the blue-tinted eva icon fills.
+MAC_ICON_FILLS = {
+    LIGHTFILL_ACTIVE: "fill=\"#5f5f64\"",
+    LIGHTFILL: "fill=\"#b4b4b8\"",
+    DARKFILL_ACTIVE: "fill=\"#c2c2c7\"",
+    DARKFILL: "fill=\"#6c6c70\"",
+}
+MAC_THEME_PREFIX = 'mac-'
+# Icons loaded without an explicit theme on macOS come from one directory that
+# is rewritten when the appearance changes, so QIcon(path) users follow a live
+# switch. Stylesheet urls stay per theme because Qt caches them by url.
+LIVE_ICON_DIR_NAME = 'live'
+_live_icon_theme = ''
 
 def _resolve_theme(theme: str = None) -> str:
-    return theme or _default_theme()
+    return theme or current_theme()
 
 def _themed_icon_cache_dir(theme: str) -> str:
     return osp.join(THEMED_ICON_CACHE_DIR, theme)
@@ -173,20 +195,21 @@ def _list_svg_icons() -> List[str]:
                 THEMED_ICON_LIST.append(filename)
     return THEMED_ICON_LIST
 
-def ensure_themed_icons(theme: str):
-    theme = _resolve_theme(theme)
-    if theme in THEMED_ICON_READY:
-        return
-
-    cache_dir = _themed_icon_cache_dir(theme)
+def _write_themed_icons(theme: str, cache_dir: str) -> None:
     os.makedirs(cache_dir, exist_ok=True)
 
-    if theme == 'eva-dark':
+    if theme.endswith('-dark'):
         pattern = re.compile(re.escape(LIGHTFILL) + '|' + re.escape(LIGHTFILL_ACTIVE))
         rep_dict = ICONREVERSE_DICT_LIGHT2DARK
     else:
         pattern = re.compile(re.escape(DARKFILL) + '|' + re.escape(DARKFILL_ACTIVE))
         rep_dict = ICONREVERSE_DICT_DARK2LIGHT
+    if theme.startswith(MAC_THEME_PREFIX):
+        # Map both source fills straight to the neutral fill of this theme.
+        pattern = re.compile('|'.join(re.escape(fill) for fill in MAC_ICON_FILLS))
+        rep_dict = {
+            fill: MAC_ICON_FILLS[rep_dict.get(fill, fill)] for fill in MAC_ICON_FILLS
+        }
 
     icon_dir = shared.ICON_DIR
     for filename in _list_svg_icons():
@@ -200,9 +223,34 @@ def ensure_themed_icons(theme: str):
                     continue
         with open(cache_path, "w", encoding="utf-8") as f:
             f.write(svg_content)
+
+def ensure_themed_icons(theme: str):
+    theme = _resolve_theme(theme)
+    if theme in THEMED_ICON_READY:
+        return
+    _write_themed_icons(theme, _themed_icon_cache_dir(theme))
     THEMED_ICON_READY.add(theme)
 
+def refresh_live_icons() -> None:
+    """Rewrite the macOS live icon directory for the current theme.
+
+    Icons built with ``QIcon(themed_icon_path(name))`` re-read their SVG once
+    the pixmap cache is dropped; pixmaps a widget rendered itself are not
+    refreshed.
+    """
+    global _live_icon_theme
+    theme = current_theme()
+    if theme == _live_icon_theme:
+        return
+    _write_themed_icons(theme, _themed_icon_cache_dir(LIVE_ICON_DIR_NAME))
+    if _live_icon_theme:
+        QPixmapCache.clear()
+    _live_icon_theme = theme
+
 def themed_icon_path(filename: str, theme: str = None) -> str:
+    if theme is None and shared.ON_MACOS:
+        refresh_live_icons()
+        return osp.join(_themed_icon_cache_dir(LIVE_ICON_DIR_NAME), filename)
     theme = _resolve_theme(theme)
     ensure_themed_icons(theme)
     return osp.join(_themed_icon_cache_dir(theme), filename)
@@ -228,6 +276,11 @@ def parse_stylesheet(theme: str = '') -> str:
         theme = list(theme_dict.keys())[0]
     tgt_theme: Dict = theme_dict[theme]
 
+    if theme.startswith(MAC_THEME_PREFIX):
+        stylesheet = _apply_mac_accent(NON_MACOS_STYLE_PATTERN.sub('', stylesheet))
+    else:
+        stylesheet = MACOS_STYLE_PATTERN.sub('', stylesheet)
+
     ensure_themed_icons(theme)
     stylesheet = STYLESHEET_ICON_PATTERN.sub(lambda m: _replace_stylesheet_icon_url(m, theme), stylesheet)
 
@@ -238,6 +291,17 @@ def parse_stylesheet(theme: str = '') -> str:
     for key, val in tgt_theme.items():
         stylesheet = stylesheet.replace(key, val)
     return stylesheet
+
+def _apply_mac_accent(stylesheet: str) -> str:
+    """Use the system accent for the mac rules and the shared accent literals."""
+    accent = accent_rgb()
+    accent_text = '{}, {}, {}'.format(*accent)
+    if accent != DEFAULT_ACCENT_RGB:
+        # Shared rules spell the accent as rgb()/rgba() literals.
+        stylesheet = stylesheet.replace(
+            '{}, {}, {}'.format(*DEFAULT_ACCENT_RGB), accent_text
+        )
+    return stylesheet.replace('@macAccentRgb', accent_text)
 
 def mutate_dict_key(adict: dict, old_key: Union[str, int], new_key: str):
     # https://stackoverflow.com/questions/12150872/change-key-in-ordereddict-without-losing-order

@@ -423,6 +423,9 @@ class ParamWidget(QWidget):
                 elif param_type == 'secret':
                     param_widget = SecretParamWidget(param_key, size=param_size)
                     param_widget.setText(str(value))
+                    # Module params are saved as plain values; only LLM profile
+                    # keys use the obfuscated storage the default tooltip describes.
+                    param_widget.editor.setToolTip(param_description)
 
                 elif param_type == 'check_group':
                     param_widget = ParamCheckGroup(param_key, check_group=value)

@@ -49,6 +49,7 @@ from ballontranslator.ui.text_engine.pipeline_formatting import (
     apply_auto_tate_chu_yoko,
 )
 from ballontranslator.utils import shared
+from ballontranslator.utils.llm_profiles import LLM_TRANSLATOR_KEY, LLMProfile, default_codex_profile
 from ballontranslator.utils.config import (
     AutoTateChuYokoConfig,
     LLMTranslateContext,
@@ -634,6 +635,79 @@ class RunPipelineDialogTests(unittest.TestCase):
         dialog.close()
         self.assertEqual(self.save_config_mock.call_count, 5)
 
+    def test_llm_translator_preflight_names_the_gap_and_blocks_unusable_runs(self):
+        usable = {'model': 'm', 'model_options': ['m']}
+        profiles = [
+            LLMProfile(id='ready', name='Ready', built_in=True, api_key='key', **usable),
+            LLMProfile(id='no-key', name='No Key', built_in=True, **usable),
+            LLMProfile(id='keyless', name='Local', built_in=True, require_api_key=False, **usable),
+            LLMProfile(id='no-model', name='No Model', built_in=True, api_key='key'),
+            LLMProfile(id='no-url', name='No URL', api_key='key', **usable),
+            default_codex_profile(),
+        ]
+        other_translator = 'google'
+        with patch.object(pcfg.module, 'llm_profiles', profiles), \
+                patch.object(pcfg.module, 'translator', LLM_TRANSLATOR_KEY), \
+                patch.object(pcfg.module, 'translator_llm_id', 'no-key'):
+            dialog = RunPipelineDialog()
+            dialog.show()
+
+            def state() -> tuple[bool, bool, bool]:
+                return (
+                    dialog.setup_warning.isVisible(),
+                    dialog.run_button.isEnabled(),
+                    dialog.continue_button.isEnabled(),
+                )
+
+            self.assertEqual(state(), (True, False, False))
+            self.assertIn('No Key', dialog.setup_warning_label.toolTip())
+            dialog.run_button.click()
+            dialog.continue_button.click()
+            self.assertEqual(dialog.result(), 0)
+            self.assertTrue(dialog.isVisible())
+
+            for profile_id, expected, target in (
+                ('ready', (False, True, True), ''),
+                ('no-model', (True, False, False), 'model'),
+                ('keyless', (False, True, True), ''),
+                # The OpenAI endpoint is the runtime fallback, so this only warns.
+                ('no-url', (True, True, True), 'base_url'),
+                ('codex', (False, True, True), ''),
+                ('no-key', (True, False, False), 'api_key'),
+            ):
+                with self.subTest(profile=profile_id):
+                    pcfg.module.translator_llm_id = profile_id
+                    dialog.refreshLLMSelections()
+                    self.assertEqual(state(), expected)
+                    if target:
+                        self.assertEqual(dialog.llm_setup_target, (profile_id, target))
+
+            translation = next(
+                activator for activator in dialog.module_activators
+                if activator.module_type == 'translator'
+            )
+            translation.button.setChecked(False)
+            self.assertEqual(state(), (False, True, True))
+            translation.button.setChecked(True)
+            self.assertEqual(state(), (True, False, False))
+
+            dialog.workflow_selector.setCurrentIndex(1)
+            self.assertFalse(dialog.setup_warning.isVisible())
+            dialog.workflow_selector.setCurrentIndex(0)
+
+            pcfg.module.translator = other_translator
+            dialog.setModuleSelection('translator', other_translator)
+            self.assertEqual(state(), (False, True, True))
+            pcfg.module.translator = LLM_TRANSLATOR_KEY
+            dialog.setModuleSelection('translator', LLM_TRANSLATOR_KEY)
+            self.assertEqual(state(), (True, False, False))
+
+            dialog.setup_button.click()
+            self.assertEqual(dialog.result(), RunPipelineDialog.SETUP)
+            self.assertEqual(dialog.llm_setup_target, ('no-key', 'api_key'))
+            self.assertFalse(dialog.isVisible())
+            dialog.deleteLater()
+
     def test_module_activator_selector_and_auxiliary_actions(self):
         dialog = RunPipelineDialog()
         activator = dialog.module_activators[0]
@@ -1102,12 +1176,15 @@ class RunPipelineDialogTests(unittest.TestCase):
             on_run_llm_profile_selected=lambda _module_type, _profile_id: None,
             llm_profile_selection_changed=FakeSignal(),
             show_module_param_dialog=lambda _module_type, _module_name: None,
+            focus_llm_profile=lambda profile_id, **kwargs: calls.append((profile_id, kwargs)),
         )
 
         class FakeDialog:
             RUN = RunPipelineDialog.RUN
             CONTINUE = RunPipelineDialog.CONTINUE
             RENDER = RunPipelineDialog.RENDER
+            SETUP = RunPipelineDialog.SETUP
+            llm_setup_target = ('profile-1', 'model')
             result = 0
             preserve_style = False
             pages = ['page-2']
@@ -1165,7 +1242,14 @@ class RunPipelineDialogTests(unittest.TestCase):
             FakeDialog.result = 0
             MainWindow.run_imgtrans(owner)
             self.assertEqual(calls, [])
-            self.assertEqual(FakeDialog.deleted_count, 4)
+
+            FakeDialog.result = FakeDialog.SETUP
+            MainWindow.run_imgtrans(owner)
+            self.assertEqual(
+                calls,
+                [('profile-1', {'expand_details': False, 'target': 'model'})],
+            )
+            self.assertEqual(FakeDialog.deleted_count, 5)
 
     def test_view_actions_only_control_bottom_bar_visibility(self):
         window = QMainWindow()
@@ -1190,7 +1274,8 @@ class RunPipelineDialogTests(unittest.TestCase):
         view_actions = title_bar.viewMenu.actions()
         self.assertEqual(
             [action.text() for action in view_actions[:2]],
-            ['Dark Mode', 'Display Language'],
+            # macOS replaces the toggle with the Appearance submenu.
+            ['Appearance' if shared.ON_MACOS else 'Dark Mode', 'Display Language'],
         )
         self.assertFalse(any(action.isSeparator() for action in view_actions[:2]))
         self.assertFalse(hasattr(title_bar, 'runToolBtn'))

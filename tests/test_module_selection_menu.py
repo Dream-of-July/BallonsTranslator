@@ -160,6 +160,25 @@ class ModuleSelectionMenuTest(unittest.TestCase):
         with patch.object(RunPipelineDialog, 'exec_', interact):
             MainWindow.run_imgtrans(self.window)
 
+    def test_config_shortcut_is_visible_and_stable_without_hover(self) -> None:
+        self.window.show()
+        for name in ('textdet_selector', 'ocr_selector', 'trans_selector', 'inpaint_selector'):
+            with self.subTest(selector=name):
+                widget = getattr(self.window.bottomBar, name)
+                requests = []
+                widget.cfg_clicked.connect(lambda: requests.append(True))
+                self.assertTrue(widget.cfg_btn.isVisible())
+                self.assertFalse(widget.cfg_btn.icon().isNull())
+                width = widget.sizeHint().width()
+                QApplication.sendEvent(widget, QEvent(QEvent.Type.Enter))
+                self.assertEqual(widget.sizeHint().width(), width)
+                QApplication.sendEvent(widget, QEvent(QEvent.Type.Leave))
+                self.assertTrue(widget.cfg_btn.isVisible())
+                self.assertFalse(widget.cfg_btn.icon().isNull())
+                self.assertEqual(widget.sizeHint().width(), width)
+                widget.cfg_btn.click()
+                self.assertEqual(requests, [True])
+
     def test_profiles_are_filtered_and_languages_remain_bottom_bar_only(self) -> None:
         pcfg.module.llm_profiles.append(LLMProfile(
             id='text-only', name='Text only', model='text-model', model_options=['text-model'],

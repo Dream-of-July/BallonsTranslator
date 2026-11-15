@@ -475,6 +475,11 @@ def checkbox_with_label(
         sublock.name_label.setFont(font)
         sublock.layout().removeWidget(checkbox)
         sublock.layout().insertWidget(0, checkbox)
+        if ON_MACOS:
+            # The indicator is stylesheet-drawn, so QMacStyle's native layout
+            # insets would let the label overlap it.
+            checkbox.setAttribute(Qt.WidgetAttribute.WA_LayoutUsesWidgetRect)
+            sublock.layout().setSpacing(6)
         sublock.layout().addItem(QSpacerItem(0, 0, QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding))
         target_block = sublock
     return checkbox, target_block
@@ -636,12 +641,18 @@ class ConfigTable(QTreeView):
         self.setHeaderHidden(True)
         self.setMinimumWidth(190)
         self.setMaximumWidth(240)
+        if ON_MACOS:
+            # Sidebar rows: full-width rounded highlight, no tree chrome.
+            self.setIndentation(8)
+            self.setRootIsDecorated(False)
         self.section_items = {}
 
     def addHeader(self, header: str) -> TableItem:
         rootNode = self.model().invisibleRootItem()
-        ti = TableItem(header, CONFIG_FONTSIZE_TABLE)
+        ti = TableItem(header, CONFIG_FONTSIZE_TABLE - 2 if ON_MACOS else CONFIG_FONTSIZE_TABLE)
         ti.setSelectable(False)
+        if ON_MACOS:
+            ti.setBold(True)
         rootNode.appendRow(ti)
         return ti
 
@@ -662,7 +673,9 @@ class ConfigTable(QTreeView):
         
         index = self.currentIndex()
         if index.isValid():
-            self.model().itemFromIndex(index).setBold(True)
+            if not ON_MACOS:
+                # The macOS sidebar marks the selection with the highlight only.
+                self.model().itemFromIndex(index).setBold(True)
             section_key = self.model().itemFromIndex(index).data(Qt.ItemDataRole.UserRole)
             if section_key is not None:
                 self.section_pressed.emit(section_key)
@@ -1397,7 +1410,12 @@ class ConfigPanel(OutsideClickFramelessMixin, FramelessWindow):
 
         window_layout = QVBoxLayout(surface)
         window_layout.setSpacing(0)
-        window_layout.setContentsMargins(6, 6 if ON_MACOS else 0, 6, 6)
+        if ON_MACOS:
+            # Sidebar and content run edge to edge under the system title bar.
+            window_layout.setContentsMargins(0, 0, 0, 0)
+            splitter.setHandleWidth(1)
+        else:
+            window_layout.setContentsMargins(6, 0, 6, 6)
 
         self.title_bar = QWidget(surface)
         self.title_bar.setObjectName('ConfigPanelTitleBar')

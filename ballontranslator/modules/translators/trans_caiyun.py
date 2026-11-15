@@ -6,7 +6,10 @@ class CaiyunTranslator(BaseTranslator):
     concate_text = False
     cht_require_convert = True
     params: Dict = {
-        'token': '',
+        'token': {
+            'type': 'secret',
+            'value': '',
+        },
         'delay': 0.0
     }
 
@@ -19,7 +22,7 @@ class CaiyunTranslator(BaseTranslator):
     def _translate(self, src_list: List[str]) -> List[str]:
 
         url = "http://api.interpreter.caiyunai.com/v1/translator"
-        token = self.params['token']
+        token = self.get_param_value('token')
         if token == '' or token is None:
             raise MissingTranslatorParams('token')
 

@@ -10,6 +10,7 @@ import numpy as np
 from ...custom_widget import ScrollBar, Widget, SeparatorWidget
 from ..item import TextBlock
 from .context_menu import create_text_edit_context_menu
+from ballontranslator.utils import shared
 from ballontranslator.utils.config import pcfg
 from ...spellcheck import (
     SpellCheckHighlighter,
@@ -855,7 +856,9 @@ class TextEditListScrollArea(QScrollArea):
 
         # ScrollBar(Qt.Orientation.Horizontal, self)
         ScrollBar(Qt.Orientation.Vertical, self)
-        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        if not shared.ON_MACOS:
+            # The custom bar replaces the native one everywhere but macOS.
+            self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
 
         vlayout = QVBoxLayout(self.scrollContent)
         vlayout.setContentsMargins(0, 0, 3, 0)

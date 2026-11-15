@@ -1,10 +1,15 @@
+import gc
 import os
+import threading
+import time
 import unittest
+import weakref
+from typing import Callable
 from unittest.mock import patch
 
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 
-from qtpy.QtCore import Qt
+from qtpy.QtCore import QCoreApplication, QEvent, Qt
 from qtpy.QtGui import QContextMenuEvent
 from qtpy.QtTest import QTest
 from qtpy.QtWidgets import QApplication, QMenu, QVBoxLayout, QWidget
@@ -12,7 +17,11 @@ from qtpy.QtWidgets import QApplication, QMenu, QVBoxLayout, QWidget
 from ballontranslator.ui.llm_profile_widgets import LLMProfilesWidget, ProfileCardWidget
 from ballontranslator.ui.misc import parse_stylesheet
 from ballontranslator.utils.config import pcfg
-from ballontranslator.utils.llm_profiles import default_codex_profile, LLMProfile, default_profile, profile_to_dict
+from ballontranslator.modules.llm_chat import LLMConnectionTestResult
+from ballontranslator.utils.llm_profiles import (
+    default_codex_profile, LLMProfile, default_profile, profile_from_template, profile_to_dict,
+    provider_template_names,
+)
 
 
 class LLMProfileModelSelectorTest(unittest.TestCase):
@@ -342,6 +351,200 @@ class APIProfilesPanelTest(unittest.TestCase):
             panel.copyProfile(codex.id)
             panel.deleteProfile(codex.id)
             self.assertEqual(pcfg.module.llm_profiles, [codex, api])
+
+    def test_new_menu_creates_prefilled_profiles_from_provider_templates(self) -> None:
+        existing = default_profile('DeepSeek')
+        with patch.object(pcfg.module, 'llm_profiles', [existing]):
+            panel = LLMProfilesWidget()
+            self.addCleanup(panel.deleteLater)
+            panel.show()
+            actions = {action.text(): action for action in panel.new_btn.menu().actions()}
+            for name in provider_template_names():
+                self.assertIn(name, actions)
+
+            actions['Moonshot'].trigger()
+            self.app.processEvents()
+            moonshot = pcfg.module.llm_profiles[-1]
+            template = profile_from_template('Moonshot')
+            self.assertEqual(
+                (moonshot.name, moonshot.base_url, moonshot.model, moonshot.built_in, moonshot.api_key),
+                ('Moonshot', template.base_url, template.model, False, ''),
+            )
+            self.assertTrue(moonshot.id.startswith('custom-'))
+            row = panel.rows[moonshot.id]
+            self.assertTrue(row.details.isVisible())
+            self.assertTrue(row.api_key_widget.editor.hasFocus())
+
+            actions['DeepSeek'].trigger()
+            duplicate = pcfg.module.llm_profiles[-1]
+            self.assertEqual(duplicate.name, 'DeepSeek 2')
+            self.assertNotEqual(duplicate.id, existing.id)
+            self.assertEqual(profile_to_dict(existing), profile_to_dict(default_profile('DeepSeek')))
+
+            actions['Zhipu'].trigger()
+            self.assertEqual(pcfg.module.llm_profiles[-1].model, '')
+
+            custom = next(action for text, action in actions.items() if text.startswith('Custom'))
+            custom.trigger()
+            blank = pcfg.module.llm_profiles[-1]
+            self.assertEqual((blank.base_url, blank.model, blank.built_in), ('', '', False))
+            self.assertEqual(len(panel.rows), 5)
+            panel.hide()
+
+
+class ProfileConnectionTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self) -> None:
+        self.release = threading.Event()
+        self.started = 0
+        self.destroyed = 0
+        self.requests: list[tuple[LLMProfile, str]] = []
+        self.result = LLMConnectionTestResult(True, 'Connection successful.', 'ok', ['m1', 'm2', 'm3'])
+        check_patch = patch(
+            'ballontranslator.modules.llm_chat.check_profile_connection', self.check_connection,
+        )
+        check_patch.start()
+        self.addCleanup(check_patch.stop)
+        # A failed assertion must not leave the worker blocked while the patch is removed.
+        self.addCleanup(self.finish_requests)
+
+    def check_connection(self, profile: LLMProfile, *, proxy: str = '', timeout: float = 15.0):
+        self.requests.append((profile, proxy))
+        self.release.wait(10)
+        if isinstance(self.result, Exception):
+            raise self.result
+        return self.result
+
+    def finish_requests(self) -> None:
+        self.release.set()
+        self.wait_until(self.all_workers_destroyed)
+
+    def all_workers_destroyed(self) -> bool:
+        return self.destroyed == self.started
+
+    def on_worker_destroyed(self, *_) -> None:
+        self.destroyed += 1
+
+    def wait_until(self, predicate: Callable[[], bool]) -> None:
+        deadline = time.monotonic() + 10
+        while not predicate() and time.monotonic() < deadline:
+            self.app.processEvents()
+            QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+            time.sleep(0.005)
+        self.assertTrue(predicate())
+
+    def start(self, card: ProfileCardWidget) -> None:
+        card.test_connection_btn.click()
+        self.started += 1
+        card._connection_worker.destroyed.connect(self.on_worker_destroyed)
+
+    def card(self, profile: LLMProfile) -> ProfileCardWidget:
+        card = ProfileCardWidget(profile)
+        self.addCleanup(card.deleteLater)
+        return card
+
+    def test_success_uses_unsaved_fields_and_offers_models_without_saving_them(self) -> None:
+        profile = LLMProfile(
+            id='t', name='T', base_url='https://saved.example/v1',
+            model='m1', model_options=['m1', 'user-added'],
+        )
+        card = self.card(profile)
+        card.api_key_widget.setText('typed-key')
+        card.details.param_widgets['base_url'].setText('https://typed.example/v1')
+        proxy_params = {'LLMTranslator': {'proxy': {'value': 'http://127.0.0.1:7890'}}}
+        with patch.object(pcfg.module, 'translator_params', proxy_params):
+            self.start(card)
+        self.assertFalse(card.test_connection_btn.isEnabled())
+        self.assertTrue(card.connection_status_label.text())
+        card.test_connection_btn.click()
+        self.wait_until(lambda: bool(self.requests))
+        self.release.set()
+        self.wait_until(card.test_connection_btn.isEnabled)
+
+        self.assertEqual(len(self.requests), 1)
+        tested, proxy = self.requests[0]
+        self.assertEqual(
+            (tested.api_key, tested.base_url, tested.model, proxy),
+            ('typed-key', 'https://typed.example/v1', 'm1', 'http://127.0.0.1:7890'),
+        )
+        self.assertEqual((profile.api_key, profile.base_url), ('', 'https://saved.example/v1'))
+        self.assertIn('3', card.connection_status_label.text())
+        self.assertNotIn('typed-key', card.connection_status_label.text())
+        combo = card.model_combo
+        self.assertEqual(
+            [combo.itemText(index) for index in range(combo.count())],
+            ['m1', 'user-added', 'm2', 'm3'],
+        )
+        self.assertEqual(combo.currentText(), 'm1')
+        self.assertEqual(profile.model_options, ['m1', 'user-added'])
+
+        card.syncFromProfile()
+        self.assertEqual(combo.count(), 4)
+        combo.setCurrentText('m3')
+        self.assertEqual(profile.model, 'm3')
+        self.assertEqual(profile.model_options, ['m1', 'user-added', 'm3'])
+
+    def test_failure_and_unexpected_errors_show_a_safe_inline_message(self) -> None:
+        card = self.card(LLMProfile(id='t', name='T', api_key='secret-key', model='m1', model_options=['m1']))
+        self.release.set()
+        self.result = LLMConnectionTestResult(
+            False, 'HTTP 401: Authentication failed. Check the API key.', 'auth', [],
+        )
+        self.start(card)
+        self.wait_until(card.test_connection_btn.isEnabled)
+        self.assertEqual(card.connection_status_label.text(), self.result.message)
+        self.assertEqual(card.model_combo.count(), 1)
+
+        self.result = RuntimeError('proxy rejected secret-key')
+        self.start(card)
+        self.wait_until(card.test_connection_btn.isEnabled)
+        self.assertTrue(card.connection_status_label.text())
+        self.assertNotIn('secret-key', card.connection_status_label.text())
+
+        card.api_key_widget.editor.textEdited.emit('other')
+        self.assertEqual(card.connection_status_label.text(), '')
+
+    def test_fetched_models_do_not_select_a_model_for_an_empty_profile(self) -> None:
+        profile = profile_from_template('Zhipu')
+        card = self.card(profile)
+        card.api_key_widget.setText('typed-key')
+        self.release.set()
+        self.result = LLMConnectionTestResult(True, 'Connection successful.', 'ok', ['glm-a', 'glm-b', 'glm-a'])
+        self.start(card)
+        self.wait_until(card.test_connection_btn.isEnabled)
+        self.assertEqual(card.model_combo.count(), 2)
+        self.assertEqual((card.model_combo.currentText(), profile.model, profile.model_options), ('', '', []))
+
+    def test_deleting_the_card_or_panel_during_a_request_is_safe(self) -> None:
+        first, second = default_profile('OpenAI'), default_profile('DeepSeek')
+        first.api_key = second.api_key = 'key'
+        with patch.object(pcfg.module, 'llm_profiles', [first, second]), \
+                patch.object(pcfg.module, 'translator_llm_id', first.id), \
+                patch.object(pcfg.module, 'ocr_llm_id', first.id), \
+                patch.object(pcfg.module, 'inpaint_llm_id', first.id):
+            panel = LLMProfilesWidget()
+            self.start(panel.rows[second.id])
+            self.start(panel.rows[first.id])
+            self.wait_until(lambda: len(self.requests) == 2)
+            card_ref = weakref.ref(panel.rows[second.id])
+
+            panel.deleteProfile(second.id)
+            QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+            panel.deleteLater()
+            panel_ref = weakref.ref(panel)
+            del panel
+            QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+            gc.collect()
+            self.assertIsNone(card_ref())
+            self.assertIsNone(panel_ref())
+
+            self.assertEqual(self.destroyed, 0)
+            self.release.set()
+            self.wait_until(self.all_workers_destroyed)
+            self.assertEqual(pcfg.module.llm_profiles, [first])
 
 
 if __name__ == '__main__':

@@ -26,6 +26,7 @@ from .llm_modality import (
     LLM_MODALITY_VISION,
     LLM_MODALITY_VISION_COLOR,
 )
+from .appearance import current_theme
 from .misc import themed_icon_path
 from ballontranslator.utils import shared
 from ballontranslator.utils.config import pcfg
@@ -114,11 +115,10 @@ def cfg_icon() -> QIcon:
 
 
 def _theme_value(key: str, fallback: str) -> str:
-    theme = 'eva-dark' if pcfg.darkmode else 'eva-light'
     try:
         with open(shared.THEME_PATH, 'r', encoding='utf8') as f:
             theme_dict = json.loads(f.read())
-        return theme_dict.get(theme, {}).get(key, fallback)
+        return theme_dict.get(current_theme(), {}).get(key, fallback)
     except Exception:
         return fallback
 
@@ -494,10 +494,14 @@ class ModuleSelectionWidget(Widget):
         self.menu.llm_profile_changed.connect(self.llm_profile_changed.emit)
         self.menu.llm_profile_changed.connect(self.updateButtonText)
 
+        # Both shortcuts stay visible so the bar keeps its width on hover.
         self.cfg_btn = SmallConfigPutton(self)
+        self.cfg_btn.setToolTip(self.tr('Config'))
+        self.cfg_btn.setAccessibleName(self.tr('Config'))
         self.cfg_btn.clicked.connect(self.cfg_clicked)
-        self.cfg_btn.hide()
         self.edit_btn = SmallConfigPutton(self)
+        self.edit_btn.setToolTip(self.tr('Edit LLM Profile'))
+        self.edit_btn.setAccessibleName(self.tr('Edit LLM Profile'))
         self.edit_btn.clicked.connect(self.onEditClicked)
         self.edit_btn.hide()
 
@@ -509,21 +513,17 @@ class ModuleSelectionWidget(Widget):
         layout.addWidget(self.cfg_btn)
         self.updateButtonText()
 
-    def enterEvent(self, event: QEvent) -> None:
+    def _refreshAuxButtons(self) -> None:
+        # Icons are theme-dependent files, so they are re-read with each refresh.
+        self.cfg_btn.setIcon(cfg_icon())
         show_edit = self.shouldShowEditButton()
-        _set_bottom_aux_button_visible(self.edit_btn, show_edit)
         if show_edit:
             self.edit_btn.setIcon(QIcon(themed_icon_path('edit.svg')))
-        _set_bottom_aux_button_visible(self.cfg_btn, True)
-        self.cfg_btn.setIcon(cfg_icon())
-        return super().enterEvent(event)
+        _set_bottom_aux_button_visible(self.edit_btn, show_edit)
 
-    def leaveEvent(self, event: QEvent) -> None:
-        self.edit_btn.setIcon(QIcon())
-        self.cfg_btn.setIcon(QIcon())
-        _set_bottom_aux_button_visible(self.edit_btn, False)
-        _set_bottom_aux_button_visible(self.cfg_btn, False)
-        return super().leaveEvent(event)
+    def enterEvent(self, event: QEvent) -> None:
+        self._refreshAuxButtons()
+        return super().enterEvent(event)
 
     def blockSignals(self, block: bool):
         self.selector.blockSignals(block)
@@ -584,8 +584,7 @@ class ModuleSelectionWidget(Widget):
 
     def updateButtonText(self, *args) -> None:
         self.tool_btn.setText(_bottom_tool_button_text(self.menu.selectedText()))
-        if self.llm_modality:
-            _set_bottom_aux_button_visible(self.edit_btn, self.shouldShowEditButton() and self.underMouse())
+        self._refreshAuxButtons()
 
     def shouldShowEditButton(self) -> bool:
         return self.menu.isCurrentLLM()

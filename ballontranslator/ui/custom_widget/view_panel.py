@@ -135,9 +135,11 @@ class PanelArea(QScrollArea):
         self.setWidgetResizable(True)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
         ScrollBar(Qt.Orientation.Vertical, self)
-        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         ScrollBar(Qt.Orientation.Horizontal, self)
-        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        if not shared.ON_MACOS:
+            # The custom bars replace the native ones everywhere but macOS.
+            self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
 
         self.view_widget = ViewWidget(self, panel_name)
         self.view_hide_btn_clicked = self.view_widget.view_hide_btn_clicked

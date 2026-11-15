@@ -2,6 +2,7 @@ from qtpy.QtWidgets import QApplication, QAbstractScrollArea, QGraphicsOpacityEf
 from qtpy.QtCore import QEvent, Qt, QPropertyAnimation, QTimer, Signal, QPoint, Property, QAbstractAnimation
 from qtpy.QtGui import QMouseEvent, QPainter, QColor
 
+from ballontranslator.utils import shared
 from .helper import isDarkTheme
 
 class ScrollBarGroove(QWidget):
@@ -133,6 +134,14 @@ class ScrollBar(QWidget):
     sliderPressed = Signal()
     sliderReleased = Signal()
     sliderMoved = Signal()
+
+    def __new__(cls, *args, **kwargs):
+        # macOS keeps the scroll area's native overlay scrollbar, so no custom
+        # bar is built there: ``ScrollBar(...)`` evaluates to None and call
+        # sites need no platform branch.
+        if shared.ON_MACOS:
+            return None
+        return super().__new__(cls)
 
     def __init__(self, orient: Qt.Orientation, parent: QAbstractScrollArea, fadeout: bool = False, hover_style: bool = False):
         super().__init__(parent)

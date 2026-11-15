@@ -19,6 +19,7 @@ from qtpy.QtWidgets import (
     QDockWidget,
     QFileDialog,
     QFrame,
+    QGraphicsOpacityEffect,
     QGridLayout,
     QHBoxLayout,
     QLabel,
@@ -60,7 +61,13 @@ from ballontranslator.utils.config import (
     save_config,
     TranslateContext,
 )
-from ballontranslator.utils.llm_profiles import LLM_OCR_KEY, LLM_TRANSLATOR_KEY
+from ballontranslator.utils.llm_profiles import (
+    LLM_OCR_KEY,
+    LLM_TRANSLATOR_KEY,
+    LLMProfile,
+    profile_by_id,
+    resolve_api_key,
+)
 from ballontranslator.utils.proj_imgtrans import ProjImgTrans
 from ballontranslator.modules import (
     GET_VALID_INPAINTERS,
@@ -73,6 +80,33 @@ from ballontranslator.modules import (
 RUN_PIPELINE_DIALOG_WIDTH = 510
 RUN_PIPELINE_SETTING_CONTROL_WIDTH = 100
 RUN_PIPELINE_GLOSSARY_DISPLAY_WIDTH = 100
+RUN_PIPELINE_SETUP_PROFILE_NAME_WIDTH = 72
+
+
+def llm_translator_setup_gap(profile: LLMProfile) -> tuple[str, bool]:
+    """Return the first missing profile field and whether it blocks a run.
+
+    The check is local: it mirrors what LLMTranslator rejects before sending.
+    A custom profile without a base URL still runs against the OpenAI default
+    endpoint, so that gap is reported without blocking.
+
+    >>> llm_translator_setup_gap(LLMProfile(id='p', model='m', model_options=['m']))
+    ('api_key', True)
+    >>> llm_translator_setup_gap(LLMProfile(
+    ...     id='p', model='m', model_options=['m'], require_api_key=False, built_in=True))
+    ('', False)
+    """
+    if profile.backend != 'openai':
+        return '', False
+    if profile.require_api_key and not resolve_api_key(profile).strip():
+        return 'api_key', True
+    if not str(profile.model or '').strip() or not any(
+        str(option).strip() for option in profile.model_options
+    ):
+        return 'model', True
+    if not profile.built_in and not str(profile.base_url or '').strip():
+        return 'base_url', False
+    return '', False
 
 
 class PipelineModuleButton(QAbstractButton):
@@ -351,6 +385,7 @@ class RunPipelineDialog(QDialog):
     RUN = 1
     CONTINUE = 2
     RENDER = 3
+    SETUP = 4
     translate_source_changed = Signal(str)
     translate_target_changed = Signal(str)
     module_selected = Signal(str, str)
@@ -371,6 +406,8 @@ class RunPipelineDialog(QDialog):
         self.translator_metadata = translator_metadata or {}
         self._app_event_filter_installed = False
         self._checkbox_settings: dict[QCheckBox, tuple[object, str]] = {}
+        # (profile id, field) for the caller to open once SETUP is returned.
+        self.llm_setup_target: tuple[str, str] = ('', '')
         self.setObjectName('RunPipelineDialog')
         self.setWindowTitle(self.tr('Run'))
         self.setMinimumWidth(RUN_PIPELINE_DIALOG_WIDTH)
@@ -436,6 +473,29 @@ class RunPipelineDialog(QDialog):
         button_row = QHBoxLayout()
         button_row.setContentsMargins(0, 10, 0, 0)
         button_row.setSpacing(8)
+
+        self.setup_warning = QWidget(surface)
+        self.setup_warning.setObjectName('RunPipelineGeneralSettingRow')
+        self.setup_warning.setAttribute(widget_attribute.WA_StyledBackground, True)
+        warning_row = QHBoxLayout(self.setup_warning)
+        warning_row.setContentsMargins(0, 0, 0, 0)
+        warning_row.setSpacing(6)
+        warning_icon = QLabel(self.setup_warning)
+        warning_icon.setFixedSize(16, 16)
+        warning_icon.setPixmap(render_svg_pixmap(
+            themed_icon_path('llm_key_missing.svg'), 16, 16, self.devicePixelRatioF(),
+        ))
+        warning_row.addWidget(warning_icon)
+        self.setup_warning_label = QLabel(self.setup_warning)
+        self.setup_warning_label.setObjectName('RunPipelineSettingLabel')
+        warning_row.addWidget(self.setup_warning_label)
+        self.setup_button = QPushButton(self.tr('Set Up…'), self.setup_warning)
+        self.setup_button.setObjectName('RunPipelineSecondaryButton')
+        self.setup_button.setAutoDefault(False)
+        self.setup_button.clicked.connect(self._finish_setup)
+        warning_row.addWidget(self.setup_button)
+        self.setup_warning.hide()
+        button_row.addWidget(self.setup_warning)
         button_row.addStretch()
 
         self.run_button = QPushButton(self.tr('Run'), surface)
@@ -454,6 +514,16 @@ class RunPipelineDialog(QDialog):
             button_row.addWidget(self.run_button)
             button_row.addWidget(self.continue_button)
 
+        # The themed action buttons have no disabled style outside the macOS
+        # theme, so a blocked run is dimmed there.
+        self._blocked_run_effects = []
+        for button in () if shared.ON_MACOS else (self.run_button, self.continue_button):
+            effect = QGraphicsOpacityEffect(button)
+            effect.setOpacity(0.4)
+            effect.setEnabled(False)
+            button.setGraphicsEffect(effect)
+            self._blocked_run_effects.append(effect)
+
         self.render_button = QPushButton(self.tr('Render'), surface)
         self.render_button.setObjectName('RunPipelinePrimaryButton')
         self.render_button.clicked.connect(self._finish_render)
@@ -469,10 +539,51 @@ class RunPipelineDialog(QDialog):
         self.resize(RUN_PIPELINE_DIALOG_WIDTH, initial_height)
 
     def _finish_run(self, _checked: bool = False) -> None:
-        self.done(self.RUN)
+        if self._refresh_translator_preflight():
+            self.done(self.RUN)
 
     def _finish_continue(self, _checked: bool = False) -> None:
-        self.done(self.CONTINUE)
+        if self._refresh_translator_preflight():
+            self.done(self.CONTINUE)
+
+    def _finish_setup(self, _checked: bool = False) -> None:
+        # Settings is a separate window, so this modal dialog has to close first.
+        self.done(self.SETUP)
+
+    def _refresh_translator_preflight(self) -> bool:
+        """Show what the selected LLM translator still needs; return whether a run may start."""
+        target = ''
+        blocking = False
+        profile = None
+        if (
+            self.content_stack.currentIndex() == 0
+            and pcfg.module.enable_translate
+            and pcfg.module.translator == LLM_TRANSLATOR_KEY
+        ):
+            profile = profile_by_id(pcfg.module.llm_profiles, pcfg.module.translator_llm_id)
+            if profile is not None:
+                target, blocking = llm_translator_setup_gap(profile)
+        if target:
+            message = {
+                'api_key': self.tr('{profile}: API key missing'),
+                'model': self.tr('{profile}: model missing'),
+                'base_url': self.tr('{profile}: base URL missing'),
+            }[target]
+            name = profile.name or profile.id
+            self.llm_setup_target = (profile.id, target)
+            # Only the name is shortened; the missing field must stay readable.
+            self.setup_warning_label.ensurePolished()
+            short_name = self.setup_warning_label.fontMetrics().elidedText(
+                name, Qt.TextElideMode.ElideRight, RUN_PIPELINE_SETUP_PROFILE_NAME_WIDTH,
+            )
+            self.setup_warning_label.setText(message.format(profile=short_name))
+            self.setup_warning_label.setToolTip(message.format(profile=name))
+        self.setup_warning.setVisible(bool(target))
+        for button in (self.run_button, self.continue_button):
+            button.setEnabled(not blocking)
+        for effect in self._blocked_run_effects:
+            effect.setEnabled(blocking)
+        return not blocking
 
     def _finish_render(self, _checked: bool = False) -> None:
         self.done(self.RENDER)
@@ -1448,6 +1559,7 @@ class RunPipelineDialog(QDialog):
                 and self._settings_section_has_content(section_body)
             )
         self._refresh_progress()
+        self._refresh_translator_preflight()
         self._fit_to_current_workflow()
 
     def _on_stage_button_toggled(self, checked: bool) -> None:
@@ -1466,11 +1578,13 @@ class RunPipelineDialog(QDialog):
         for activator in self.module_activators:
             if activator.module_type == module_type:
                 activator.setModule(module_name)
-                return
+                break
+        self._refresh_translator_preflight()
 
     def refreshLLMSelections(self) -> None:
         for activator in self.module_activators:
             activator.refreshSelection()
+        self._refresh_translator_preflight()
 
     def _set_module_settings_expanded(
         self,
@@ -1603,6 +1717,7 @@ class RunPipelineDialog(QDialog):
         self.render_button.setVisible(rendering)
         self.render_button.setDefault(rendering)
         self.run_button.setDefault(not rendering)
+        self._refresh_translator_preflight()
         self._fit_to_current_workflow()
 
     def _on_render_without_text_style_update_changed(self, checked: bool):

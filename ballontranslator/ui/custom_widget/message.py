@@ -3,10 +3,12 @@ import time
 import datetime
 
 from qtpy.QtWidgets import QDialog, QLabel, QHBoxLayout, QVBoxLayout, QMessageBox, QSizePolicy, QProgressBar, QPushButton
-from qtpy.QtGui import  QCloseEvent, QShowEvent
-from qtpy.QtCore import Qt, Signal
+from qtpy.QtGui import  QCloseEvent, QPainter, QPaintEvent, QPen, QShowEvent
+from qtpy.QtCore import QRectF, Qt, Signal
 
+from ballontranslator.utils import shared
 from ballontranslator.utils.shared import remove_from_runtime_widget_set, add_to_runtime_widget_set
+from .helper import borderColor, widgetBackgroundColor
 from .widget import Widget
 
 
@@ -140,6 +142,10 @@ class ProgressMessageBox(QDialog):
         layout = QVBoxLayout(self)
         layout.setSpacing(0)
         layout.setContentsMargins(20, 10, 20, 30)
+        if shared.ON_MACOS:
+            # A frameless window has square corners; paint a rounded surface.
+            self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+            layout.setContentsMargins(20, 16, 20, 20)
 
         self.task_progress_bar: TaskProgressBar = None
         if task_name is not None:
@@ -156,6 +162,15 @@ class ProgressMessageBox(QDialog):
             button_layout.addWidget(self.stop_button)
             button_layout.addStretch()
             layout.addLayout(button_layout)
+
+    def paintEvent(self, event: QPaintEvent) -> None:
+        if not shared.ON_MACOS:
+            return super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QPen(borderColor(), 1))
+        painter.setBrush(widgetBackgroundColor())
+        painter.drawRoundedRect(QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5), 10, 10)
 
     def on_stop_clicked(self):
         self.stop_clicked.emit()

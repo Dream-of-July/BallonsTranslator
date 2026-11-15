@@ -267,6 +267,9 @@ def install_app_style_filters(app):
         ('_menu_style_filter', MenuStyleFilter),
         ('_dropdown_style_filter', DropDownStyleFilter),
     )
+    if shared.ON_MACOS:
+        # Menus keep the native popup window, shadow and check marks on macOS.
+        filter_specs = filter_specs[1:]
     for attribute, filter_class in filter_specs:
         if getattr(app, attribute, None) is not None:
             continue

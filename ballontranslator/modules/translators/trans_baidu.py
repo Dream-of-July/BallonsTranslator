@@ -8,7 +8,10 @@ class BaiduTranslator(BaseTranslator):
     concate_text = False
     cht_require_convert = True
     params: Dict = {
-        'token': '',
+        'token': {
+            'type': 'secret',
+            'value': '',
+        },
         'appId': '',
         'delay': 0.0
     }
@@ -44,8 +47,8 @@ class BaiduTranslator(BaseTranslator):
             batch = query.split('\n')
             query_split_sizes.append(len(batch))
             n_queries.extend(batch)
-        token = self.params['token']
-        appId = self.params['appId']
+        token = self.get_param_value('token')
+        appId = self.get_param_value('appId')
         if token == '' or token is None:
             raise MissingTranslatorParams('token')
         if appId == '' or appId is None:

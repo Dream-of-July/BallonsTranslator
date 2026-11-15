@@ -228,6 +228,11 @@ class TextEffectPanel(PanelArea):
         self.faster_preview_toggle.setObjectName(
             'TextEffectFasterPreviewToggle'
         )
+        # The indicator is stylesheet-drawn; QMacStyle's native layout insets
+        # would clip the text. Other styles have no such insets.
+        self.faster_preview_toggle.setAttribute(
+            Qt.WidgetAttribute.WA_LayoutUsesWidgetRect
+        )
         faster_preview_hint = self.tr(
             'Render live effect changes at half resolution. Committed and '
             'exported text keep full quality.'

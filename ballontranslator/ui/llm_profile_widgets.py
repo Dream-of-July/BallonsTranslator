@@ -22,7 +22,7 @@ from qtpy.QtWidgets import (
     QStyle,
     QStyleOptionGroupBox,
 )
-from qtpy.QtCore import QEvent, QRectF, QTimer, Qt, QUrl, Signal
+from qtpy.QtCore import QEvent, QRectF, QThread, QTimer, Qt, QUrl, Signal
 from qtpy.QtGui import QColor, QDesktopServices, QFont, QIcon, QLinearGradient, QMouseEvent, QPaintEvent, QPainter, QPainterPath, QPen, QPixmap, QRegion
 
 try:
@@ -52,7 +52,10 @@ from ballontranslator.utils.llm_profiles import (
     parse_profile_title,
     copy_profile,
     profile_by_id,
+    profile_from_config,
+    profile_from_template,
     profile_to_export_dict,
+    provider_template_names,
     profiles_from_json,
     restore_builtin_profiles,
     resolve_api_key,
@@ -87,6 +90,50 @@ PROFILE_MODALITY_PARAM_DEFS = {
     ],
 }
 PROFILE_FIELD_TYPES = get_type_hints(LLMProfile)
+
+
+def _llm_translator_proxy() -> str:
+    """Read the saved LLMTranslator proxy without instantiating the translator."""
+    proxy = (pcfg.module.translator_params.get(LLM_TRANSLATOR_KEY) or {}).get('proxy', '')
+    if isinstance(proxy, dict):
+        proxy = proxy.get('value', '')
+    return str(proxy or '').strip()
+
+
+class ProfileConnectionWorker(QThread):
+    """Run one blocking connection check for a detached profile snapshot.
+
+    The application owns the thread, so deleting the requesting card never
+    destroys a request that cannot be interrupted.
+
+    >>> issubclass(ProfileConnectionWorker, QThread)
+    True
+    """
+
+    result_ready = Signal(bool, str, list)
+
+    def __init__(self, profile: LLMProfile, proxy: str) -> None:
+        app = QApplication.instance()
+        super().__init__(app)
+        self._profile = profile
+        self._proxy = proxy
+        self.finished.connect(self.deleteLater)
+        app.aboutToQuit.connect(self._waitForRequest)
+
+    def run(self) -> None:
+        try:
+            # Imported here so the settings page still opens without the HTTP stack.
+            from ballontranslator.modules import llm_chat
+            result = llm_chat.check_profile_connection(self._profile, proxy=self._proxy)
+            ok, message, models = result.ok, result.message, list(result.models)
+        except Exception:
+            # Unexpected diagnostics can echo credentials or proxy URLs.
+            ok, message, models = False, '', []
+        self.result_ready.emit(ok, message, models)
+
+    def _waitForRequest(self) -> None:
+        # Never destroy a running QThread; the request is bounded by its timeout.
+        self.wait()
 
 
 def _widen_profile_editor(editor: QWidget) -> None:
@@ -387,6 +434,9 @@ class ProfileCardWidget(QGroupBox):
         self._previous_vision_model_text = ''
         self._previous_image_model_text = ''
         self._action_buttons_visible = False
+        self._connection_worker: ProfileConnectionWorker | None = None
+        # Listed by the provider; persisted only once the user selects one.
+        self._fetched_models: list[str] = []
         self.profile_param_display_names = {
             'base_url': self.tr('Base URL'),
             'image_base_url': self.tr('Image Base URL'),
@@ -688,6 +738,28 @@ class ProfileCardWidget(QGroupBox):
         self._sync_summary_grid()
         layout.addWidget(self.summary_widget)
 
+        self.connection_row = QWidget(self)
+        self.connection_row.setObjectName('LLMProfileSummaryColumn')
+        self.connection_row.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        connection_layout = QHBoxLayout(self.connection_row)
+        connection_layout.setContentsMargins(0, 2, 0, 0)
+        connection_layout.setSpacing(8)
+        self.test_connection_btn = NoBorderPushBtn(self.tr('Test Connection'), self.connection_row)
+        self.test_connection_btn.setToolTip(self.tr('Check the API key and base URL, and list available models.'))
+        self.test_connection_btn.clicked.connect(self.testConnection)
+        self.connection_status_icon = CachedSvgStatusIcon(self.connection_row)
+        self.connection_status_icon.setObjectName('LLMProfileKeyStatusIcon')
+        self.connection_status_icon.setFixedSize(16, 16)
+        self.connection_status_icon.hide()
+        self.connection_status_label = QLabel(self.connection_row)
+        self.connection_status_label.setObjectName('LLMProfileFieldLabel')
+        self.connection_status_label.setWordWrap(True)
+        self.connection_status_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        connection_layout.addWidget(self.test_connection_btn, 0, Qt.AlignmentFlag.AlignTop)
+        connection_layout.addWidget(self.connection_status_icon, 0, Qt.AlignmentFlag.AlignVCenter)
+        connection_layout.addWidget(self.connection_status_label, 1)
+        layout.addWidget(self.connection_row)
+
         self.details = ProfileDetailsWidget(
             self._detail_params(PROFILE_COMMON_PARAM_DEFS),
             {
@@ -709,6 +781,7 @@ class ProfileCardWidget(QGroupBox):
         self.image_model_combo.paramwidget_edited.connect(self.on_image_model_edited)
         self.api_key_widget.editor.editingFinished.connect(self.on_api_key_finished)
         self.api_key_widget.editor.textChanged.connect(self.on_api_key_text_changed)
+        self.api_key_widget.editor.textEdited.connect(self._clearConnectionStatus)
         self.details.paramwidget_edited.connect(self.on_detail_edited)
         self._position_header_controls()
         self.refreshTextBadge()
@@ -723,7 +796,7 @@ class ProfileCardWidget(QGroupBox):
             editor.scrollbar_h = ScrollBar(Qt.Orientation.Horizontal, editor, fadeout=False, hover_style=True)
 
     def syncFromProfile(self):
-        self._syncComboBox(self.model_combo, self.profile.model_options, self.profile.model)
+        self._syncComboBox(self.model_combo, self._textModelChoices(), self.profile.model)
         self._syncComboBox(self.vision_model_combo, self.profile.vision_model_options, self.profile.vision_model)
         self._syncImageModelCombo()
         vision_detail_combo = self.details.param_widgets.get('vision_detail_level')
@@ -1233,10 +1306,7 @@ class ProfileCardWidget(QGroupBox):
         options.pop(removed_idx)
         self.profile.model_options = options
         next_model = options[min(removed_idx, len(options) - 1)] if options else ''
-        self.model_combo.blockSignals(True)
-        self.model_combo.clear()
-        self.model_combo.addItems(options)
-        self.model_combo.blockSignals(False)
+        self._syncComboBox(self.model_combo, self._textModelChoices(), next_model)
         self._setModelText(next_model, emit_changed=True)
 
     def _setModelText(self, text: str, emit_changed: bool):
@@ -1401,6 +1471,58 @@ class ProfileCardWidget(QGroupBox):
             _, image_model = split_image_model_selection(self.profile.image_model)
             self.remove_image_model_btn.setEnabled(image_model in self.profile.image_model_options)
 
+    def _textModelChoices(self) -> list[str]:
+        options = [str(option) for option in self.profile.model_options if str(option)]
+        return options + [model for model in self._fetched_models if model not in options]
+
+    def _connectionSnapshot(self) -> LLMProfile:
+        """Copy the profile with the editor values that are not committed yet."""
+        snapshot = profile_from_config(self.profile)
+        snapshot.api_key = self.api_key_widget.text()
+        base_url_editor = self.details.param_widgets.get('base_url')
+        if isinstance(base_url_editor, QLineEdit):
+            snapshot.base_url = base_url_editor.text().strip()
+        return snapshot
+
+    def testConnection(self) -> None:
+        if self._connection_worker is not None:
+            return
+        worker = ProfileConnectionWorker(self._connectionSnapshot(), _llm_translator_proxy())
+        worker.result_ready.connect(self._onConnectionResult)
+        self._connection_worker = worker
+        self.test_connection_btn.setEnabled(False)
+        self._setConnectionStatus('', self.tr('Testing…'))
+        worker.start()
+
+    def _onConnectionResult(self, ok: bool, message: str, models: list) -> None:
+        self._connection_worker = None
+        self.test_connection_btn.setEnabled(True)
+        if not ok:
+            self._setConnectionStatus('llm_key_missing.svg', message or self.tr('Connection failed.'))
+            return
+        if models:
+            self._offerFetchedModels(models)
+            status = self.tr('Connected · {count} models').format(count=len(models))
+        else:
+            status = self.tr('Connected')
+        self._setConnectionStatus('llm_key_ok.svg', status)
+
+    def _offerFetchedModels(self, models: list[str]) -> None:
+        if self._model_editing:
+            self.finishModelEdit()
+        self._fetched_models = list(dict.fromkeys(str(model) for model in models if str(model)))
+        self._syncComboBox(self.model_combo, self._textModelChoices(), self.profile.model)
+
+    def _setConnectionStatus(self, icon_file: str, text: str) -> None:
+        self.connection_status_icon.setVisible(bool(icon_file))
+        if icon_file:
+            self.connection_status_icon.setIconFile(icon_file)
+        self.connection_status_label.setText(text)
+
+    def _clearConnectionStatus(self, *_) -> None:
+        if self._connection_worker is None:
+            self._setConnectionStatus('', '')
+
     def on_api_key_finished(self):
         store_api_key(self.profile, self.api_key_widget.text())
         self.profile_changed.emit()
@@ -1465,7 +1587,7 @@ class ProfileCardWidget(QGroupBox):
             options = self.profile.model_options
             if self.profile.model not in options:
                 options.insert(0, self.profile.model)
-        self._syncComboBox(self.model_combo, self.profile.model_options, self.profile.model)
+        self._syncComboBox(self.model_combo, self._textModelChoices(), self.profile.model)
         self.refreshTextBadge()
         self.refreshConditionalVisibility()
         self.profile_changed.emit()
@@ -1600,6 +1722,12 @@ class LLMProfilesWidget(QWidget):
         self.scrollWidget = scrollWidget
         self.rows = {}
         self._selected_profile_ids = self._currentSelectedProfileIds()
+        # A panel-owned timer drops the pending focus request with the panel.
+        self._pending_focus: tuple[str, str, bool] | None = None
+        self._focus_timer = QTimer(self)
+        self._focus_timer.setSingleShot(True)
+        self._focus_timer.setInterval(0)
+        self._focus_timer.timeout.connect(self._applyPendingFocus)
         self.layout = QVBoxLayout(self)
         self.layout.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
         self.layout.setContentsMargins(0, 0, 0, 0)
@@ -1612,8 +1740,13 @@ class LLMProfilesWidget(QWidget):
         self.new_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         self.new_btn.setFixedHeight(24)
         new_menu = QMenu(self.new_btn)
-        new_empty_action = new_menu.addAction(self.tr('New Empty Profile'))
+        for template_name in provider_template_names():
+            new_menu.addAction(template_name).setData(template_name)
+        new_menu.addSeparator()
+        new_empty_action = new_menu.addAction(self.tr('Custom (OpenAI-compatible)'))
+        new_menu.addSeparator()
         import_action = new_menu.addAction(self.tr('Import from Clipboard'))
+        new_menu.triggered.connect(self.onNewMenuTriggered)
         new_empty_action.triggered.connect(self.newProfile)
         import_action.triggered.connect(self.importProfiles)
         self.new_btn.setMenu(new_menu)
@@ -1756,6 +1889,33 @@ class LLMProfilesWidget(QWidget):
         self.focusProfileName(profile.id, deferred=True)
         self.profile_ui_updated.emit()
 
+    def onNewMenuTriggered(self, action: QAction) -> None:
+        template_name = action.data()
+        if isinstance(template_name, str) and template_name:
+            self.newProfileFromTemplate(template_name)
+
+    def newProfileFromTemplate(self, template_name: str) -> LLMProfile:
+        self.filter_edit.clear()
+        profile = profile_from_template(template_name)
+        used_ids = {existing.id for existing in pcfg.module.llm_profiles}
+        if profile.id in used_ids:
+            profile.id = self._new_custom_profile_id()
+        used_names = {existing.name for existing in pcfg.module.llm_profiles}
+        suffix = 2
+        while profile.name in used_names:
+            profile.name = f'{template_name} {suffix}'
+            suffix += 1
+        pcfg.module.llm_profiles.append(profile)
+        row = self.addProfileRow(profile)
+        self.applyFilterToRow(row)
+        if profile.require_api_key:
+            self.focusProfileApiKey(profile.id, deferred=True)
+        else:
+            row.expand()
+            self.ensureRowVisible(row)
+        self.profile_ui_updated.emit()
+        return profile
+
     def copyProfileAsJson(self, profile_id: str):
         if profile_id not in self.rows:
             return
@@ -1860,14 +2020,8 @@ class LLMProfilesWidget(QWidget):
         if deferred:
             # A zero-timeout timer runs on the next Qt event-loop turn, after
             # rebuild/show/layout work has settled enough for focus and scroll.
-            QTimer.singleShot(
-                0,
-                lambda profile_id=profile_id, target=target, expand_details=expand_details: self.focusProfileControl(
-                    profile_id,
-                    target=target,
-                    expand_details=expand_details,
-                ),
-            )
+            self._pending_focus = (profile_id, target, expand_details)
+            self._focus_timer.start()
             return
         if not row.isVisible():
             self.filter_edit.clear()
@@ -1882,8 +2036,11 @@ class LLMProfilesWidget(QWidget):
         elif target == 'image_model':
             row.focusImageModel()
             self.ensureWidgetVisible(row.image_model_combo)
-        elif target == 'image_base_url':
-            row.focusDetailLineEditor(target, self.tr('Image Base URL'))
+        elif target in ('base_url', 'image_base_url'):
+            row.focusDetailLineEditor(
+                target,
+                self.tr('Base URL') if target == 'base_url' else self.tr('Image Base URL'),
+            )
             widget = row.details.param_widgets.get(target)
             if widget is not None:
                 self.ensureWidgetVisible(widget)
@@ -1904,10 +2061,21 @@ class LLMProfilesWidget(QWidget):
         if row is None:
             return
         if deferred:
-            QTimer.singleShot(0, lambda profile_id=profile_id: self.focusProfileName(profile_id))
+            self._pending_focus = (profile_id, 'name', False)
+            self._focus_timer.start()
             return
         row.startNameEdit()
         self.ensureRowVisible(row)
+
+    def _applyPendingFocus(self) -> None:
+        if self._pending_focus is None:
+            return
+        profile_id, target, expand_details = self._pending_focus
+        self._pending_focus = None
+        if target == 'name':
+            self.focusProfileName(profile_id)
+        else:
+            self.focusProfileControl(profile_id, target=target, expand_details=expand_details)
 
     def ensureRowVisible(self, row: QWidget):
         self.ensureWidgetVisible(row)
