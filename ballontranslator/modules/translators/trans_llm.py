@@ -140,6 +140,11 @@ class LLMTranslator(LLMChatRequester, BaseTranslator):
             "display_name": "Retry Timeout",
             "description": "Delay between retries in seconds.",
         },
+        "request timeout": {
+            "value": 120.0,
+            "display_name": "Request Timeout",
+            "description": "Overall request time limit in seconds. Invalid or non-positive values use 120 seconds.",
+        },
         "proxy": {
             "value": "",
             "display_name": "Proxy",
@@ -1069,7 +1074,7 @@ class LLMTranslator(LLMChatRequester, BaseTranslator):
         if profile.backend == 'codex':
             from ..codex import CodexTurnState
             request_kwargs['codex_turn'] = CodexTurnState()
-        attempts = max(1, int(self.get_param_value('retry attempts')))
+        attempts = self._retry_attempts()
         for attempt in range(1, attempts + 1):
             if self.stop_event is not None and self.stop_event.is_set():
                 raise LLMRequestStopped()
@@ -1236,6 +1241,12 @@ class LLMTranslator(LLMChatRequester, BaseTranslator):
             self._translation_codex_response = result
         return result.content
 
+    def _retry_attempts(self) -> int:
+        try:
+            return max(1, int(self.get_param_value('retry attempts')))
+        except (TypeError, ValueError, OverflowError):
+            return 5
+
     def _translate(
         self,
         src_list: Sequence[str],
@@ -1285,6 +1296,7 @@ class LLMTranslator(LLMChatRequester, BaseTranslator):
             ),
         )
         retry_attempt = 0
+        attempts = self._retry_attempts()
         provider_attempt = 0
         active_context = request_context
         has_optional_summaries = bool(
@@ -1382,7 +1394,7 @@ class LLMTranslator(LLMChatRequester, BaseTranslator):
                 if isinstance(e, InvalidNumTranslations):
                     self.logger.error(f"Failed to parse matching translation count for prompt:\n{prompt}\n{e}")
                 retry_attempt += 1
-                if retry_attempt >= self.get_param_value('retry attempts'):
+                if retry_attempt >= attempts:
                     self.logger.error(f"LLM translation failed: {e}")
                     self.logger.debug(traceback.format_exc())
                     raise

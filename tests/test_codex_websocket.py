@@ -302,7 +302,8 @@ class CodexWebSocketTest(unittest.TestCase):
         self.call()
         with patch('ballontranslator.modules.responses_ws.threading.Thread', wraps=threading.Thread) as worker:
             self.call()
-        worker.assert_not_called()
+        self.assertFalse(any(call.kwargs.get('name') == 'Responses WebSocket'
+                             for call in worker.call_args_list))
         self.assertEqual(self.connect.await_count, 1)
         self.assertEqual(len(self.http_requests), 2)
         bodies = [json.loads(request.content) for request in self.http_requests]

@@ -248,6 +248,75 @@ class EngineTests(unittest.TestCase):
         self.assertEqual([m for m in self.messages() if m.get('event')=='run_finished'][-1]['failed_pages'], ['001.png'])
         self.assertNotIn('private detail', self.sink.getvalue())
 
+    def test_watchdog_stops_stalled_run_and_allows_next_run(self):
+        manager = self.server.manager
+        self.call('set_settings', dict(translator=dict(kind='google')))
+        with patch.dict(os.environ, BALLOONTRANS_ENGINE_STALL_SECONDS='1'), \
+                patch.object(manager, '_prepare_modules_then'), \
+                patch.object(manager, 'stopImgtransPipeline', wraps=manager.stopImgtransPipeline) as stop:
+            self.assertTrue(self.call('run')['result']['started'])
+            deadline = time.monotonic() + 3
+            while self.server.active and time.monotonic() < deadline:
+                self.app.processEvents()
+                time.sleep(.01)
+            self.assertFalse(self.server.active)
+            stop.assert_called_once()
+            events = [m for m in self.messages() if 'event' in m]
+            errors = [m for m in events if m['event'] == 'error']
+            self.assertEqual(errors, [dict(event='error',
+                message='The run stopped because a stage stopped responding.')])
+            finished = [m for m in events if m['event'] == 'run_finished']
+            self.assertEqual(len(finished), 1)
+            self.assertEqual(finished[0]['failed_pages'], ['001.png'])
+            self.assertFalse(finished[0]['cancelled'])
+            self.assertLess(events.index(errors[0]), events.index(finished[0]))
+            self.assertTrue(self.call('run')['result']['started'])
+            self.call('cancel')
+            self.server.settle()
+            self.assertFalse(self.server.active)
+
+    def test_watchdog_exempts_silent_model_preparation_and_packages(self):
+        manager = self.server.manager
+        self.call('set_settings', dict(translator=dict(kind='google')))
+        for module, worker in (('detector', manager.textdetect_thread),
+                               ('packages', manager.package_install_thread)):
+            with self.subTest(module=module), \
+                    patch.dict(os.environ, BALLOONTRANS_ENGINE_STALL_SECONDS='1'), \
+                    patch.object(manager, '_prepare_modules_then'), \
+                    patch.object(worker, 'isRunning', return_value=True):
+                self.assertTrue(self.call('run')['result']['started'])
+                self.server.prepare_progress(module, {'event': 'loading_model'})
+                deadline = time.monotonic() + 1.2
+                while time.monotonic() < deadline:
+                    self.app.processEvents()
+                    time.sleep(.01)
+                self.assertTrue(self.server.active)
+                self.assertFalse(any(m.get('event') == 'error' for m in self.messages()))
+            self.server.check_stall()
+            self.assertTrue(self.server.active)
+            self.call('cancel')
+            self.server.settle()
+            self.assertFalse(self.server.active)
+
+    def test_watchdog_tracks_progress_and_silent_prepare_queue(self):
+        manager = self.server.manager
+        self.call('set_settings', dict(translator=dict(kind='google')))
+        with patch.dict(os.environ, BALLOONTRANS_ENGINE_STALL_SECONDS='1'), \
+                patch.object(manager, '_prepare_modules_then'):
+            self.call('run')
+            self.server.last_progress = time.monotonic() - 2
+            with patch.object(manager, '_pending_prepare_success', object()):
+                self.server.check_stall()
+                self.assertFalse(self.server.stalled)
+            self.server.stage_progress('translate', 1)
+            stamp = self.server.last_progress
+            self.server.stage_progress('translate', 1)
+            self.assertEqual(self.server.last_progress, stamp)
+            self.server.check_stall()
+            self.assertFalse(self.server.stalled)
+            self.call('cancel')
+            self.server.settle()
+
     def test_dpi_ink_measurement(self):
         from ballontranslator.utils import shared
         from ballontranslator.utils.textblock import TextBlock

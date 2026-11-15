@@ -1,5 +1,6 @@
 import json
 import threading
+import time
 import unittest
 from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
@@ -422,7 +423,7 @@ class LLMChatRequesterTest(unittest.TestCase):
             usage=usage,
         )
         completions = SimpleNamespace(create=mock.Mock(return_value=completion))
-        client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+        client = SimpleNamespace(chat=SimpleNamespace(completions=completions), close=mock.Mock())
         api_args = {'model': 'gpt-5.5', 'messages': []}
 
         with (
@@ -459,7 +460,7 @@ class LLMChatRequesterTest(unittest.TestCase):
             )],
             usage=usage,
         )
-        client = SimpleNamespace(chat=SimpleNamespace(
+        client = SimpleNamespace(close=mock.Mock(), chat=SimpleNamespace(
             completions=SimpleNamespace(
                 create=mock.Mock(return_value=completion)
             )
@@ -489,7 +490,7 @@ class LLMChatRequesterTest(unittest.TestCase):
                 create=mock.Mock(side_effect=error)
             )
             return SimpleNamespace(
-                chat=SimpleNamespace(completions=completions)
+                chat=SimpleNamespace(completions=completions), close=mock.Mock()
             )
 
         with (
@@ -545,6 +546,8 @@ class LLMChatRequesterTest(unittest.TestCase):
             api_key='sk-demo',
             base_url='https://api.openai.com/v1',
             http_client=http_client,
+            timeout=httpx.Timeout(120.0, connect=10.0),
+            max_retries=0,
         )
 
     def test_full_chat_endpoint_is_requested_once(self):
@@ -592,6 +595,146 @@ class LLMChatRequesterTest(unittest.TestCase):
 
         with self.assertRaises(LLMRequestStopped):
             self.requester._wait(5)
+
+    def test_timeout_defaults_and_http_limits_are_finite(self) -> None:
+        self.assertEqual(self.requester._request_timeout(), 120.0)
+        for value in (None, 0, -1, float('inf'), -float('inf'), float('nan'), 'invalid'):
+            self.requester.values['request timeout'] = value
+            self.assertEqual(self.requester._request_timeout(), 120.0)
+        for value in (0.03, 30):
+            self.requester.values['request timeout'] = value
+            with self.requester._http_client('') as client:
+                self.assertEqual(client.timeout.read, value)
+                self.assertEqual(client.timeout.write, value)
+                self.assertEqual(client.timeout.pool, value)
+                self.assertEqual(client.timeout.connect, min(10, value))
+
+    def test_retry_timeout_does_not_change_request_budget(self) -> None:
+        for budget in (None, 0.2):
+            if budget is not None:
+                self.requester.values['request timeout'] = budget
+            for delay in (0.001, 7.0, 300.0):
+                self.requester.values['retry timeout'] = delay
+                self.assertEqual(self.requester._request_timeout(), budget or 120.0)
+
+    def test_request_slower_than_retry_delay_succeeds_within_request_timeout(self) -> None:
+        self.requester.values.update({'retry timeout': 0.001, 'request timeout': 0.5})
+        self.profile.base_url = 'https://provider.test/v1'
+
+        def respond(request: httpx.Request) -> httpx.Response:
+            time.sleep(0.03)
+            return httpx.Response(200, json={'choices': [{
+                'index': 0, 'finish_reason': 'stop',
+                'message': {'role': 'assistant', 'content': 'ok'},
+            }]})
+
+        with httpx.Client(transport=httpx.MockTransport(respond)) as client, \
+                mock.patch.object(self.requester, '_http_client', return_value=client):
+            started = time.monotonic()
+            result = self.requester.request_chat_completion(
+                self.profile, {'model': 'test', 'messages': []})
+            self.assertGreater(time.monotonic() - started, 0.001)
+            self.assertEqual(result.content, 'ok')
+
+    def test_nonreturning_transport_obeys_total_budget_and_discards_late_result(self) -> None:
+        entered, release, closed = threading.Event(), threading.Event(), threading.Event()
+        requests = []
+
+        def respond(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            entered.set()
+            release.wait(2)
+            return httpx.Response(200, json={'choices': []})
+
+        self.requester.values['request timeout'] = 0.05
+        self.profile.base_url = 'https://provider.test/v1'
+        client = httpx.Client(transport=httpx.MockTransport(respond))
+        original_close = client.close
+
+        def close() -> None:
+            original_close()
+            closed.set()
+
+        client.close = close
+        try:
+            with mock.patch.object(self.requester, '_http_client', return_value=client):
+                started = time.monotonic()
+                with self.assertRaisesRegex(TimeoutError, 'time limit'):
+                    self.requester.request_chat_completion(self.profile, {'model': 'test', 'messages': []})
+                self.assertLess(time.monotonic() - started, 0.5)
+            self.assertTrue(entered.is_set())
+            self.assertIsNone(self.requester.client)
+            self.assertEqual(requests[0].extensions['timeout']['read'], 0.05)
+            self.assertEqual(requests[0].extensions['timeout']['connect'], 0.05)
+        finally:
+            release.set()
+            self.assertTrue(closed.wait(2))
+
+    def test_stop_interrupts_an_inflight_request(self) -> None:
+        entered, release, closed = threading.Event(), threading.Event(), threading.Event()
+        stop = threading.Event()
+        self.requester.set_stop_event(stop)
+        self.requester.values['request timeout'] = 30
+        self.profile.base_url = 'https://provider.test/v1'
+        errors = []
+
+        def respond(request: httpx.Request) -> httpx.Response:
+            entered.set()
+            release.wait(2)
+            return httpx.Response(200, json={'choices': []})
+
+        client = httpx.Client(transport=httpx.MockTransport(respond))
+        original_close = client.close
+
+        def close() -> None:
+            original_close()
+            closed.set()
+
+        client.close = close
+
+        def request() -> None:
+            try:
+                self.requester.request_chat_completion(self.profile, {'model': 'test', 'messages': []})
+            except Exception as error:
+                errors.append(error)
+
+        worker = threading.Thread(target=request)
+        try:
+            with mock.patch.object(self.requester, '_http_client', return_value=client):
+                worker.start()
+                self.assertTrue(entered.wait(2))
+                stop.set()
+                worker.join(0.5)
+                self.assertFalse(worker.is_alive())
+                self.assertEqual(len(errors), 1)
+                self.assertIsInstance(errors[0], LLMRequestStopped)
+        finally:
+            release.set()
+            worker.join(2)
+            self.assertTrue(closed.wait(2))
+
+    def test_native_streaming_request_has_an_overall_deadline(self) -> None:
+        from ballontranslator.modules.openai_responses import OpenAIResponsesSession
+        from ballontranslator.modules.llm_chat import LLMChatResult
+        cancelled = threading.Event()
+        self.requester.values['request timeout'] = 0.05
+
+        def respond(session: OpenAIResponsesSession, args: dict, profile: LLMProfile,
+                    stop: threading.Event) -> LLMChatResult:
+            if stop.wait(2):
+                cancelled.set()
+            return LLMChatResult('late response')
+
+        with mock.patch.object(OpenAIResponsesSession, 'request_chat', respond):
+            started = time.monotonic()
+            with self.assertRaises(TimeoutError):
+                self.requester.request_chat_completion(self.profile, {
+                    'model': 'gpt-5.5', 'messages': [{'role': 'user', 'content': 'test'}],
+                })
+            self.assertLess(time.monotonic() - started, 0.5)
+        self.assertTrue(cancelled.wait(1))
+        self.assertIsNone(self.requester._openai_session)
+        self.requester.client.close()
 
 
 if __name__ == '__main__':
