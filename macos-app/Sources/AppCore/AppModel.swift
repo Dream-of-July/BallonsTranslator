@@ -25,20 +25,7 @@ public final class AppModel {
     }
 
     public enum PageStatus: Sendable {
-        case pending, inProgress, done, needsReview, failed
-    }
-
-    public enum PagePreview: Hashable, Sendable {
-        case original, detection, cleaned, result
-
-        public func available(on page: Page) -> Bool {
-            switch self {
-            case .original: true
-            case .detection: !page.blocks.isEmpty
-            case .cleaned: page.inpainted != nil
-            case .result: page.result != nil
-            }
-        }
+        case pending, inProgress, done, failed
     }
 
     /// An inline, dismissible message with at most one way to fix it.
@@ -74,11 +61,9 @@ public final class AppModel {
     }
     public var selectedBlock: Int?
     public var notice: Notice?
-    public var preview: PagePreview = .result
-    public var showsOriginal: Bool {
-        get { preview == .original }
-        set { preview = newValue ? .original : .result }
-    }
+    public var showsOriginal = false
+    /// Changes whenever the selected block should be scrolled into view.
+    public private(set) var revealRequest = 0
     /// Multiplier on the fit-to-window scale; 1 shows the whole page.
     public var zoom = 1.0
     /// Profile to show when Settings opens after a "translator not ready" error.
@@ -243,7 +228,6 @@ public final class AppModel {
         if failedPages.contains(page.name) { return .failed }
         // A page of the current run counts as in progress until its result arrives.
         if let run, run.pages.contains(page.name), !finishedInRun.contains(page.name) { return .inProgress }
-        if page.result != nil, page.reviewCount > 0 { return .needsReview }
         return page.done ? .done : .pending
     }
 
@@ -265,6 +249,43 @@ public final class AppModel {
         if page.name == selectedPage, let selectedBlock, !page.blocks.contains(where: { $0.index == selectedBlock }) {
             self.selectedBlock = nil
         }
+    }
+
+    // MARK: - Review
+
+    /// Blocks of a translated page whose translation was withheld and still needs a look.
+    public func reviewCount(of page: Page) -> Int {
+        page.result == nil ? 0 : page.reviewCount
+    }
+
+    public var translatedPageCount: Int {
+        project?.pages.count(where: \.done) ?? 0
+    }
+
+    public var reviewTotal: Int {
+        project?.pages.reduce(0) { $0 + reviewCount(of: $1) } ?? 0
+    }
+
+    /// Selects the next block to review on the current page, wrapping around; when the page
+    /// has none left, the first one on the next page that has some. Returns false when nothing is left.
+    @discardableResult
+    public func selectNextReview() -> Bool {
+        guard let pages = project?.pages,
+              let current = pages.firstIndex(where: { $0.name == selectedPage }) else { return false }
+        if reviewCount(of: pages[current]) > 0 {
+            let waiting = pages[current].blocks.filter(\.needsReview).map(\.index)
+            let next = waiting.firstIndex { $0 == selectedBlock }.map { ($0 + 1) % waiting.count } ?? 0
+            selectedBlock = waiting[next]
+        } else {
+            let following = (1..<pages.count).map { pages[(current + $0) % pages.count] }
+            guard let page = following.first(where: { reviewCount(of: $0) > 0 }),
+                  let block = page.blocks.first(where: \.needsReview) else { return false }
+            selectedPage = page.name
+            selectedBlock = block.index
+        }
+        showsOriginal = false
+        revealRequest += 1
+        return true
     }
 
     // MARK: - Translate / export
@@ -358,6 +379,24 @@ public final class AppModel {
         if let batch = queue.enqueue(edit, autofit: autofit, page: pageName) {
             send(batch)
         }
+    }
+
+    /// Moves or resizes a block's box. A withheld block has nothing drawn, so it stays where it is.
+    public func setRect(_ rect: CGRect, ofBlock index: Int, on pageName: String) {
+        guard let block = project?.pages.first(where: { $0.name == pageName })?.blocks.first(where: { $0.index == index }),
+              !block.isWithheld else { return }
+        apply(BlockEdit(index: index, rect: rect), to: pageName)
+    }
+
+    /// Whether the engine can leave a block untranslated on purpose.
+    public var canKeepOriginal: Bool {
+        if case .ready(let hello) = engineState { hello.capabilities.contains(Hello.keepOriginal) } else { false }
+    }
+
+    /// Leaves a withheld block as it is on the page; it no longer counts as "to review".
+    public func keepOriginal(_ index: Int, on pageName: String) {
+        guard canKeepOriginal else { return }
+        apply(BlockEdit(index: index, keepOriginal: true), to: pageName)
     }
 
     /// Removes a block. Not undoable: protocol v1 has no way to bring a block back, and

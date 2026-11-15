@@ -21,6 +21,12 @@ private func encodeToValue(_ value: some Encodable) throws -> JSONValue {
         {"protocol": 1, "engine_version": "1.5.21", "device": null, "torch_installed": false, "models_ready": false}
         """)
         #expect(noDevice.device == nil)
+        #expect(noDevice.capabilities.isEmpty)
+        let capable = try decode(Hello.self, """
+        {"protocol": 1, "engine_version": "x", "device": null, "torch_installed": true, "models_ready": true,
+         "capabilities": ["keep_original"]}
+        """)
+        #expect(capable.capabilities == [Hello.keepOriginal])
     }
 
     @Test func projectPageAndBlockDecode() throws {
@@ -110,6 +116,9 @@ private func encodeToValue(_ value: some Encodable) throws -> JSONValue {
         let edit = BlockEdit(index: 2, rect: CGRect(x: 1, y: 2, width: 30, height: 40), fontSize: 28, bold: true)
         #expect(try encodeToValue(edit) == ["index": 2, "rect": [1, 2, 30, 40], "font_size": 28, "bold": true])
         #expect(try encodeToValue(edit).decode(BlockEdit.self) == edit)
+        let correction = BlockEdit(index: 1, translation: "b", sourceText: "a", keepOriginal: false)
+        #expect(try encodeToValue(correction) == ["index": 1, "source_text": "a", "translation": "b", "keep_original": false])
+        #expect(try encodeToValue(correction).decode(BlockEdit.self) == correction)
 
         let patch = SettingsPatch(targetLanguage: "English", translator: .llm(profileID: "abc"))
         #expect(try encodeToValue(patch) == ["target_language": "English", "translator": ["kind": "llm", "profile_id": "abc"]])
@@ -134,5 +143,13 @@ private func encodeToValue(_ value: some Encodable) throws -> JSONValue {
         var edited = block
         merged.apply(to: &edited)
         #expect(edited.translation == "b" && edited.fontSize == 24 && edited.bold)
+
+        var withheld = Block(index: 0, rect: block.rect, sourceRect: CGRect(x: 2, y: 2, width: 6, height: 6), reviewReason: "overflow")
+        #expect(withheld.needsReview && withheld.visibleRect == withheld.sourceRect)
+        let keep = BlockEdit(index: 0, keepOriginal: true)
+        #expect(keep.inverse(from: withheld) == BlockEdit(index: 0, keepOriginal: false))
+        keep.apply(to: &withheld)
+        #expect(withheld.isWithheld && !withheld.needsReview)
+        #expect(!block.isWithheld && block.visibleRect == block.rect)
     }
 }

@@ -12,6 +12,11 @@ public struct Hello: Codable, Equatable, Sendable {
     public var device: String?
     public var torchInstalled: Bool
     public var modelsReady: Bool
+    /// Optional protocol additions this engine accepts; empty for engines that list none.
+    public var capabilities: [String]
+
+    /// Capability: `update_blocks` edits may carry `keep_original`.
+    public static let keepOriginal = "keep_original"
 
     enum CodingKeys: String, CodingKey {
         case protocolVersion = "protocol"
@@ -19,14 +24,27 @@ public struct Hello: Codable, Equatable, Sendable {
         case device
         case torchInstalled = "torch_installed"
         case modelsReady = "models_ready"
+        case capabilities
     }
 
-    public init(protocolVersion: Int, engineVersion: String, device: String?, torchInstalled: Bool, modelsReady: Bool) {
+    public init(protocolVersion: Int, engineVersion: String, device: String?, torchInstalled: Bool, modelsReady: Bool,
+                capabilities: [String] = []) {
         self.protocolVersion = protocolVersion
         self.engineVersion = engineVersion
         self.device = device
         self.torchInstalled = torchInstalled
         self.modelsReady = modelsReady
+        self.capabilities = capabilities
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        protocolVersion = try c.decode(Int.self, forKey: .protocolVersion)
+        engineVersion = try c.decode(String.self, forKey: .engineVersion)
+        device = try c.decodeIfPresent(String.self, forKey: .device)
+        torchInstalled = try c.decode(Bool.self, forKey: .torchInstalled)
+        modelsReady = try c.decode(Bool.self, forKey: .modelsReady)
+        capabilities = try c.decodeIfPresent([String].self, forKey: .capabilities) ?? []
     }
 }
 
@@ -137,7 +155,15 @@ public struct Block: Codable, Equatable, Sendable, Identifiable {
     public var italic: Bool
 
     public var id: Int { index }
-    public var needsReview: Bool { reviewReason != nil && reviewReason != "protected" }
+    /// The translation is not drawn; the original text is still on the page.
+    public var isWithheld: Bool { reviewReason != nil }
+    /// Withheld because of a problem, not on purpose.
+    public var needsReview: Bool { isWithheld && reviewReason != Self.protected }
+    /// Where the block shows on the page: the detected box while withheld, the render box otherwise.
+    public var visibleRect: CGRect { isWithheld ? sourceRect ?? rect : rect }
+
+    /// `review_reason` of a block that is left untranslated on purpose.
+    public static let protected = "protected"
 
     enum CodingKeys: String, CodingKey {
         case index, rect, angle
@@ -221,6 +247,8 @@ public struct BlockEdit: Codable, Equatable, Sendable {
     public var alignment: BlockAlignment?
     public var bold: Bool?
     public var italic: Bool?
+    /// `true` leaves the block untranslated on purpose; `false` withdraws that.
+    public var keepOriginal: Bool?
 
     enum CodingKeys: String, CodingKey {
         case index, translation, rect, angle
@@ -228,13 +256,15 @@ public struct BlockEdit: Codable, Equatable, Sendable {
         case fontFamily = "font_family"
         case fontSize = "font_size"
         case color, alignment, bold, italic
+        case keepOriginal = "keep_original"
     }
 
     public init(index: Int, translation: String? = nil, rect: CGRect? = nil, angle: Double? = nil,
                 fontFamily: String? = nil, fontSize: Double? = nil, color: RGB? = nil,
                 alignment: BlockAlignment? = nil, bold: Bool? = nil, italic: Bool? = nil,
-                sourceText: String? = nil) {
+                sourceText: String? = nil, keepOriginal: Bool? = nil) {
         self.index = index
+        self.keepOriginal = keepOriginal
         self.sourceText = sourceText
         self.translation = translation
         self.rect = rect
@@ -261,6 +291,7 @@ public struct BlockEdit: Codable, Equatable, Sendable {
         alignment = try c.decodeIfPresent(BlockAlignment.self, forKey: .alignment)
         bold = try c.decodeIfPresent(Bool.self, forKey: .bold)
         italic = try c.decodeIfPresent(Bool.self, forKey: .italic)
+        keepOriginal = try c.decodeIfPresent(Bool.self, forKey: .keepOriginal)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -276,6 +307,7 @@ public struct BlockEdit: Codable, Equatable, Sendable {
         try c.encodeIfPresent(alignment, forKey: .alignment)
         try c.encodeIfPresent(bold, forKey: .bold)
         try c.encodeIfPresent(italic, forKey: .italic)
+        try c.encodeIfPresent(keepOriginal, forKey: .keepOriginal)
     }
 
     /// Later values win; used to coalesce queued edits of one block.
@@ -291,6 +323,7 @@ public struct BlockEdit: Codable, Equatable, Sendable {
         merged.alignment = other.alignment ?? alignment
         merged.bold = other.bold ?? bold
         merged.italic = other.italic ?? italic
+        merged.keepOriginal = other.keepOriginal ?? keepOriginal
         return merged
     }
 
@@ -305,6 +338,12 @@ public struct BlockEdit: Codable, Equatable, Sendable {
         if let alignment { block.alignment = alignment }
         if let bold { block.bold = bold }
         if let italic { block.italic = italic }
+        if keepOriginal == true {
+            block.reviewReason = Block.protected
+        } else if keepOriginal == false, block.reviewReason == Block.protected {
+            // Withheld again; the engine's reply carries the actual reason.
+            block.reviewReason = "untranslated"
+        }
     }
 
     /// The edit that restores `block`'s current values for every field this edit sets.
@@ -320,7 +359,8 @@ public struct BlockEdit: Codable, Equatable, Sendable {
             alignment: alignment.map { _ in block.alignment },
             bold: bold.map { _ in block.bold },
             italic: italic.map { _ in block.italic },
-            sourceText: sourceText.map { _ in block.sourceText }
+            sourceText: sourceText.map { _ in block.sourceText },
+            keepOriginal: keepOriginal.map { !$0 }
         )
     }
 }

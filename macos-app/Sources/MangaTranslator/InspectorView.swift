@@ -25,7 +25,11 @@ private struct BlockForm: View {
     @State private var draft: String
     @State private var sourceDraft: String
     @State private var color: Color
-    @FocusState private var isEditingTranslation: Bool
+    @FocusState private var focus: Field?
+
+    private enum Field {
+        case source, translation
+    }
 
     init(page: String, block: Block) {
         self.page = page
@@ -38,15 +42,26 @@ private struct BlockForm: View {
     var body: some View {
         Form {
             // Own strings table: "Original" and "Translation" mean other things elsewhere in the app.
+            if block.needsReview {
+                Section {
+                    Label {
+                        Text(verbatim: block.reviewMessage)
+                    } icon: {
+                        Image(systemName: "exclamationmark.circle.fill")
+                            .foregroundStyle(.orange)
+                    }
+                }
+            }
             Section {
                 if block.needsReview {
-                    Label(reviewMessage, systemImage: "exclamationmark.circle")
-                        .foregroundStyle(.orange)
-                    TextField("Recognized text", text: $sourceDraft, axis: .vertical)
-                    Button("Save correction") {
-                        model.apply(BlockEdit(index: block.index, sourceText: sourceDraft), autofit: true, to: page)
+                    // What was read may be the problem, so it can be corrected here.
+                    TextField(text: $sourceDraft, axis: .vertical) {
+                        Text("Original", tableName: "Inspector")
                     }
-                    .disabled(sourceDraft == block.sourceText)
+                    .labelsHidden()
+                    .multilineTextAlignment(.leading)
+                    .focused($focus, equals: .source)
+                    .onSubmit(commitText)
                 } else {
                     Text(verbatim: block.sourceText)
                         .textSelection(.enabled)
@@ -60,11 +75,11 @@ private struct BlockForm: View {
                     .font(.body)
                     .frame(minHeight: 88)
                     .scrollContentBackground(.hidden)
-                    .focused($isEditingTranslation)
+                    .focused($focus, equals: .translation)
                     .accessibilityLabel(Text("Translation", tableName: "Inspector"))
                     // ⌘↩ commits without leaving the field.
                     .background {
-                        Button("Apply", action: commitTranslation)
+                        Button("Apply", action: commitText)
                             .keyboardShortcut(.return, modifiers: .command)
                             .opacity(0)
                             .accessibilityHidden(true)
@@ -107,24 +122,33 @@ private struct BlockForm: View {
             }
             Section {
                 Button("Auto-Fit", systemImage: "arrow.up.left.and.arrow.down.right") {
-                    commitTranslation()
+                    commitText()
                     model.apply(BlockEdit(index: block.index), autofit: true, to: page)
                 }
                 .help("Fit the text to its bubble again")
+                if block.needsReview, model.canKeepOriginal {
+                    Button("Keep Original", systemImage: "character.bubble") {
+                        model.keepOriginal(block.index, on: page)
+                    }
+                    .help("Leave this text untranslated")
+                }
                 Button("Delete", systemImage: "trash", role: .destructive) {
                     model.deleteBlock(block.index, on: page)
                 }
             }
         }
         .formStyle(.grouped)
-        .onChange(of: isEditingTranslation) {
-            if !isEditingTranslation { commitTranslation() }
+        // Leaving both text fields commits them together; moving between the two does not.
+        .onChange(of: focus) {
+            if focus == nil { commitText() }
         }
         .onChange(of: block.translation) {
             // Undo, auto-fit or the engine changed it under us.
-            if !isEditingTranslation { draft = block.translation }
+            if focus == nil { draft = block.translation }
         }
-        .onChange(of: block.sourceText) { sourceDraft = block.sourceText }
+        .onChange(of: block.sourceText) {
+            if focus == nil { sourceDraft = block.sourceText }
+        }
         .onChange(of: block.color) {
             if RGB(color) != block.color { color = Color(block.color) }
         }
@@ -136,16 +160,7 @@ private struct BlockForm: View {
             guard !Task.isCancelled else { return }
             model.apply(BlockEdit(index: block.index, color: picked), to: page)
         }
-        .onDisappear(perform: commitTranslation)
-    }
-
-    private var reviewMessage: LocalizedStringKey {
-        switch block.reviewReason {
-        case "unreadable": "Check the recognized text. The original is kept."
-        case "overflow": "Shorten the translation so it fits."
-        case "geometry": "The text overlaps artwork or a nearby bubble."
-        default: "Add or check the translation."
-        }
+        .onDisappear(perform: commitText)
     }
 
     @ViewBuilder private var fontOptions: some View {
@@ -176,9 +191,14 @@ private struct BlockForm: View {
         }
     }
 
-    private func commitTranslation() {
-        guard draft != block.translation else { return }
-        model.apply(BlockEdit(index: block.index, translation: draft), to: page)
+    /// Sends whichever of the two texts changed as one edit. A withheld block is laid out
+    /// again by the engine, which is what decides whether it can be drawn now.
+    private func commitText() {
+        let edit = BlockEdit(index: block.index,
+                             translation: draft == block.translation ? nil : draft,
+                             sourceText: sourceDraft == block.sourceText ? nil : sourceDraft)
+        guard edit.translation != nil || edit.sourceText != nil else { return }
+        model.apply(edit, autofit: block.isWithheld, to: page)
     }
 }
 

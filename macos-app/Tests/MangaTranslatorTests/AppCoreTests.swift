@@ -57,6 +57,19 @@ private func isClose(_ a: CGPoint, _ b: CGPoint, tolerance: CGFloat = 1e-6) -> B
                         CGPoint(x: start.x + delta.width, y: start.y + delta.height)))
     }
 
+    @Test func scrollOffsetCentresABlockWhenThePageIsLargerThanTheViewport() {
+        let viewport = CGSize(width: 448, height: 648)
+        let block = CGRect(x: 600, y: 900, width: 100, height: 100)
+        // The whole page fits: nothing to scroll.
+        let fitted = PageGeometry(imageSize: CGSize(width: 800, height: 1200), scale: 0.5)
+        #expect(fitted.scrollOffset(centering: block, viewport: viewport, padding: 24) == .zero)
+        let zoomed = PageGeometry(imageSize: CGSize(width: 800, height: 1200), scale: 1)
+        #expect(zoomed.scrollOffset(centering: block, viewport: viewport, padding: 24) == CGPoint(x: 400, y: 600))
+        // Near a corner the offset stops at the edge of the content.
+        let corner = CGRect(x: 0, y: 1150, width: 40, height: 40)
+        #expect(zoomed.scrollOffset(centering: corner, viewport: viewport, padding: 24) == CGPoint(x: 0, y: 600))
+    }
+
     @Test func resizeStopsAtTheMinimumAndMoveStaysOnThePage() {
         let rect = CGRect(x: 100, y: 100, width: 50, height: 50)
         let tiny = BlockGeometry.resized(rect, angle: 0, handle: .right, by: CGSize(width: -500, height: 0))
@@ -156,7 +169,7 @@ private func makeModel(translated: Int = 6, configure: (inout MockEngine.Options
         await waitUntil { model.run?.prepare != nil }
         #expect(model.run?.prepare?.phase != nil)
         await waitUntil { model.run == nil && model.project?.pages.allSatisfy(\.done) == true }
-        #expect(model.project?.pages.allSatisfy { $0.result != nil && $0.blocks.count == 3 } == true)
+        #expect(model.project?.pages.allSatisfy { $0.result != nil && $0.blocks.count >= 3 } == true)
         #expect(model.project?.pages.allSatisfy { model.status(of: $0) == .done } == true)
         #expect(await engine.params(of: "run") == [["mode": "all"]])
     }
@@ -272,6 +285,136 @@ private func makeModel(translated: Int = 6, configure: (inout MockEngine.Options
         undo.undo()
         await waitUntil { model.renderingPages.isEmpty }
         #expect(model.currentPage?.blocks.first == moved)
+    }
+
+    @Test func withheldBlocksCountAsToReviewNotAsUntranslated() async throws {
+        let (model, _) = await makeModel()
+        let pages = try #require(model.project?.pages)
+        #expect(pages.allSatisfy { model.status(of: $0) == .done })
+        #expect(model.translatedPageCount == 6)
+        // 002 has two withheld blocks and a signature left alone on purpose; 004 has two more.
+        #expect(pages.map(model.reviewCount(of:)) == [0, 2, 0, 2, 0, 0])
+        #expect(pages[1].blocks.count { $0.isWithheld } == 3)
+        #expect(model.reviewTotal == 4)
+
+        let (untranslated, _) = await makeModel(translated: 0)
+        #expect(untranslated.translatedPageCount == 0)
+        #expect(untranslated.reviewTotal == 0)
+    }
+
+    @Test func nextReviewWalksThePageWrapsAndJumpsToTheNextPage() async throws {
+        let (model, _) = await makeModel()
+        model.showsOriginal = true
+        #expect(model.selectNextReview())
+        #expect(model.selectedPage == "002.png" && model.selectedBlock == 1)
+        #expect(!model.showsOriginal)
+        #expect(model.revealRequest == 1)
+        #expect(model.selectNextReview())
+        #expect(model.selectedPage == "002.png" && model.selectedBlock == 3)
+        #expect(model.selectNextReview())
+        #expect(model.selectedBlock == 1)
+        // A block that is not waiting for review does not change where the walk starts.
+        model.selectedBlock = 0
+        #expect(model.selectNextReview())
+        #expect(model.selectedBlock == 1)
+
+        // Past the last page with something to review, the search wraps to the front.
+        model.selectedPage = "005.png"
+        #expect(model.selectNextReview())
+        #expect(model.selectedPage == "002.png" && model.selectedBlock == 1)
+
+        model.apply(BlockEdit(index: 1, translation: "今天天气真好"), autofit: true, to: "002.png")
+        model.apply(BlockEdit(index: 3, translation: "咚!"), autofit: true, to: "002.png")
+        await waitUntil { model.renderingPages.isEmpty }
+        #expect(model.reviewCount(of: try #require(model.currentPage)) == 0)
+        #expect(model.selectNextReview())
+        #expect(model.selectedPage == "004.png" && model.selectedBlock == 0)
+
+        model.apply(BlockEdit(index: 0, translation: "等等我!"), autofit: true, to: "004.png")
+        model.apply(BlockEdit(index: 2, translation: "走吧"), autofit: true, to: "004.png")
+        await waitUntil { model.renderingPages.isEmpty }
+        #expect(model.reviewTotal == 0)
+        #expect(!model.selectNextReview())
+        #expect(model.selectedPage == "004.png")
+    }
+
+    @Test func correctedTextIsOneEditAndOneUndoStep() async throws {
+        let (model, engine) = await makeModel()
+        let undo = UndoManager()
+        undo.groupsByEvent = false
+        model.undoManager = undo
+        model.selectedPage = "002.png"
+        let original = try #require(model.currentPage?.blocks.first { $0.index == 1 })
+        #expect(original.reviewReason == "unreadable")
+
+        undo.beginUndoGrouping()
+        model.apply(BlockEdit(index: 1, translation: "今天天气真好", sourceText: "今日はいい天気"), autofit: true, to: "002.png")
+        undo.endUndoGrouping()
+        await waitUntil { model.renderingPages.isEmpty }
+        #expect(await engine.params(of: "update_blocks") == [[
+            "page": "002.png", "autofit": true,
+            "edits": [["index": 1, "source_text": "今日はいい天気", "translation": "今天天气真好"]],
+        ]])
+        let fixed = try #require(model.currentPage?.blocks.first { $0.index == 1 })
+        #expect(fixed.sourceText == "今日はいい天気" && fixed.translation == "今天天气真好")
+        #expect(!fixed.isWithheld)
+
+        undo.undo()
+        await waitUntil { model.renderingPages.isEmpty }
+        #expect(!undo.canUndo)
+        #expect(await engine.count(of: "update_blocks") == 2)
+        #expect(model.currentPage?.blocks.first { $0.index == 1 } == original)
+    }
+
+    @Test func withheldBlocksCannotBeMovedOrResized() async throws {
+        let (model, engine) = await makeModel()
+        model.selectedPage = "002.png"
+        let page = try #require(model.currentPage)
+        let target = CGRect(x: 10, y: 10, width: 300, height: 200)
+        // 1 needs review, 4 is the signature left alone on purpose.
+        for index in [1, 4] {
+            model.setRect(target, ofBlock: index, on: page.name)
+        }
+        #expect(model.currentPage == page)
+        #expect(await engine.count(of: "update_blocks") == 0)
+
+        model.setRect(target, ofBlock: 0, on: page.name)
+        await waitUntil { model.renderingPages.isEmpty }
+        #expect(model.currentPage?.blocks.first?.rect == target)
+        #expect(await engine.count(of: "update_blocks") == 1)
+    }
+
+    @Test func keepOriginalStopsCountingTheBlockAndCanBeUndone() async throws {
+        let (model, engine) = await makeModel()
+        let undo = UndoManager()
+        model.undoManager = undo
+        model.selectedPage = "002.png"
+        #expect(model.canKeepOriginal)
+
+        model.keepOriginal(3, on: "002.png")
+        #expect(model.currentPage?.reviewCount == 1)
+        await waitUntil { model.renderingPages.isEmpty }
+        #expect(await engine.params(of: "update_blocks") == [["page": "002.png", "edits": [["index": 3, "keep_original": true]]]])
+        #expect(model.currentPage?.blocks.first { $0.index == 3 }?.reviewReason == Block.protected)
+        #expect(model.reviewTotal == 3)
+
+        undo.undo()
+        await waitUntil { model.renderingPages.isEmpty }
+        #expect(await engine.params(of: "update_blocks").last == ["page": "002.png", "edits": [["index": 3, "keep_original": false]]])
+        #expect(model.currentPage?.blocks.first { $0.index == 3 }?.reviewReason == "untranslated")
+        #expect(model.reviewTotal == 4)
+    }
+
+    @Test func keepOriginalIsNotSentToAnEngineWithoutIt() async throws {
+        let (model, engine) = await makeModel { $0.supportsKeepOriginal = false }
+        #expect(!model.canKeepOriginal)
+        model.keepOriginal(3, on: "002.png")
+        #expect(await engine.count(of: "update_blocks") == 0)
+        #expect(model.reviewTotal == 4)
+        // The engine refuses the field, as the Python engine does today.
+        await #expect(throws: EngineError.self) {
+            try await engine.updateBlocks(page: "002.png", edits: [BlockEdit(index: 3, keepOriginal: true)])
+        }
     }
 
     @Test func deleteRemovesTheBlockAndClearsSelection() async throws {

@@ -164,6 +164,13 @@ struct AppCommands: Commands {
             Button("Stop") { Task { await model.cancelRun() } }
                 .keyboardShortcut(".")
                 .disabled(model.run == nil || model.run?.cancelling == true)
+            Divider()
+            Button("Next Item to Review") {
+                showsInspector = true
+                model.selectNextReview()
+            }
+            .keyboardShortcut("'")
+            .disabled(model.reviewTotal == 0)
         }
     }
 }

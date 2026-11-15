@@ -80,6 +80,11 @@ engine's automatic layout for the edited blocks (may change their `rect` and
 progress (`busy`).
 `source_text` records a manual OCR correction. A Japanese page analysed by the
 native engine keeps its independently evaluated cleanup mask through edits.
+`keep_original` (optional bool in an edit; **not implemented by the Python engine yet**):
+`true` leaves a withheld block untranslated on purpose, so its `review_reason` becomes
+`protected` and the source pixels stay; `false` withdraws that and the block is evaluated
+again. An engine that accepts the field lists `"keep_original"` in an optional
+`capabilities` string array of its `hello` result; the app offers the action only then.
 
 ### `delete_blocks` `{page, indexes: [int…]}` → Page
 Removes blocks (their text is no longer drawn) and re-renders.

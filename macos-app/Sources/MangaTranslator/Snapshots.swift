@@ -60,6 +60,15 @@ enum Snapshots {
         try await capture(SidebarView().environment(main), "pane-sidebar", pane, into: directory)
         try await capture(InspectorView().environment(main), "pane-inspector", pane, into: directory)
 
+        // A page with withheld blocks, one of them selected, then the same jump on a zoomed page.
+        main.selectNextReview()
+        try await capture(ContentView().environment(main), "review", window, into: directory)
+        try await capture(InspectorView().environment(main), "pane-inspector-review",
+                          CGSize(width: pane.width, height: 800), into: directory)
+        main.zoom = 2.5
+        main.selectNextReview()
+        try await capture(ContentView().environment(main), "review-zoomed", window, into: directory)
+
         let untranslated = await model { $0.translatedPages = 0 }
         await untranslated.open([folder])
         try await capture(ContentView().environment(untranslated), "not-translated", window, into: directory)
@@ -72,6 +81,7 @@ enum Snapshots {
         await translating.translate()
         await wait { translating.run?.stage == "detect" && translating.run?.done == 2 }
         try await capture(ContentView().environment(translating), "translating", window, into: directory)
+        try await capture(SidebarView().environment(translating), "pane-sidebar-translating", pane, into: directory)
 
         // A long step keeps the run in "Stopping…" while both appearances are captured.
         let stopping = await model {
@@ -109,6 +119,7 @@ enum Snapshots {
         await wait { failed.run == nil }
         failed.selectedPage = "003.png"
         try await capture(ContentView().environment(failed), "error-page", window, into: directory)
+        try await capture(SidebarView().environment(failed), "pane-sidebar-failed", pane, into: directory)
 
         let services = await model()
         services.settingsProfile = "p1"

@@ -27,8 +27,8 @@
 "Translation service" = "翻译服务";
 "Add Service…" = "添加服务…";
 "%lld of %lld pages translated" = "已翻译 %1$lld / %2$lld 页";
-"%lld of %lld pages translated · %lld need review" = "已翻译 %1$lld / %2$lld 页 · %3$lld 页需校对";
-"needs review" = "需校对";
+"%lld of %lld pages translated · %lld to review" = "已翻译 %1$lld / %2$lld 页 · %3$lld 处待校对";
+"Next Item to Review" = "下一处待校对";
 
 /* Start screen and engine status */
 "Drop a folder of pages" = "拖入漫画文件夹";
@@ -42,6 +42,7 @@
 "not translated" = "未翻译";
 "translating" = "翻译中";
 "translated" = "已翻译";
+"translated, %lld to review" = "已翻译，%lld 处待校对";
 "failed" = "失败";
 
 /* Page */
@@ -55,16 +56,13 @@
 "Getting ready…" = "正在准备…";
 "Updating page" = "正在更新页面";
 "Original" = "原图";
-"Page preview" = "页面预览";
-"Detection" = "识别";
-"Cleaned" = "修补";
-"Result" = "译图";
-"Recognized text" = "识别原文";
-"Save correction" = "保存原文校对";
-"Check the recognized text. The original is kept." = "请校对识别内容。原字已保留。";
-"Shorten the translation so it fits." = "请缩短译文，以放入文字区域。";
-"The text overlaps artwork or a nearby bubble." = "文字区域与画面或邻近气泡重叠。";
-"Add or check the translation." = "请填写或校对译文。";
+"%lld to review" = "%lld 处待校对";
+"Go to the next item to review" = "前往下一处待校对";
+"The text here couldn't be read clearly." = "这里的文字没能看清。";
+"This text has no translation yet." = "这段文字还没有译文。";
+"The translation is too long to fit here." = "译文太长，这里放不下。";
+"The translation would cover artwork or another bubble." = "译文会压到画面或旁边的气泡。";
+"This text was left untranslated." = "这段文字没有翻译。";
 "Show the untranslated page" = "查看未翻译的原图";
 
 /* Inspector */
@@ -83,6 +81,8 @@
 "Color" = "颜色";
 "Auto-Fit" = "自动排版";
 "Fit the text to its bubble again" = "让文字重新适应气泡";
+"Keep Original" = "保留原文";
+"Leave this text untranslated" = "不翻译这段文字";
 "Delete" = "删除";
 "Added" = "已添加";
 "System" = "系统";

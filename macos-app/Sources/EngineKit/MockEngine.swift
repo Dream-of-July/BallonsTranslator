@@ -16,6 +16,8 @@ public actor MockEngine: Engine {
         public var failingPages: Set<String> = []
         /// Pages already translated when the project opens.
         public var translatedPages = 0
+        /// `false` behaves like an engine without the `keep_original` edit.
+        public var supportsKeepOriginal = true
 
         public init() {}
     }
@@ -65,7 +67,8 @@ public actor MockEngine: Engine {
         switch method {
         case "hello":
             return try JSONValue(encoding: Hello(protocolVersion: engineProtocolVersion, engineVersion: "mock",
-                                                 device: "mps", torchInstalled: true, modelsReady: options.modelsReady))
+                                                 device: "mps", torchInstalled: true, modelsReady: options.modelsReady,
+                                                 capabilities: options.supportsKeepOriginal ? [Hello.keepOriginal] : []))
         case "open_project":
             return try openProject(path: try string(params, "path"))
         case "get_page":
@@ -227,18 +230,26 @@ public actor MockEngine: Engine {
             throw error(.badRequest, "Missing edits.")
         }
         var page = current
+        let base = MockArt.blocks(number: index, english: targetIsEnglish)
         for edit in edits {
             guard let position = page.blocks.firstIndex(where: { $0.index == edit.index }) else {
                 throw error(.badRequest, "No block \(edit.index).")
             }
+            guard edit.keepOriginal == nil || options.supportsKeepOriginal else {
+                throw error(.badRequest, "Invalid edit.")
+            }
             edit.apply(to: &page.blocks[position])
-            if params?["autofit"]?.boolValue == true {
+            let original = base.first { $0.index == edit.index }
+            if edit.keepOriginal != true, edit.keepOriginal != nil || edit.sourceText != nil || edit.translation != nil {
+                // Stand-in for the engine's checks: a withheld block passes once its text is changed.
+                let block = page.blocks[position]
+                let unchanged = block.sourceText == original?.sourceText && block.translation == original?.translation
+                page.blocks[position].reviewReason = unchanged ? original?.reviewReason : nil
+            }
+            if params?["autofit"]?.boolValue == true, let original {
                 // Stand-in for the engine's layout: back to the bubble, sized to fill it.
-                let base = MockArt.blocks(number: index, english: targetIsEnglish)
-                if let original = base.first(where: { $0.index == edit.index }) {
-                    page.blocks[position].rect = original.rect
-                    page.blocks[position].fontSize = original.fontSize
-                }
+                page.blocks[position].rect = original.rect
+                page.blocks[position].fontSize = original.fontSize
             }
         }
         try render(&page, number: index)
@@ -347,7 +358,10 @@ enum MockArt {
         ("本当に?", "真的吗?", "Really?"),
     ]
 
-    /// Bubble text boxes of a page, already "translated".
+    private static let bubbleCount = 3
+
+    /// Text boxes of a page, already "translated": three bubbles, and on the second and fourth
+    /// page the mix a real run leaves behind — withheld blocks, a sound effect, a signature.
     static func blocks(number: Int, english: Bool) -> [Block] {
         let shift = CGFloat((number * 37) % 60)
         let rects = [
@@ -355,13 +369,39 @@ enum MockArt {
             CGRect(x: 470, y: 480 + shift, width: 230, height: 110),
             CGRect(x: 150 + shift, y: 890, width: 260, height: 100),
         ]
-        return rects.enumerated().map { index, rect in
+        var blocks = rects.enumerated().map { index, rect in
             let line = lines[(number + index) % lines.count]
             return Block(index: index, rect: rect, angle: index == 1 ? -6 : 0, sourceText: line.source,
                          translation: english ? line.english : line.chinese, vertical: false,
                          fontFamily: "PingFang SC", fontSize: 34, color: RGB(r: 20, g: 20, b: 20),
                          alignment: .center, bold: false, italic: false)
         }
+        func withhold(_ index: Int, _ reason: String, translation: String) {
+            blocks[index].reviewReason = reason
+            blocks[index].translation = translation
+            blocks[index].angle = 0
+            // The detected box hugs the line of original text at the top of the bubble.
+            blocks[index].sourceRect = CGRect(x: blocks[index].rect.minX + 8, y: blocks[index].rect.minY - 4,
+                                              width: blocks[index].rect.width - 16, height: 52)
+        }
+        switch number {
+        case 1:
+            withhold(1, "unreadable", translation: "")
+            let effect = CGRect(x: 520, y: 165, width: 190, height: 64)
+            blocks.append(Block(index: 3, rect: effect, sourceText: "ドン!", fontFamily: "PingFang SC", fontSize: 46,
+                                color: RGB(r: 20, g: 20, b: 20), bold: true, sourceRect: effect, reviewReason: "untranslated"))
+            let signature = CGRect(x: 70, y: 1106, width: 150, height: 34)
+            blocks.append(Block(index: 4, rect: signature, sourceText: "たなか 画", fontFamily: "PingFang SC", fontSize: 22,
+                                color: RGB(r: 20, g: 20, b: 20), sourceRect: signature, reviewReason: Block.protected))
+        case 3:
+            withhold(0, "overflow", translation: english
+                ? "Hold on, wait for me, I still have to find my umbrella and my keys!"
+                : "等一下等一下,我还得先找到我的雨伞和钥匙才能出门!")
+            withhold(2, "geometry", translation: blocks[2].translation)
+        default:
+            break
+        }
+        return blocks
     }
 
     /// Draws page `number`. `blocks == nil` gives the untranslated source page.
@@ -399,15 +439,17 @@ enum MockArt {
 
         let base = MockArt.blocks(number: number, english: false)
         context.setLineWidth(4)
-        for bubble in base {
+        for bubble in base.prefix(bubbleCount) {
             let ellipse = bubble.rect.insetBy(dx: -34, dy: -30)
             context.setFillColor(gray: 1, alpha: 1)
             context.fillEllipse(in: ellipse)
             context.strokeEllipse(in: ellipse)
         }
         for block in blocks ?? base {
-            let text = blocks == nil ? block.sourceText : block.translation
-            draw(text, block: block, family: blocks == nil ? "Hiragino Sans" : block.fontFamily, in: context)
+            // A withheld block keeps its original text on the translated page.
+            let original = blocks == nil || block.isWithheld
+            draw(original ? block.sourceText : block.translation, block: block,
+                 family: original ? "Hiragino Sans" : block.fontFamily, in: context)
         }
         return context.makeImage()
     }

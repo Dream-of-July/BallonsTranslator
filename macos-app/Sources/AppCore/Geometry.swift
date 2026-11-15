@@ -42,6 +42,19 @@ public struct PageGeometry: Equatable, Sendable {
     public func toImage(_ size: CGSize) -> CGSize {
         CGSize(width: size.width / scale, height: size.height / scale)
     }
+
+    /// Scroll offset that brings `rect` (image pixels) to the middle of `viewport`, for a page
+    /// shown with `padding` around it. Zero along an axis where the whole page already fits.
+    public func scrollOffset(centering rect: CGRect, viewport: CGSize, padding: CGFloat) -> CGPoint {
+        func offset(_ centre: CGFloat, page: CGFloat, visible: CGFloat) -> CGFloat {
+            let content = page + 2 * padding
+            guard content > visible else { return 0 }
+            return min(max(padding + centre - visible / 2, 0), content - visible)
+        }
+        let target = toView(rect)
+        return CGPoint(x: offset(target.midX, page: viewSize.width, visible: viewport.width),
+                       y: offset(target.midY, page: viewSize.height, visible: viewport.height))
+    }
 }
 
 /// The eight resize handles of a block; `unit` is the handle's position in the box, -1…1 per axis.

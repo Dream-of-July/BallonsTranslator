@@ -156,10 +156,10 @@ struct ProjectView: View {
     private var subtitle: String {
         guard let project = model.project else { return "" }
         if case .starting = model.engineState { return String(localized: "Starting engine…") }
-        let done = project.pages.count { $0.done && $0.reviewCount == 0 }
-        let review = project.pages.count { $0.result != nil && $0.reviewCount > 0 }
+        let done = model.translatedPageCount
+        let review = model.reviewTotal
         if review > 0 {
-            return String(localized: "\(done) of \(project.pages.count) pages translated · \(review) need review")
+            return String(localized: "\(done) of \(project.pages.count) pages translated · \(review) to review")
         }
         return String(localized: "\(done) of \(project.pages.count) pages translated")
     }
@@ -280,7 +280,7 @@ struct SidebarView: View {
         @Bindable var model = model
         List(selection: $model.selectedPage) {
             ForEach(Array((model.project?.pages ?? []).enumerated()), id: \.element.name) { offset, page in
-                PageRow(page: page, number: offset + 1, status: model.status(of: page))
+                PageRow(page: page, number: offset + 1, status: model.status(of: page), review: model.reviewCount(of: page))
                     .tag(page.name)
                     .contextMenu {
                         Button("Translate This Page") {
@@ -297,6 +297,8 @@ struct PageRow: View {
     var page: Page
     var number: Int
     var status: AppModel.PageStatus
+    /// Blocks left to review; shown in place of the check mark on a translated page.
+    var review: Int
 
     var body: some View {
         HStack(spacing: 10) {
@@ -319,10 +321,16 @@ struct PageRow: View {
             Image(systemName: "circle.dotted").foregroundStyle(.tertiary)
         case .inProgress:
             ProgressView().controlSize(.small)
+        case .done where review > 0:
+            Text(verbatim: "\(review)")
+                .font(.caption.weight(.semibold))
+                .monospacedDigit()
+                .foregroundStyle(.white)
+                .padding(.horizontal, 5)
+                .frame(minWidth: 17, minHeight: 17)
+                .background(.orange, in: .capsule)
         case .done:
             Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
-        case .needsReview:
-            Image(systemName: "exclamationmark.circle.fill").foregroundStyle(.orange)
         case .failed:
             Image(systemName: "exclamationmark.triangle.fill").symbolRenderingMode(.multicolor)
         }
@@ -332,8 +340,8 @@ struct PageRow: View {
         switch status {
         case .pending: String(localized: "not translated")
         case .inProgress: String(localized: "translating")
+        case .done where review > 0: String(localized: "translated, \(review) to review")
         case .done: String(localized: "translated")
-        case .needsReview: String(localized: "needs review")
         case .failed: String(localized: "failed")
         }
     }

@@ -141,13 +141,15 @@ private struct RunProgress: View {
     }
 }
 
-/// Compare the processing stages without changing canvas zoom.
+/// Floating controls under the page: what is left to review, original/translated and zoom.
 private struct CanvasBar: View {
     @Environment(AppModel.self) private var model
+    @AppStorage("showsInspector") private var showsInspector = true
     var page: Page
 
     var body: some View {
         @Bindable var model = model
+        let review = model.reviewCount(of: page)
         GlassEffectContainer(spacing: 10) {
             HStack(spacing: 10) {
                 if model.renderingPages.contains(page.name) {
@@ -157,19 +159,27 @@ private struct CanvasBar: View {
                         .glassEffect()
                         .accessibilityLabel("Updating page")
                 }
-                if page.result != nil || !page.blocks.isEmpty || page.inpainted != nil {
-                    Picker("Page preview", selection: Binding(
-                        get: { model.preview.available(on: page) ? model.preview : .original },
-                        set: { model.preview = $0 }
-                    )) {
-                        Text("Original").tag(AppModel.PagePreview.original)
-                        Text("Detection").tag(AppModel.PagePreview.detection).disabled(page.blocks.isEmpty)
-                        Text("Cleaned").tag(AppModel.PagePreview.cleaned).disabled(page.inpainted == nil)
-                        Text("Result").tag(AppModel.PagePreview.result).disabled(page.result == nil)
+                if review > 0 {
+                    Button {
+                        showsInspector = true
+                        model.selectNextReview()
+                    } label: {
+                        Label {
+                            Text("\(review) to review")
+                                .monospacedDigit()
+                        } icon: {
+                            Image(systemName: "exclamationmark.bubble.fill")
+                                .foregroundStyle(.orange)
+                        }
                     }
-                    .pickerStyle(.segmented)
-                    .labelsHidden()
-                    .fixedSize()
+                    .labelStyle(.titleAndIcon)
+                    .help("Go to the next item to review")
+                }
+                if page.result != nil {
+                    Toggle("Original", systemImage: "photo", isOn: $model.showsOriginal)
+                        .toggleStyle(.button)
+                        .labelStyle(.titleAndIcon)
+                        .help("Show the untranslated page")
                 }
                 Button("Zoom Out", systemImage: "minus.magnifyingglass") { model.zoomOut() }
                     .disabled(model.zoom <= AppModel.zoomRange.lowerBound)
@@ -191,26 +201,22 @@ struct PageCanvas: View {
     var page: Page
     @State private var image: CGImage?
     @State private var zoomAtPinchStart: Double?
+    @State private var scroll = ScrollPosition()
     @FocusState private var isFocused: Bool
 
     private static let padding: CGFloat = 24
 
-    private var preview: AppModel.PagePreview {
-        model.preview.available(on: page) ? model.preview : .original
+    private var showsResult: Bool {
+        page.result != nil && !model.showsOriginal
     }
 
     private var imagePath: String {
-        switch preview {
-        case .original, .detection: page.source
-        case .cleaned: page.inpainted ?? page.source
-        case .result: page.result ?? page.source
-        }
+        showsResult ? page.result ?? page.source : page.source
     }
 
     var body: some View {
         GeometryReader { proxy in
-            let fit = PageGeometry.fitScale(image: page.size, container: proxy.size, padding: Self.padding)
-            let geometry = PageGeometry(imageSize: page.size, scale: fit * model.zoom)
+            let geometry = geometry(in: proxy.size)
             ScrollView([.horizontal, .vertical]) {
                 ZStack(alignment: .topLeading) {
                     pageImage
@@ -220,16 +226,23 @@ struct PageCanvas: View {
                             model.selectedBlock = nil
                             isFocused = true
                         }
-                    if preview == .detection || preview == .result {
-                        BlockLayer(page: page, geometry: geometry, detection: preview == .detection) {
-                            isFocused = true
-                        }
-                        .allowsHitTesting(model.canEdit(page: page.name))
+                    if showsResult {
+                        BlockLayer(page: page, geometry: geometry) { isFocused = true }
+                            .allowsHitTesting(model.canEdit(page: page.name))
                     }
                 }
                 .coordinateSpace(.named(BlockLayer.space))
                 .padding(Self.padding)
                 .frame(minWidth: proxy.size.width, minHeight: proxy.size.height)
+            }
+            .scrollPosition($scroll)
+            // Also runs when a review jump lands on this page, so the block is in view from the start.
+            .task(id: model.revealRequest) {
+                guard let block = model.currentBlock else { return }
+                // Measured now: the layout this closure was created in may be older.
+                let offset = self.geometry(in: proxy.size)
+                    .scrollOffset(centering: block.visibleRect, viewport: proxy.size, padding: Self.padding)
+                withAnimation(.snappy) { scroll.scrollTo(point: offset) }
             }
         }
         .focusable()
@@ -265,6 +278,11 @@ struct PageCanvas: View {
         }
     }
 
+    private func geometry(in container: CGSize) -> PageGeometry {
+        let fit = PageGeometry.fitScale(image: page.size, container: container, padding: Self.padding)
+        return PageGeometry(imageSize: page.size, scale: fit * model.zoom)
+    }
+
     @ViewBuilder private var pageImage: some View {
         if let image {
             Image(decorative: image, scale: 1)
@@ -277,7 +295,7 @@ struct PageCanvas: View {
     }
 
     private func nudge(_ press: KeyPress) -> Bool {
-        guard preview == .result, let block = model.currentBlock else { return false }
+        guard showsResult, let block = model.currentBlock, !block.isWithheld else { return false }
         let step: CGFloat = press.modifiers.contains(.shift) ? 10 : 1
         let delta: CGSize = switch press.key {
         case .leftArrow: CGSize(width: -step, height: 0)
@@ -285,21 +303,21 @@ struct PageCanvas: View {
         case .upArrow: CGSize(width: 0, height: -step)
         default: CGSize(width: 0, height: step)
         }
-        model.apply(BlockEdit(index: block.index, rect: BlockGeometry.moved(block.rect, by: delta, within: page.size)),
-                    to: page.name)
+        model.setRect(BlockGeometry.moved(block.rect, by: delta, within: page.size), ofBlock: block.index, on: page.name)
         return true
     }
 }
 
-/// Selectable, movable, resizable outlines of a page's text blocks. Only the outline
-/// follows the pointer; the text is redrawn by the engine after the gesture ends.
+/// The page's text blocks. A translated block is an outline that appears on hover and can be
+/// moved and resized; only the outline follows the pointer, the engine redraws the text after
+/// the gesture. A block whose translation was withheld stays marked where the original text
+/// is, and can only be selected.
 struct BlockLayer: View {
     static let space = "page"
 
     @Environment(AppModel.self) private var model
     var page: Page
     var geometry: PageGeometry
-    var detection: Bool
     var takeFocus: () -> Void
     @State private var dragged: (index: Int, rect: CGRect)?
     @State private var hovered: Int?
@@ -309,24 +327,25 @@ struct BlockLayer: View {
             ForEach(page.blocks) { block in
                 let frame = geometry.toView(rect(of: block))
                 let isSelected = model.selectedBlock == block.index
-                Rectangle()
-                    .strokeBorder(outlineColor(block, selected: isSelected),
-                                  lineWidth: isSelected ? 2 : 1)
+                outline(block, selected: isSelected)
                     .frame(width: frame.width, height: frame.height)
                     .contentShape(.rect)
                     .onHover { inside in
                         if inside { hovered = block.index } else if hovered == block.index { hovered = nil }
                     }
                     .onTapGesture { select(block) }
-                    .gesture(move(block), including: detection ? .none : .all)
-                    .rotationEffect(.degrees(detection ? 0 : block.angle))
+                    .gesture(move(block), including: block.isWithheld ? .subviews : .all)
+                    .help(block.needsReview ? block.reviewMessage : "")
+                    // The detected box of a withheld block is not rotated.
+                    .rotationEffect(.degrees(block.isWithheld ? 0 : block.angle))
                     .position(x: frame.midX, y: frame.midY)
                     .accessibilityElement()
-                    .accessibilityLabel(Text(verbatim: block.translation.isEmpty || detection ? block.sourceText : block.translation))
+                    .accessibilityLabel(Text(verbatim: block.isWithheld || block.translation.isEmpty ? block.sourceText : block.translation))
+                    .accessibilityValue(Text(verbatim: block.needsReview ? block.reviewMessage : ""))
                     .accessibilityAddTraits(isSelected ? [.isButton, .isSelected] : .isButton)
                     .accessibilityAction { select(block) }
             }
-            if !detection, let block = page.blocks.first(where: { $0.index == model.selectedBlock }) {
+            if let block = page.blocks.first(where: { $0.index == model.selectedBlock }), !block.isWithheld {
                 ForEach(ResizeHandle.allCases, id: \.self) { handle in
                     let point = geometry.toView(BlockGeometry.position(of: handle.unit, rect: rect(of: block), angle: block.angle))
                     Circle()
@@ -345,15 +364,20 @@ struct BlockLayer: View {
     }
 
     private func rect(of block: Block) -> CGRect {
-        if detection { return block.sourceRect ?? block.rect }
-        if let dragged, dragged.index == block.index { return dragged.rect }
-        return block.rect
+        if let dragged, dragged.index == block.index { dragged.rect } else { block.visibleRect }
     }
 
-    private func outlineColor(_ block: Block, selected: Bool) -> Color {
-        if selected { return .accentColor }
-        if detection { return block.needsReview ? .orange : Color.accentColor.opacity(0.7) }
-        return Color.accentColor.opacity(hovered == block.index ? 0.55 : 0)
+    @ViewBuilder private func outline(_ block: Block, selected: Bool) -> some View {
+        if selected {
+            Rectangle().strokeBorder(Color.accentColor, lineWidth: 2)
+        } else if block.needsReview {
+            // A faint light edge keeps the dashes readable on dark artwork.
+            Rectangle()
+                .strokeBorder(.orange, style: StrokeStyle(lineWidth: 1.5, dash: [5, 3]))
+                .shadow(color: .white.opacity(0.9), radius: 0.5)
+        } else {
+            Rectangle().strokeBorder(Color.accentColor.opacity(hovered == block.index ? 0.55 : 0), lineWidth: 1)
+        }
     }
 
     private func select(_ block: Block) {
@@ -385,6 +409,19 @@ struct BlockLayer: View {
         // Whole pixels: the box is stored in image pixels.
         let rect = CGRect(x: dragged.rect.minX.rounded(), y: dragged.rect.minY.rounded(),
                           width: dragged.rect.width.rounded(), height: dragged.rect.height.rounded())
-        model.apply(BlockEdit(index: dragged.index, rect: rect), to: page.name)
+        model.setRect(rect, ofBlock: dragged.index, on: page.name)
+    }
+}
+
+extension Block {
+    /// One sentence on why the translation was withheld; shown on the page and in the inspector.
+    var reviewMessage: String {
+        switch reviewReason {
+        case "unreadable": String(localized: "The text here couldn't be read clearly.")
+        case "overflow": String(localized: "The translation is too long to fit here.")
+        case "geometry": String(localized: "The translation would cover artwork or another bubble.")
+        case "untranslated": String(localized: "This text has no translation yet.")
+        default: String(localized: "This text was left untranslated.")
+        }
     }
 }
