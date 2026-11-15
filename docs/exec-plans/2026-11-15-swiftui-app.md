@@ -1,0 +1,95 @@
+# ExecPlan: 原生 SwiftUI 漫画翻译应用
+
+Living document。范围、决策或进度变化时更新。
+
+## 1. 背景与产品意图
+
+七月要一个真正 macOS 原生的漫画翻译应用:Liquid Glass、SF Symbols、符合 HIG,简洁、接近一键完成。上游 BallonsTranslator 是功能密集的 PyQt 专业编辑器,Qt 自绘控件做不出系统材质,打磨到头也只是"像 Mac 的 Qt 应用"。
+
+决策(七月 2026-11-15 确认):**新写 SwiftUI 界面,上游 Python 流水线做引擎**;首版包含改译文、调字体字号、拖动与缩放文本框。PyQt 版停在当前状态,作为高级编辑器保留;引擎侧修复仍可合并回上游,SwiftUI 界面不合并回上游。
+
+## 2. 当前仓库理解
+
+- 流水线(检测→OCR→翻译→擦除)在 `ballontranslator/ui/module_manager.py` 的 `ImgtransThread._imgtrans_pipeline`,与界面无关,但**不负责嵌字渲染**。
+- 嵌字渲染在 `MainWindow.on_pagtrans_finished` → `SceneTextManager`(自动排版 `layout_textblk`)→ `Canvas.render_result_img` → `saveCurrentPage`。要与 GUI 输出一致,必须宿主一个隐藏的 `MainWindow`。
+- 无界面模式(`launch.py --headless`)在本机已跑通,但 `MainWindow` 无界面构造会走 `run_batch` → `input()`,阻塞主线程,不能直接当常驻服务用。
+- 没有"只重渲染一页"的接口;现有 render-only 模式会处理所有页并把字号、行距重置为全局格式。
+- `TextBlock.rich_text`(Qt HTML)优先于 `translation` 和字体字段;跑完一遍后每个块都有 `rich_text`,编辑时必须清空它。渲染框是 `_bounding_rect`(图像像素),不是 `xyxy`。
+- 字体列表来自 `shared.FONT_REGISTRY`;LLM 配置在 `pcfg.module.llm_profiles`,服务商模板与连接检测已在 `utils/llm_profiles.py`、`modules/llm_chat.py`。
+- 无界面下错误只写日志,没有结构化上报。
+
+## 3. 目标与非目标
+
+**目标**
+1. 拖入一个图片文件夹,点一次"翻译",得到全部翻译好的页面。
+2. 逐页查看,原图与结果对照;选中文本块可改译文、字体、字号,拖动和缩放文本框,结果由引擎重渲染,所见即导出。
+3. 翻译服务设置简单:选服务商、填 Key、测试连接。默认 Google 免配置可用。
+4. 首次运行的依赖和模型下载有清楚的进度。
+5. 界面是标准 SwiftUI:`NavigationSplitView`、工具栏、检查器、设置窗口,系统自动获得 Liquid Glass;图标全部 SF Symbols;深浅色、强调色跟随系统。
+
+**非目标(首版)**
+- 画板/手动涂抹修补、文字特效与变形、竖排切换、逐字符富文本、术语表、批量多项目队列。
+- 手动新增文本框(只能编辑或删除检测到的)。
+- 把 Python 环境打进 `.app`(首版引用本仓库的 `.venv`;独立分发另开任务)。
+- 签名、公证、上架。
+
+## 4. 方案
+
+```
+MangaTranslator.app (SwiftUI)
+  └─ EngineClient ── stdin/stdout JSON 行 ──▶ python -m ballontranslator.engine
+                                               └─ 隐藏的 MainWindow(offscreen Qt)
+```
+
+- 接口契约见 `macos-app/PROTOCOL.md`(单一事实来源)。
+- **编辑预览**:拖动/缩放时 Swift 只画选框,松手后发 `update_blocks`,引擎重渲染该页并返回新图。文字始终由引擎绘制,保证与导出一致;代价是拖动过程中文字不跟手。
+- **引擎宿主**:新增 `ballontranslator/engine/`,子类化/打补丁 `MainWindow` 去掉 `run_batch`/`input()`,不改动上游现有行为;单页重渲染走 `updateSceneTextitems` + `saveCurrentPage`。
+- **密钥**:只经 `update_profile` 写入引擎(沿用上游的混淆存储),Swift 端不落盘、不回显。
+
+**备选(未采用)**:Swift 里自绘文字(预览流畅但与导出有出入,且要重做排版);每次操作起一个 CLI 进程(模型反复加载,太慢)。
+
+## 5. 里程碑与验证
+
+| # | 内容 | 执行 | 验证 |
+|---|---|---|---|
+| E1 | 引擎进程:协议全部方法与事件 | Codex | 单元测试(不触网、不加载模型);真机脚本:open → run → update_blocks → export |
+| S1 | 应用骨架、EngineClient、拖入→翻译→浏览→导出 | Claude 子 Agent | `swift build`、单元测试(MockEngine)、真机走通 |
+| S2 | 文本块选中、检查器编辑、拖动缩放、删除 | Claude 子 Agent | 真机:改译文/字体/字号/位置后结果图更新 |
+| S3 | 设置(服务商/Key/测试连接/语言/输出格式)、首次运行进度、错误提示 | Claude 子 Agent | 真机:缺 Key 引导、下载进度、取消 |
+| S4 | 打包脚本生成 `.app`、图标、收尾 | 主线程 | 双击启动、菜单与快捷键、深浅色 |
+
+E1 与 S1 并行(S1 先对着 MockEngine 开发)。
+
+## 6. 预计改动文件
+
+- 新增 `ballontranslator/engine/`(`__init__.py`、`__main__.py`、`server.py` 等)与 `tests/test_engine_*.py`。
+- 新增 `macos-app/`:`Package.swift`、`Sources/`、`Tests/`、`scripts/build_app.sh`、`PROTOCOL.md`。
+- 现有文件原则上不改;确需改动(例如无界面构造的阻塞点)要最小化并单独说明。
+
+## 7. 风险与回滚
+
+- **字号单位(DPI)**:`font_size` 是相对 `shared.LDPI` 的像素,GUI 在 macOS 上用屏幕 DPI,无界面固定 96。E1 必须验证引擎渲染的字高与 GUI 一致。
+- **自动排版会覆盖用户的框**:`autofit` 做成显式开关,默认关。
+- **编辑会丢逐字符格式**:清空 `rich_text` 的后果;首版接受。
+- **模型推理不可中断**:取消只在阶段/页之间生效,界面要如实显示"正在停止"。
+- **隐藏 MainWindow 的副作用**:启动耗时、可能打开最近项目、写配置;E1 需关闭 `open_recent_on_startup` 等并实测。
+- 回滚:`macos-app/` 与 `ballontranslator/engine/` 均为新增目录,删除即可,不影响 PyQt 版。
+
+## 8. 决策记录
+
+- 2026-11-15 路线从"PyQt 原生化"改为"SwiftUI + Python 引擎";首版含字体与文本框调整(七月)。
+- 2026-11-15 预览采用"引擎重渲染",不在 Swift 自绘文字(主线程)。
+- 2026-11-15 应用代码放 `macos-app/`,不动主检出里 Codex 遗留的 `macos/`。
+
+## 9. 进度记录
+
+- 2026-11-15 引擎接口摸底完成;协议 v1 起草。
+
+## 10. 最终验证 checklist
+
+- [ ] 干净状态启动 → 拖入文件夹 → 翻译 → 每页有结果
+- [ ] 改译文 / 字体 / 字号 / 拖动 / 缩放 / 删除后结果图正确更新,重开项目后保留
+- [ ] 缺 Key、断网、取消、引擎崩溃都有明确提示且可恢复
+- [ ] 导出图片与文本
+- [ ] 深浅色、窗口缩放、键盘操作、VoiceOver 标签
+- [ ] `swift build`/`swift test`、引擎测试、上游测试无新增失败
