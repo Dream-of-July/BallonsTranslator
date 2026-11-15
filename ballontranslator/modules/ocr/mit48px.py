@@ -17,6 +17,20 @@ import torch.nn.functional as F
 from .mit48px_ctc import AvgMeter, chunks, TextBlock
 
 
+def normalized_confidence(log_probability: torch.Tensor, tokens: torch.Tensor,
+                          end_tok: int = 2) -> float:
+    """Geometric mean over decoded tokens, including the first EOS, excluding BOS.
+
+    Repeated EOS padding has zero log probability and must not inflate the mean.
+
+    >>> round(normalized_confidence(torch.tensor(10 * math.log(.85)), torch.ones(10)), 2)
+    0.85
+    """
+    ends = (tokens == end_tok).nonzero(as_tuple=True)[0]
+    count = int(ends[0]) + 1 if ends.numel() else tokens.numel()
+    return (log_probability / count).exp().item() if count else 0.0
+
+
 def fixed_pos_embedding(x):
     seq_len, dim = x.shape
     inv_freq = 1.0 / (10000 ** (torch.arange(0, dim) / dim))
@@ -140,7 +154,18 @@ class Model48pxOCR:
         self.model.to(device)
         self.device = device
     
-    def __call__(self, textblk_lst: List[TextBlock], regions: List[np.ndarray], textblk_lst_indices: List, chunk_size = 16) -> None:
+    def __call__(self, textblk_lst: List[TextBlock], regions: List[np.ndarray],
+                 textblk_lst_indices: List, chunk_size: int = 16,
+                 confidence_mode: str = 'joint', min_confidence: float = 0.2) -> None:
+        manga_threshold = min_confidence
+        if any(block.manga_area is not None for block in textblk_lst):
+            from ballontranslator.engine.manga_quality import MANGA_LINE_MIN_CONFIDENCE
+            manga_threshold = MANGA_LINE_MIN_CONFIDENCE
+        for block in textblk_lst:
+            if block.manga_area is not None:
+                block.manga_line_confidence = []
+                block.manga_line_text = []
+                block.manga_partial = False
         perm = range(len(regions))
         chunck_idx = 0
         color_totals = defaultdict(
@@ -166,13 +191,17 @@ class Model48pxOCR:
 
             with torch.no_grad():
                 ret = self.model.infer_beam_batch_tensor(image_tensor, widths, beams_k = 5, max_seq_length = 255)
-            for i, (pred_chars_index, prob, fg_pred, bg_pred, fg_ind_pred, bg_ind_pred) in enumerate(ret):
+            for i, (pred_chars_index, prob, fg_pred, bg_pred, fg_ind_pred, bg_ind_pred,
+                    normalized_prob) in enumerate(ret):
                 block_index = textblk_lst_indices[i + chunck_idx]
                 cur_region = textblk_lst[block_index]
-                if cur_region.manga_area is not None:
-                    previous = cur_region.manga_ocr_confidence
-                    cur_region.manga_ocr_confidence = float(prob) if previous is None else min(previous, float(prob))
-                if prob < 0.2:
+                manga = cur_region.manga_area is not None
+                confidence = normalized_prob if manga or confidence_mode == 'normalized' else prob
+                threshold = manga_threshold if manga else min_confidence
+                if manga:
+                    cur_region.manga_line_confidence.append(float(normalized_prob))
+                    cur_region.manga_line_text.append('')
+                if confidence < threshold:
                     continue
                 has_fg = (fg_ind_pred[:, 1] > fg_ind_pred[:, 0])
                 has_bg = (bg_ind_pred[:, 1] > bg_ind_pred[:, 0])
@@ -205,6 +234,8 @@ class Model48pxOCR:
                         bg(int(c_fg[1] * 255))
                         bb(int(c_fg[2] * 255))
                 txt = ''.join(seq)
+                if manga:
+                    cur_region.manga_line_text[-1] = txt
                 fr = min(max(int(fr()), 0), 255)
                 fg = min(max(int(fg()), 0), 255)
                 fb = min(max(int(fb()), 0), 255)
@@ -221,6 +252,10 @@ class Model48pxOCR:
 
         for block_index, (fg_total, bg_total) in color_totals.items():
             textblk_lst[block_index].update_font_colors(fg_total, bg_total)
+        for block in textblk_lst:
+            if block.manga_area is not None:
+                block.manga_partial = any(block.manga_line_text) and any(
+                    value < manga_threshold for value in block.manga_line_confidence)
 
 
 
@@ -774,10 +809,12 @@ class OCR(nn.Module):
             for idx in finished_batch_indices:
                 batch_log_probs = batch_topk_log_probs[idx]
                 best_beam_idx = batch_log_probs.argmax()
+                best_tokens = out_idx[idx * beams_k + best_beam_idx]
                 finished_hypos[batch_index[beams_k * idx].item()] = \
-                    out_idx[idx * beams_k + best_beam_idx], \
+                    best_tokens, \
                     torch.exp(batch_log_probs[best_beam_idx]).item(), \
-                    cached_activations[idx * beams_k + best_beam_idx] 
+                    cached_activations[idx * beams_k + best_beam_idx], \
+                    normalized_confidence(batch_log_probs[best_beam_idx], best_tokens[1:], end_tok)
 
 
             remaining_indexs = []
@@ -813,6 +850,8 @@ class OCR(nn.Module):
                 beam_idx = active_idx * beams_k + best_beam_idx
                 final_idx = out_idx[beam_idx]
                 sequence_length = max(final_idx.numel() - 1, 1)
+                # Preserve the legacy fallback score for default GUI/CLI output;
+                # normalized_prob below uses the same token definition as EOS beams.
                 probability = torch.exp(
                     log_probs[beam_idx] / sequence_length
                 ).item()
@@ -820,19 +859,20 @@ class OCR(nn.Module):
                     final_idx,
                     probability,
                     cached_activations[beam_idx],
+                    normalized_confidence(log_probs[beam_idx], final_idx[1:], end_tok),
                 )
 
         # Final output processing and color predictions
         result = []
         for i in range(N):
-            final_idx, prob, decoded = finished_hypos[i] 
+            final_idx, prob, decoded, normalized_prob = finished_hypos[i]
             color_feats = self.color_pred1(decoded[-1].unsqueeze(0))
             fg_pred, bg_pred, fg_ind_pred, bg_ind_pred = \
                 self.color_pred_fg(color_feats), \
                 self.color_pred_bg(color_feats), \
                 self.color_pred_fg_ind(color_feats), \
                 self.color_pred_bg_ind(color_feats)
-            result.append((final_idx[1:], prob, fg_pred[0], bg_pred[0], fg_ind_pred[0], bg_ind_pred[0]))
+            result.append((final_idx[1:], prob, fg_pred[0], bg_pred[0], fg_ind_pred[0], bg_ind_pred[0], normalized_prob))
 
 
         return result
@@ -905,7 +945,7 @@ def test_infer() :
     img_torch = einops.rearrange((torch.from_numpy(img) / 127.5 - 1.0), 'h w c -> 1 c h w')
 
     with torch.no_grad() :
-        idx, prob, fg_pred, bg_pred, fg_ind_pred, bg_ind_pred = model.infer_beam_batch_tensor(img_torch, [new_w], 5, max_seq_length = 32)[0]
+        idx, prob, fg_pred, bg_pred, fg_ind_pred, bg_ind_pred, normalized_prob = model.infer_beam_batch_tensor(img_torch, [new_w], 5, max_seq_length = 32)[0]
         txt = ''
         for i in idx :
             txt += dictionary[i]
