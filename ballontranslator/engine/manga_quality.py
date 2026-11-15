@@ -627,7 +627,15 @@ def _repair_complex(
         seed_error = np.max(np.abs(crop[source].astype(np.float32) - model[source]), axis=1)
         source_change = np.max(np.abs(repaired[source].astype(np.float32) - crop[source]), axis=1)
         remaining = (source_change < 12) & (seed_error > max(12., spread * .5))
-        unchanged = np.count_nonzero(remaining) > max(3, np.count_nonzero(source) * .015)
+        # On textured art a few unrelated reconstructed pixels can happen to
+        # match their old RGB. Only connected remnants establish a surviving
+        # stroke; isolated matches must not veto an otherwise clean repair.
+        remnants = np.zeros_like(ink, np.uint8)
+        remnants[source] = remaining
+        _, labels, stats, _ = cv2.connectedComponentsWithStats(remnants, connectivity=8)
+        coherent = stats[:, cv2.CC_STAT_AREA] >= 3
+        coherent[0] = False
+        unchanged = np.count_nonzero(coherent[labels]) > max(3, np.count_nonzero(source) * .015)
         if not _residue_found(repaired, ink, area, radius, model, spread, ring, original=crop) and not unchanged:
             return repaired, ink
     block.manga_erase_failed = True
@@ -927,19 +935,121 @@ def _glyph_silhouette(block: TextBlock, *, balanced: bool = False, single_line: 
     return raster[y.min():y.max() + 1, x.min():x.max() + 1], left + x.min(), top + y.min()
 
 
+def _luminance(rgb: np.ndarray) -> np.ndarray:
+    """sRGB relative luminance (linear light, D65).
+
+    >>> _luminance(np.array([[0, 0, 0], [255, 255, 255]])).tolist()
+    [0.0, 1.0]
+    """
+    srgb = np.asarray(rgb, np.float32) / 255
+    linear = np.where(srgb <= .04045, srgb / 12.92, ((srgb + .055) / 1.055) ** 2.4)
+    return linear @ np.asarray([.2126, .7152, .0722])
+
+
+def _contrast(first: np.ndarray, second: np.ndarray) -> np.ndarray:
+    return (np.maximum(first, second) + .05) / (np.minimum(first, second) + .05)
+
+
+def _source_outline(image: np.ndarray, background: np.ndarray, block: TextBlock) -> list[int] | None:
+    """Measure a removed halo, excluding unchanged paper and artwork."""
+    points = _polygon(block, image.shape[:2])
+    if points is None:
+        return None
+    bounds = _bounds(points)
+    x1, y1, x2, y2 = bounds
+    original = image[y1:y2, x1:x2, :3]
+    cleaned = background[y1:y2, x1:x2, :3]
+    changed = np.max(np.abs(original.astype(np.int16) - cleaned), axis=2) > 24
+    support = _line_support(block, bounds) != 0
+    luminance = _luminance(original)
+    contrasted = _contrast(luminance, _luminance(block.fontformat.frgb)) >= 4.5
+    # Intermediate antialiased fill fringes are not an outline. Require a
+    # separate extreme paint that also contrasts with the repaired backing.
+    distinct = ((luminance < .03) | (luminance > .75))
+    known = np.asarray(block.bg_colors)
+    if _contrast(_luminance(known), _luminance(block.fontformat.frgb)) >= 4.5:
+        distinct |= np.max(np.abs(original.astype(float) - known), axis=2) <= 18
+    distinct &= _contrast(luminance, _luminance(cleaned)) >= 1.8
+    halo = changed & support & contrasted & distinct
+    if np.count_nonzero(halo) < max(6, np.count_nonzero(changed & support) * .08):
+        return None
+    return np.median(original[halo], axis=0).astype(int).tolist()
+
+
+def _lettering_style(
+    block: TextBlock, pixels: np.ndarray, background: np.ndarray,
+    source_outline: list[int] | None,
+) -> None:
+    """Select editable fill/stroke from the cleaned glyph footprint and rim.
+
+    >>> block = TextBlock()
+    >>> glyph = np.zeros((10, 10, 4), np.uint8); glyph[..., 3] = 255
+    >>> _lettering_style(block, glyph, np.full((10, 10, 3), 255, np.uint8), None)
+    >>> block.stroke_width == 0 and block.manga_contrast_before == 21
+    True
+    """
+    glyphs = pixels[..., 3] > 0
+    around = _grow(glyphs, 2)
+    luminance = _luminance(background[..., :3])
+    samples = luminance[around]
+    block.manga_background_luminance = float(np.median(samples))
+    block.manga_background_spread = float(np.percentile(samples, 90) - np.percentile(samples, 10))
+    fill = block.fontformat.frgb
+    before = float(np.percentile(_contrast(_luminance(fill), luminance[glyphs]), 10))
+    block.manga_contrast_before = before
+    # Small native glyphs can have no fully opaque core. Their actual coverage
+    # may make an otherwise adequate nominal fill illegible after blending.
+    insufficient = before < 4.5 or _drawn_contrast(block, pixels, background) < 4.5
+    if insufficient:
+        fill = max(([0, 0, 0], [255, 255, 255]),
+                   key=lambda rgb: np.percentile(_contrast(_luminance(rgb), luminance[glyphs]), 10))
+        block.fontformat.frgb = fill
+    # A pale, flat bubble retains its original fill and zero stroke. Texture
+    # and removed source halos are evidence for a stroke, not OCR's bg colour
+    # alone (OCR commonly reports the same colour for fill and outline).
+    outline = (block.manga_background_spread > .08 or insufficient
+               or source_outline is not None or block.stroke_width > 0)
+    if outline:
+        stroke = [255, 255, 255] if _luminance(fill) < .179 else [0, 0, 0]
+        if source_outline is None and block.stroke_width > 0:
+            source_outline = block.fontformat.srgb
+        if source_outline is not None and _contrast(_luminance(fill), _luminance(source_outline)) >= 4.5:
+            stroke = source_outline
+        block.fontformat.srgb = stroke
+        block.stroke_width = max(.10, 1.5 / block.font_size)
+    block.manga_outline_applied = outline
+
+
 def _fit(
     block: TextBlock, points: np.ndarray, refit: bool, font: FontChoice | None = None,
     available: np.ndarray | None = None,
+    *, background: np.ndarray | None = None, erased: np.ndarray | None = None,
+    source_outline: list[int] | None = None,
 ) -> tuple[np.ndarray, int, int] | None:
+    """Fit the native painted silhouette, including its editable stroke.
+
+    >>> _fit(TextBlock(), np.array([[0, 0], [0, 1], [1, 1]]), True) is None
+    True
+    """
     from ballontranslator.utils import shared
 
     bounds = _bounds(points)
     x1, y1, x2, y2 = bounds
-    area = _area_mask(points, bounds, inset=1 if min(x2 - x1, y2 - y1) < 28 else 2)
+    inset = 1 if min(x2 - x1, y2 - y1) < 28 else 2
+    # Unframed detection boxes already tightly bound source ink. Their edge
+    # is usable backing, whereas a bubble edge needs its outline clearance.
+    if background is not None and not _inside_bubble(block, background.shape[:2]):
+        inset = 0
+    area = _area_mask(points, bounds, inset=inset)
     if available is not None:
         area[~available] = 0
     if not area.any():
         return None
+    erased_colour = None
+    if background is not None and erased is not None:
+        samples = background[y1:y2, x1:x2, :3][erased[y1:y2, x1:x2] != 0]
+        if len(samples):
+            erased_colour = np.median(samples, axis=0)
     candidate = copy.deepcopy(block)
     candidate.rich_text = ''
     if font is not None:
@@ -968,6 +1078,9 @@ def _fit(
                    for dx, dy in ((0, -1), (0, 1), (-1, 0), (1, 0),
                                   (-1, -1), (1, -1), (-1, 1), (1, 1)))
     centers.append(((x1 + x2) / 2, (y1 + y2) / 2))
+    if background is not None:
+        bx1, by1, bx2, by2 = block.xyxy
+        centers.append(((bx1 + bx2) / 2, (by1 + by2) / 2))
     single_line = (len(block.lines) == 1 and not block.src_is_vertical
                    and x2 - x1 >= 4 * (y2 - y1))
     spacing = [(block.letter_spacing, block.line_spacing)]
@@ -1003,21 +1116,116 @@ def _fit(
                 if w > x2 - x1 or h > y2 - y1:
                     continue
                 positions = [(round(cx - w / 2), round(cy - h / 2)) for cx, cy in centers] if refit else [(original_x, original_y)]
+                positions = [(x, y) for x, y in positions
+                             if x1 <= x and y1 <= y and x + w <= x2 and y + h <= y2]
+                if erased_colour is not None:
+                    ink = pixels[..., 3] != 0
+                    def placement_cost(position: tuple[int, int]) -> tuple[float, float]:
+                        px, py = position
+                        zone = erased[py:py + h, px:px + w] != 0
+                        similar = np.max(np.abs(background[py:py + h, px:px + w, :3].astype(float) - erased_colour), axis=2) <= 36
+                        return float(np.mean((~zone & ~similar)[ink])), -float(np.mean(zone[ink]))
+                    positions.sort(key=placement_cost)
                 for x, y in positions:
-                    if x < x1 or y < y1 or x + w > x2 or y + h > y2:
+                    styled = candidate
+                    rendered_pixels, rx, ry = pixels, original_x, original_y
+                    px, py, ph, pw = x, y, h, w
+                    if background is not None:
+                        styled = copy.deepcopy(candidate)
+                        _lettering_style(styled, pixels, background[y:y + h, x:x + w], source_outline)
+                        if (styled.stroke_width != candidate.stroke_width
+                                or list(styled.fontformat.frgb) != list(candidate.fontformat.frgb)
+                                or list(styled.fontformat.srgb) != list(candidate.fontformat.srgb)):
+                            styled_render = _glyph_silhouette(styled, balanced=refit, single_line=single_line)
+                            if styled_render is None:
+                                continue
+                            rendered_pixels, rx, ry = styled_render
+                            ph, pw = rendered_pixels.shape[:2]
+                            px, py = (round(x + (w - pw) / 2), round(y + (h - ph) / 2)) if refit else (rx, ry)
+                    if px < x1 or py < y1 or px + pw > x2 or py + ph > y2:
                         continue
-                    section = area[y - y1:y + h - y1, x - x1:x + w - x1]
-                    if np.any((pixels[:, :, 3] > 0) & (section == 0)):
+                    section = area[py - y1:py + ph - y1, px - x1:px + pw - x1]
+                    if np.any((rendered_pixels[:, :, 3] > 0) & (section == 0)):
                         continue
                     if refit:
-                        remapped = list(candidate._bounding_rect)
-                        remapped[0] += int(x - original_x)
-                        remapped[1] += int(y - original_y)
+                        remapped = list(styled._bounding_rect)
+                        remapped[0] += int(px - rx)
+                        remapped[1] += int(py - ry)
                         block._bounding_rect = remapped
-                        block.fontformat = copy.deepcopy(candidate.fontformat)
-                        block.angle = candidate.angle
-                    return pixels, x, y
+                        block.angle = styled.angle
+                    block.fontformat = copy.deepcopy(styled.fontformat)
+                    block.manga_contrast_before = styled.manga_contrast_before
+                    block.manga_background_luminance = styled.manga_background_luminance
+                    block.manga_background_spread = styled.manga_background_spread
+                    block.manga_outline_applied = styled.manga_outline_applied
+                    return rendered_pixels, px, py
     return None
+
+
+def _soft_backing(
+    block: TextBlock, points: np.ndarray, rendered: tuple[np.ndarray, int, int],
+    cleaned: np.ndarray, applied: np.ndarray, forbidden: np.ndarray,
+) -> None:
+    """Publish a feathered text-sized veil, clipped to the bubble interior."""
+    if not block.manga_outline_applied or not _inside_bubble(block, applied.shape):
+        return
+    pixels, x, y = rendered
+    h, w = pixels.shape[:2]
+    visible = pixels[..., 3] > 64
+    edge = visible & ~cv2.erode(visible.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool)
+    if not edge.any():
+        return
+    luminance = _luminance(cleaned[y:y + h, x:x + w, :3]).astype(np.float32)
+    mean = cv2.blur(luminance, (5, 5))
+    spread = np.sqrt(np.maximum(0, cv2.blur(luminance ** 2, (5, 5)) - mean ** 2))
+    weak = (_contrast(_luminance(block.fontformat.srgb), luminance) < 3) | (spread > .06)
+    if np.mean(weak[edge]) < .20:
+        return
+    left, top, right, bottom = bounds = _bounds(points)
+    inside = _area_mask(points, bounds, inset=2) != 0
+    inside &= ~forbidden[top:bottom, left:right]
+    crop = cleaned[top:bottom, left:right, :3]
+    if not inside.any():
+        return
+    colour = np.median(crop[inside], axis=0)
+    margin = max(3, round(block.font_size * .35))
+    yy, xx = np.ogrid[top:bottom, left:right]
+    distance = np.maximum.reduce(np.broadcast_arrays(x - xx, xx - (x + w - 1),
+                                                     y - yy, yy - (y + h - 1)))
+    weight = np.clip(1 - np.maximum(0, distance) / margin, 0, 1)
+    # Smoothstep feathers only the outer margin; clipping happens afterwards,
+    # so filtering cannot leak even one pixel across the bubble outline.
+    weight = (.72 * weight ** 2 * (3 - 2 * weight) * inside)[..., None]
+    crop[:] = np.rint(crop * (1 - weight) + colour * weight).astype(np.uint8)
+    published = weight[..., 0] > 0
+    applied[top:bottom, left:right][published] = 255
+    block.manga_backing_applied = bool(published.any())
+
+
+def _drawn_contrast(block: TextBlock, rendered: np.ndarray, backing: np.ndarray) -> float:
+    """10th-percentile core contrast against the adjacent backing or stroke.
+
+    Antialias fringes are excluded. For outlined letters the adjacent paint is
+    measured from opaque stroke pixels of the real Qt raster, not from a
+    theoretical replacement of the page luminance.
+
+    >>> glyph = np.array([[[0, 0, 0, 255]]], np.uint8)
+    >>> _drawn_contrast(TextBlock(), glyph, np.full((1, 1, 3), 255, np.uint8))
+    21.0
+    """
+    alpha = rendered[..., 3:4].astype(np.float32) / 255
+    composited = rendered[..., :3] * alpha + backing[..., :3] * (1 - alpha)
+    fill = np.asarray(block.fontformat.frgb)
+    core = (rendered[..., 3] >= 224) & (np.max(np.abs(rendered[..., :3].astype(float) - fill), axis=2) <= 24)
+    if not core.any():
+        return 1.
+    comparison = _luminance(backing[..., :3])[core]
+    if block.manga_outline_applied:
+        stroke = np.asarray(block.fontformat.srgb)
+        rim = (rendered[..., 3] >= 224) & (np.max(np.abs(rendered[..., :3].astype(float) - stroke), axis=2) <= 24)
+        if rim.any():
+            comparison = np.median(_luminance(composited)[rim])
+    return float(np.percentile(_contrast(_luminance(composited)[core], comparison), 10))
 
 
 def compose_page(
@@ -1045,7 +1253,12 @@ def compose_page(
         rectangular = cv2.contourArea(points) / max(1, (right - left - 1) * (bottom - top - 1)) >= .92
         kinds.append(not rectangular and _inside_bubble(block, valid.shape))
     fonts = FontMatcher().page_choices(image, valid, blocks, kinds) if refit is None else {}
+    source_outlines = [_source_outline(image, draft, block) if source_review(block) is None else None
+                       for block in blocks]
     for index, block in enumerate(blocks):
+        block.manga_contrast_before = block.manga_contrast_after = None
+        block.manga_background_luminance = block.manga_background_spread = None
+        block.manga_outline_applied = block.manga_backing_applied = False
         block.manga_review = source_review(block)
         points = _polygon(block, valid.shape)
         inside_bubble = _inside_bubble(block, valid.shape)
@@ -1054,10 +1267,15 @@ def compose_page(
         if block.manga_review is None and block.manga_erase_failed:
             block.manga_review = 'geometry'
         region = _region_ink(block, valid, inside_bubble=inside_bubble)
+        if block.manga_review == 'skipped':
+            # An unreadable art detection has no source ink to reserve. Its
+            # expanded box can otherwise borrow a neighbouring bubble's mask
+            # and veto that bubble's independently verified white repair.
+            region = None
         if region is not None and block.manga_complex_background:
             (x1, y1, x2, y2), ink = region
             region = region[0], ink & (owners[y1:y2, x1:x2] == index)
-        if not inside_bubble:
+        if not inside_bubble and block.manga_review != 'skipped':
             white = _unframed_white_ink(block, image, valid)
             if white is not None:
                 (left, top, right, bottom), complete, _ = white
@@ -1070,7 +1288,8 @@ def compose_page(
         if block.manga_review is None:
             resize = refit is None or index in refit
             candidate = copy.deepcopy(block)
-            rendered = _fit(candidate, points, resize, fonts.get(index))
+            rendered = _fit(candidate, points, resize, fonts.get(index),
+                            background=draft, erased=valid, source_outline=source_outlines[index])
             if rendered is not None:
                 overlays.append([index, block, candidate, region, rendered])
                 continue
@@ -1095,7 +1314,8 @@ def compose_page(
             # Exactly one re-placement search, starting from the original size
             # and spacing. Source erasure itself may never cross protected ink.
             retried.add(index)
-            retry = _fit(candidate, points, refit is None or index in refit, fonts.get(index), remaining)
+            retry = _fit(candidate, points, refit is None or index in refit, fonts.get(index), remaining,
+                         background=draft, erased=valid, source_outline=source_outlines[index])
             if source_collision or retry is None:
                 block.manga_review = 'geometry'
                 reserved[y1:y2, x1:x2] |= ink
@@ -1127,7 +1347,8 @@ def compose_page(
                     left, top, right, bottom = _bounds(points)
                     remaining = ~(reserved[top:bottom, left:right] | lettering[top:bottom, left:right])
                     candidate = copy.deepcopy(block)
-                    retry = _fit(candidate, points, refit is None or index in refit, fonts.get(index), remaining)
+                    retry = _fit(candidate, points, refit is None or index in refit, fonts.get(index), remaining,
+                                 background=draft, erased=valid, source_outline=source_outlines[index])
                 if retry is not None and not np.any(ink & reserved[y1:y2, x1:x2]):
                     entry[2], entry[4] = candidate, retry
                     pixels, x, y = retry
@@ -1145,13 +1366,21 @@ def compose_page(
         block._bounding_rect = candidate._bounding_rect
         block.fontformat = candidate.fontformat
         block.angle = candidate.angle
+        block.manga_contrast_before = candidate.manga_contrast_before
+        block.manga_background_luminance = candidate.manga_background_luminance
+        block.manga_background_spread = candidate.manga_background_spread
+        block.manga_outline_applied = candidate.manga_outline_applied
     cleaned[applied != 0, :3] = draft[applied != 0, :3]
+    for _, block, _, _, rendered in overlays:
+        if not block.manga_review:
+            _soft_backing(block, _polygon(block, valid.shape), rendered, cleaned, applied, reserved)
     result = cleaned.copy()
     for _, block, _, _, (pixels, x, y) in overlays:
         if block.manga_review:
             continue
         h, w = pixels.shape[:2]
         crop = result[y:y + h, x:x + w, :3]
+        block.manga_contrast_after = _drawn_contrast(block, pixels, crop)
         alpha = pixels[:, :, 3:4].astype(np.uint16)
         crop[:] = ((pixels[:, :, :3] * alpha + crop * (255 - alpha) + 127) // 255).astype(np.uint8)
     return cleaned, result, applied

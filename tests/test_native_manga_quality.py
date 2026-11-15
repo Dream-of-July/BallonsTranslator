@@ -227,6 +227,12 @@ def test_confidence_fields_default_and_project_json_round_trip(tmp_path):
     assert old.manga_complex_background is False
     assert old.manga_residue_retried is False
     assert old.manga_erase_failed is False
+    assert old.manga_contrast_before is None and old.manga_contrast_after is None
+    assert old.manga_background_luminance is None and old.manga_background_spread is None
+    assert not old.manga_outline_applied and not old.manga_backing_applied
+    new.manga_contrast_after = 7.2
+    new.manga_outline_applied = True
+    new.manga_backing_applied = True
     old.manga_line_confidence.append(.9)
     assert TextBlock().manga_line_confidence == []
     payload = json.loads(json.dumps(project.to_dict(), cls=TextBlkEncoder))
@@ -235,6 +241,8 @@ def test_confidence_fields_default_and_project_json_round_trip(tmp_path):
     assert loaded.manga_line_confidence == new.manga_line_confidence
     assert loaded.manga_line_text == new.manga_line_text
     assert loaded.manga_partial is True
+    assert loaded.manga_contrast_after == 7.2
+    assert loaded.manga_outline_applied and loaded.manga_backing_applied
 
 
 def test_retry_merges_better_lines_without_losing_good_readings():
@@ -885,3 +893,229 @@ def test_complex_mask_respects_protected_area_and_resets_retry_state():
     assert draft[65:120, 88:141, 3].sum() == 0
     assert np.array_equal(draft[65:120, 88:141, :3], image[65:120, 88:141])
     assert draft[:, :88, 3].any()
+
+
+def legibility_page(background, fill=(0, 0, 0), bubble=True):
+    image = background.copy()
+    block = box_block((20, 20, 219, 159), '天地玄黃', size=28,
+                      source_bounds=(70, 55, 85, 120), vertical=False)
+    block.fontformat.frgb = list(fill)
+    if not bubble:
+        block.xyxy = [20, 20, 219, 159]
+    mask = np.zeros(image.shape[:2], np.uint8)
+    mask[55:120, 70:85] = 255
+    image[mask != 0] = fill
+    return image, np.dstack((background, mask)), block
+
+
+@pytest.mark.parametrize(('low', 'high', 'fill', 'stroke'), [
+    (125, 240, (0, 0, 0), [255, 255, 255]),
+    (5, 95, (255, 255, 255), [0, 0, 0]),
+])
+def test_busy_lettering_keeps_contrasting_source_fill_and_uses_native_stroke(low, high, fill, stroke):
+    from ballontranslator.engine.manga_quality import compose_page, _glyph_silhouette
+
+    y, x = np.indices((180, 240))
+    grey = np.where((x // 4 + y // 4) % 2, low, high).astype(np.uint8)
+    background = np.repeat(grey[..., None], 3, axis=2)
+    image, draft, block = legibility_page(background, fill)
+    compose_page(image, draft, [block])
+    assert block.manga_review is None
+    assert block.fontformat.frgb == list(fill)
+    assert block.fontformat.srgb == stroke
+    assert block.manga_outline_applied and block.stroke_width >= .08
+    assert block.stroke_width * block.font_size >= 1.5
+    assert block.manga_contrast_after >= 4.5
+    # Edits and subsequent re-renders use the same persisted native stroke.
+    rendered = _glyph_silhouette(block)
+    assert rendered is not None
+    assert np.any(np.all(rendered[0][..., :3] == stroke, axis=2) & (rendered[0][..., 3] > 224))
+
+
+def test_green_source_on_grey_wall_gets_sufficient_contrast():
+    from ballontranslator.engine.manga_quality import compose_page
+
+    image, draft, block = legibility_page(np.full((180, 240, 3), 145, np.uint8), (25, 145, 18), False)
+    compose_page(image, draft, [block])
+    assert block.manga_review is None
+    assert block.manga_contrast_before < 4.5
+    assert block.fontformat.frgb == [0, 0, 0]
+    assert block.manga_outline_applied
+    assert block.manga_contrast_after >= 4.5
+    assert not block.manga_backing_applied
+
+
+@pytest.mark.parametrize('colour', [(255, 255, 255), (241, 245, 232)])
+def test_flat_pale_bubble_keeps_fill_and_zero_stroke(colour):
+    from ballontranslator.engine.manga_quality import compose_page
+
+    image, draft, block = legibility_page(np.full((180, 240, 3), colour, np.uint8), (12, 22, 10))
+    compose_page(image, draft, [block])
+    assert block.manga_review is None
+    assert block.fontformat.frgb == [12, 22, 10]
+    assert block.stroke_width == 0
+    assert not block.manga_outline_applied and not block.manga_backing_applied
+
+
+@pytest.mark.parametrize('bubble', [False, True])
+def test_backing_and_outlined_glyphs_stay_inside_bubble_and_preserve_original_edges(bubble):
+    from ballontranslator.engine.manga_quality import compose_page, _glyph_silhouette, _area_mask, _bounds
+
+    y, x = np.indices((180, 240))
+    grey = np.where((x // 3 + y // 3) % 2, 125, 240).astype(np.uint8)
+    image, draft, block = legibility_page(np.repeat(grey[..., None], 3, axis=2), bubble=bubble)
+    if bubble:
+        ellipse = cv2.ellipse2Poly((120, 90), (99, 69), 0, 0, 360, 10)
+        block.manga_area = ellipse.tolist()
+    points = np.asarray(block.manga_area, np.int32)
+    allowed = np.zeros(image.shape[:2], np.uint8)
+    cv2.fillPoly(allowed, [points], 255)
+    cleaned, result, applied = compose_page(image, draft, [block])
+    assert block.manga_review is None and block.manga_outline_applied
+    assert block.manga_backing_applied is bubble
+    assert np.array_equal(cleaned[allowed == 0], image[allowed == 0])
+    assert np.array_equal(result[allowed == 0], image[allowed == 0])
+    assert np.array_equal(cleaned[applied == 0], image[applied == 0])
+    pixels, px, py = _glyph_silhouette(block)
+    h, w = pixels.shape[:2]
+    assert not np.any((pixels[..., 3] != 0) & (allowed[py:py + h, px:px + w] == 0))
+    if bubble:
+        left, top, right, bottom = _bounds(points)
+        interior = _area_mask(points, (left, top, right, bottom), inset=2)
+        backing = np.any(cleaned[top:bottom, left:right] != draft[top:bottom, left:right, :3], axis=2)
+        assert backing.any() and not np.any(backing & (interior == 0))
+        # Partial opacity retains texture instead of replacing it with a plate.
+        assert np.ptp(cleaned[top:bottom, left:right][backing], axis=0).max() > 5
+
+
+def test_removed_source_halo_preserves_its_contrasting_colour():
+    from ballontranslator.engine.manga_quality import compose_page, _grow
+
+    background = np.full((180, 240, 3), 100, np.uint8)
+    image, draft, block = legibility_page(background, (255, 255, 255), False)
+    core = draft[..., 3] != 0
+    halo = _grow(core, 4) & ~core
+    image[halo] = [0, 0, 20]
+    draft[halo, 3] = 255
+    compose_page(image, draft, [block])
+    assert block.fontformat.frgb == [255, 255, 255]
+    assert block.manga_outline_applied
+    assert block.fontformat.srgb == [0, 0, 20]
+
+
+def test_unreadable_art_detection_does_not_reserve_neighbouring_white_bubble_ink():
+    from ballontranslator.engine.manga_quality import compose_page, prepare_background
+
+    image, mask, merged = comic_page()
+    from ballontranslator.engine.manga_quality import identify_regions
+    bubble = identify_regions(image, [merged])[0]
+    bubble.text, bubble.translation = ['文字'], '中文'
+    art = box_block((10, 10, 210, 140), '', size=24)
+    art.text = ['']
+    blocks = [bubble, art]
+    draft = prepare_background(image, mask, blocks, None)
+    _, result, applied = compose_page(image, draft, blocks)
+    assert art.manga_review == 'skipped'
+    assert bubble.manga_review is None
+    assert applied.any() and np.any(result != image)
+    assert bubble.stroke_width == 0 and not bubble.manga_backing_applied
+
+
+@pytest.mark.parametrize('connected', [False, True])
+def test_textured_repair_distinguishes_coincident_pixels_from_surviving_stroke(connected):
+    from ballontranslator.engine.manga_quality import prepare_background, _grow
+
+    rng = np.random.default_rng(19)
+    clean = rng.integers(30, 180, (180, 240, 3), dtype=np.uint8)
+    image, _, block = legibility_page(clean, (0, 0, 0), False)
+    mask = np.zeros(clean.shape[:2], np.uint8)
+    mask[55:120, 70:85] = 255
+    repaired = clean.copy()
+    # Four chance matches are not a stroke. A connected strip still fails.
+    dots = [(65, 74), (77, 78), (91, 74), (106, 79)]
+    for y, x in dots:
+        repaired[y, x] = 0
+    if connected:
+        repaired[65:115, 76:79] = 0
+
+    class RepairedTexture:
+        def all_model_loaded(self):
+            return True
+
+        def memory_safe_inpaint(self, crop, ink):
+            from ballontranslator.modules.inpaint.base import enlarge_window
+            from ballontranslator.engine.manga_quality import _bounds
+            x1, y1, x2, y2 = _bounds(np.asarray(block.manga_area, np.int32))
+            left, top, right, bottom = enlarge_window((x1, y1, x2, y2), 240, 180, ratio=1.7)
+            return repaired[top:bottom, left:right].copy()
+
+    draft = prepare_background(image, mask, [block], RepairedTexture())
+    assert block.manga_erase_failed is connected
+    assert bool(draft[..., 3].any()) is not connected
+
+
+def test_antialiased_dark_source_on_white_is_not_mistaken_for_a_halo():
+    from ballontranslator.engine.manga_quality import compose_page
+
+    background = np.full((180, 240, 3), 255, np.uint8)
+    image, draft, block = legibility_page(background, (5, 8, 3))
+    # A wide range of JPEG/antialias grey values belongs to a single fill.
+    for offset, grey in enumerate((25, 65, 125, 145, 175, 205, 225, 240)):
+        image[55:120, 70 + offset] = grey
+    compose_page(image, draft, [block])
+    assert block.manga_review is None
+    assert block.fontformat.frgb == [5, 8, 3]
+    assert block.stroke_width == 0 and not block.manga_backing_applied
+
+
+def test_placement_prefers_erased_background_to_artwork_without_withholding():
+    from ballontranslator.engine.manga_quality import _fit, _area_mask, _bounds
+
+    background = np.full((180, 240, 3), 230, np.uint8)
+    background[20:90, 20:220] = [20, 10, 5]  # artwork at the first distance maximum
+    erased = np.zeros(background.shape[:2], np.uint8)
+    erased[95:145, 80:155] = 255
+    block = box_block((20, 20, 219, 159), '天地', size=20,
+                      source_bounds=(80, 95, 155, 145), vertical=False)
+    points = np.asarray(block.manga_area, np.int32)
+    rendered = _fit(block, points, True, background=background, erased=erased)
+    assert rendered is not None
+    pixels, x, y = rendered
+    h, w = pixels.shape[:2]
+    visible = pixels[..., 3] != 0
+    assert not np.any(visible & (background[y:y + h, x:x + w, 0] == 20))
+    assert np.any(visible & (erased[y:y + h, x:x + w] != 0))
+
+
+def test_native_stroke_remains_collision_geometry():
+    from ballontranslator.engine.manga_quality import _fit, _bounds, _area_mask
+
+    block = box_block((20, 20, 219, 159), '天地玄黃', size=28, vertical=False)
+    block.fontformat.srgb = [255, 255, 255]
+    block.stroke_width = .14
+    points = np.asarray(block.manga_area, np.int32)
+    left, top, right, bottom = _bounds(points)
+    available = np.ones((bottom - top, right - left), bool)
+    available[:, 85:100] = False
+    rendered = _fit(block, points, True, available=available)
+    assert rendered is not None
+    pixels, x, y = rendered
+    h, w = pixels.shape[:2]
+    assert not np.any((pixels[..., 3] > 0) & ~available[y - top:y - top + h, x - left:x - left + w])
+
+
+def test_small_translucent_glyph_core_gets_contrast_without_overflowing_tight_detection():
+    from ballontranslator.engine.manga_quality import _fit, _drawn_contrast
+
+    background = np.full((100, 80, 3), 255, np.uint8)
+    block = box_block((20, 20, 30, 78), '天地玄黃宇宙', size=9)
+    block.fontformat.frgb = [8, 130, 6]
+    erased = np.zeros(background.shape[:2], np.uint8)
+    erased[20:79, 20:31] = 255
+    rendered = _fit(block, np.asarray(block.manga_area, np.int32), True,
+                    background=background, erased=erased)
+    assert rendered is not None
+    pixels, x, y = rendered
+    h, w = pixels.shape[:2]
+    assert 20 <= x and 20 <= y and x + w <= 31 and y + h <= 79
+    assert _drawn_contrast(block, pixels, background[y:y + h, x:x + w]) >= 4.5
