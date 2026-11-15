@@ -669,6 +669,84 @@ def test_outlined_text_on_gradient_is_reconstructed_without_residue(detected_siz
     assert np.abs(cleaned[changed].astype(int) - clean[changed].astype(int)).max() <= 3
 
 
+@pytest.mark.parametrize('missing_mask', [False, True])
+def test_wide_outline_on_grey_gradient_uses_backing_beyond_tight_line(missing_mask):
+    from ballontranslator.engine.manga_quality import prepare_background, compose_page, _erase_radius, _grow
+
+    y, x = np.indices((180, 260))
+    clean = np.stack((145 + x * .12, 140 + y * .15, 136 + x * .08 + y * .06), axis=2).astype(np.uint8)
+    image = clean.copy()
+    source = np.zeros(image.shape[:2], np.uint8)
+    source[81:84, 52:76] = 255
+    source[82:106, 62:65] = 255
+    source[81:106, 88:91] = 255
+    source[81:106, 110:113] = 255
+    source[92:95, 88:113] = 255
+    outline = _grow(source, 13)
+    image[outline] = 255
+    image[source != 0] = (25, 145, 18)
+    block = box_block((48, 81, 123, 108), '天地', size=16, vertical=False)
+    block.fg_colors = [25, 145, 18]
+    block.bg_colors = [25, 145, 18]  # OCR often reports the fill twice.
+    changed = np.any(image != clean, axis=2)
+    assert np.any(changed & ~_grow(source, _erase_radius(block, (48, 81, 124, 109)) * 5))
+
+    class UnusedInpainter:
+        def all_model_loaded(self):
+            pytest.fail('A recoverable gradient must use the surface model')
+
+    mask = np.zeros_like(source) if missing_mask else source
+    draft = prepare_background(image, mask, [block], UnusedInpainter())
+    assert block.manga_complex_background and not block.manga_erase_failed
+    assert np.all(draft[changed, 3] != 0)
+    assert np.abs(draft[changed, :3].astype(int) - clean[changed].astype(int)).max() <= 3
+    assert draft[draft[..., 3] != 0, :3].max() < 211
+    assert np.array_equal(draft[draft[..., 3] == 0, :3], image[draft[..., 3] == 0])
+    cleaned, _, applied = compose_page(image, draft, [block])
+    assert block.manga_review is None
+    assert np.all(applied[changed] != 0)
+    assert np.abs(cleaned[changed].astype(int) - clean[changed].astype(int)).max() <= 3
+
+
+def test_pale_gradient_uses_distant_backing_instead_of_white_outline():
+    from ballontranslator.engine.manga_quality import prepare_background, _unframed_white_ink
+
+    y, x = np.indices((140, 180))
+    clean = np.stack((223 + x * .1, 220 + y * .1, 218 + x * .07), axis=2).astype(np.uint8)
+    image = clean.copy()
+    mask = np.zeros(image.shape[:2], np.uint8)
+    cv2.putText(image, 'HI', (55, 85), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 15)
+    cv2.putText(image, 'HI', (55, 85), cv2.FONT_HERSHEY_SIMPLEX, 1, (25, 145, 18), 2)
+    cv2.putText(mask, 'HI', (55, 85), cv2.FONT_HERSHEY_SIMPLEX, 1, 255, 2)
+    block = box_block((53, 61, 85, 88), '天地', size=16, vertical=False)
+    block.fg_colors = block.bg_colors = [25, 145, 18]
+    assert _unframed_white_ink(block, image, mask) is None
+    draft = prepare_background(image, mask, [block], None)
+    assert not block.manga_erase_failed
+    changed = np.any(image != clean, axis=2)
+    assert np.all(draft[changed, 3] != 0)
+    assert np.abs(draft[changed, :3].astype(int) - clean[changed].astype(int)).max() <= 3
+
+
+def test_residue_allows_continuing_border_but_rejects_attached_glyph_strokes():
+    from ballontranslator.engine.manga_quality import _background_model, _residue_found, _grow
+
+    clean = np.full((120, 180, 3), 170, np.uint8)
+    cv2.line(clean, (0, 65), (179, 65), (25, 90, 30), 2)
+    original = clean.copy()
+    cv2.putText(original, 'T', (80, 64), cv2.FONT_HERSHEY_SIMPLEX, .8, (5, 5, 5), 3)
+    ink = np.zeros(clean.shape[:2], bool)
+    ink[40:78, 70:114] = True
+    area = np.ones_like(ink)
+    ring = _grow(ink, 16) & ~_grow(ink, 4)
+    model, spread = _background_model(original, ring)
+    assert not _residue_found(clean, ink, area, 2, model, spread, ring, original=original)
+    assert _residue_found(original, ink, area, 2, model, spread, ring, original=original)
+    partial = clean.copy()
+    partial[44:59, 87:91] = 5
+    assert _residue_found(partial, ink, area, 2, model, spread, ring, original=original)
+
+
 @pytest.mark.parametrize(('low', 'high'), [(65, 145), (0, 200)])
 def test_failed_textured_erasure_retries_once_and_withholds_original(low, high):
     from ballontranslator.engine.manga_quality import prepare_background, compose_page
@@ -697,6 +775,84 @@ def test_failed_textured_erasure_retries_once_and_withholds_original(low, high):
     assert block.manga_review == 'geometry'
     assert np.array_equal(cleaned, texture) and np.array_equal(result, texture)
     assert not applied.any()
+
+
+@pytest.mark.parametrize('repair_core', [False, True])
+def test_partial_repair_does_not_hide_remaining_strokes_on_busy_art(repair_core):
+    from ballontranslator.engine.manga_quality import prepare_background, _grow
+
+    image, mask, clean, block = outlined_gradient_page()
+    # Construct the halo explicitly: putText thickness handling varies across
+    # OpenCV builds, so this rejection case must guarantee real white strokes.
+    image = clean.copy()
+    image[_grow(mask, 5)] = 255
+    image[mask != 0] = 5
+    assert np.any(image.min(axis=2) == 255)
+    texture = np.random.default_rng(11).integers(0, 200, image.shape, dtype=np.uint8)
+    source = (image.min(axis=2) == 5) | (image.min(axis=2) == 255)
+    texture[source] = image[source]
+    calls = []
+
+    class PartialInpainter:
+        def all_model_loaded(self):
+            return True
+
+        def memory_safe_inpaint(self, crop, ink):
+            calls.append(1)
+            repaired = crop.copy()
+            if repair_core:
+                # Erase every dark core while leaving the white glyph halo.
+                repaired[crop.min(axis=2) == 5] = 100
+            else:
+                selected = np.flatnonzero(ink)
+                repaired.reshape(-1, 3)[selected[::100]] = 100
+            return repaired
+
+    draft = prepare_background(texture, mask, [block], PartialInpainter())
+    assert len(calls) == 2
+    assert block.manga_erase_failed and block.manga_residue_retried
+    assert not draft[..., 3].any()
+    assert np.array_equal(draft[..., :3], texture)
+
+
+def test_textured_translucent_bubble_keeps_veil_texture_and_border():
+    from ballontranslator.engine.manga_quality import prepare_background, _bounds
+    from ballontranslator.modules.inpaint.base import enlarge_window
+
+    y, x = np.indices((220, 300))
+    art = np.stack((60 + x % 70, 70 + y % 60, 80 + (x + y) % 80), axis=2).astype(np.uint8)
+    bubble = np.zeros(art.shape[:2], np.uint8)
+    cv2.ellipse(bubble, (150, 110), (85, 80), 0, 0, 360, 255, -1)
+    clean = art.copy()
+    clean[bubble != 0] = ((art[bubble != 0].astype(float) + 255) * .5).astype(np.uint8)
+    cv2.ellipse(clean, (150, 110), (85, 80), 0, 0, 360, (35, 140, 25), 2)
+    image = clean.copy()
+    source = np.zeros(bubble.shape, np.uint8)
+    source[85:130, 133:137] = 255
+    source[85:89, 124:146] = 255
+    halo = cv2.dilate(source, np.ones((9, 9), np.uint8)) != 0
+    image[halo] = 255
+    image[source != 0] = (25, 145, 18)
+    block = box_block((65, 30, 235, 190), '天地', size=24, source_bounds=(122, 80, 151, 135))
+    contour = cv2.findContours(bubble, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0][0].reshape(-1, 2)
+    block.manga_area = contour.tolist()
+    block.fg_colors = block.bg_colors = [25, 145, 18]
+    left, top, right, bottom = enlarge_window(_bounds(contour), 300, 220, ratio=1.7)
+    calls = []
+
+    class VeilInpainter:
+        def all_model_loaded(self):
+            return True
+
+        def memory_safe_inpaint(self, crop, ink):
+            calls.append(1)
+            return clean[top:bottom, left:right].copy()
+
+    draft = prepare_background(image, source, [block], VeilInpainter())
+    assert calls == [1] and block.manga_complex_background and not block.manga_erase_failed
+    assert np.array_equal(draft[..., :3], clean)
+    assert np.ptp(draft[draft[..., 3] != 0, :3], axis=0).max() > 20
+    assert not draft[bubble == 0, 3].any()
 
 
 def test_unreadable_outside_bubble_is_skipped_and_inside_is_reviewed():
