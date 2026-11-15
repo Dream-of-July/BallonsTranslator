@@ -351,10 +351,63 @@ def _line_support(block: TextBlock, bounds: tuple[int, int, int, int]) -> np.nda
     return cv2.dilate(support, np.ones((9, 9), dtype=np.uint8))
 
 
+def _erase_polygon(block: TextBlock, shape: tuple[int, int]) -> np.ndarray | None:
+    points = _polygon(block, shape)
+    if points is not None and not _inside_bubble(block, shape):
+        # Detection boxes bound the glyphs, not their outline or the backing
+        # samples. Keep layout geometry unchanged while giving cleanup room.
+        x1, y1, x2, y2 = _bounds(points)
+        if min(x2 - x1, y2 - y1) > max(16., block._detected_font_size) * 5:
+            return points
+        padding = max(16, round(max(0., block._detected_font_size)))
+        left, top = max(0, x1 - padding), max(0, y1 - padding)
+        right, bottom = min(shape[1] - 1, x2 + padding), min(shape[0] - 1, y2 + padding)
+        points = np.asarray([[left, top], [right, top], [right, bottom], [left, bottom]], np.int32)
+    return points
+
+
+def _erase_owners(blocks: list[TextBlock], shape: tuple[int, int]) -> np.ndarray:
+    """Partition cleanup margins; -1 denotes pixels outside every region.
+
+    >>> _erase_owners([], (1, 3)).tolist()
+    [[-1, -1, -1]]
+    """
+    owners = np.full(shape, -1, np.int32)
+    nearest = np.full(shape, np.inf, np.float32)
+    for index, block in enumerate(blocks):
+        points = _erase_polygon(block, shape)
+        if points is None or not block.lines:
+            continue
+        x1, y1, x2, y2 = bounds = _bounds(points)
+        source = np.ones((y2 - y1, x2 - x1), np.uint8)
+        for line in block.lines:
+            cv2.fillPoly(source, [np.asarray(line, np.int32) - (x1, y1)], 0)
+        distance = cv2.distanceTransform(source, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
+        closer = (distance < nearest[y1:y2, x1:x2]) & (_area_mask(points, bounds) != 0)
+        nearest[y1:y2, x1:x2][closer] = distance[closer]
+        owners[y1:y2, x1:x2][closer] = index
+    return owners
+
+
+def _source_colour_ink(block: TextBlock, crop: np.ndarray, bounds: tuple[int, int, int, int]) -> np.ndarray:
+    """Anchor known, readable source strokes without inventing detections."""
+    support = np.zeros(crop.shape[:2], np.uint8)
+    for line in block.lines:
+        cv2.fillPoly(support, [np.asarray(line, np.int32) - bounds[:2]], 1)
+    colour = np.asarray(block.fg_colors, dtype=np.float32)
+    if source_review(block) is not None or colour.shape != (3,) or not np.isfinite(colour).all():
+        return np.zeros(crop.shape[:2], bool)
+    matches = (np.max(np.abs(crop.astype(np.float32) - colour), axis=2) <= 36) & (support != 0)
+    # A foreground colour shared by the backing is not an ink measurement.
+    if np.count_nonzero(matches) < 3 or np.count_nonzero(matches) > np.count_nonzero(support) * .45:
+        matches[:] = False
+    return matches
+
+
 def _region_ink(
     block: TextBlock, mask: np.ndarray, *, inside_bubble: bool = False,
 ) -> tuple[tuple[int, int, int, int], np.ndarray] | None:
-    points = _polygon(block, mask.shape)
+    points = _erase_polygon(block, mask.shape)
     if points is None or not block.lines:
         return None
     bounds = _bounds(points)
@@ -377,18 +430,21 @@ def _unframed_white_ink(
         return None
     x1, y1, x2, y2 = _bounds(tight)
     height, width = mask.shape
-    padding = min(16, max(10, round(block._detected_font_size * .5)))
+    padding = max(16, round(max(0., block._detected_font_size)))
     bounds = (max(0, x1 - padding), max(0, y1 - padding),
               min(width, x2 + padding), min(height, y2 + padding))
     left, top, right, bottom = bounds
     crop = image[top:bottom, left:right, :3]
     rim = np.ones(crop.shape[:2], dtype=bool)
     rim[y1 - top:y2 - top, x1 - left:x2 - left] = False
+    # White glyph halos often dominate a tight rim. Only distant backing
+    # samples can establish paper; a halo is never a backing plate.
+    rim &= ~_grow(_line_support(block, bounds), max(3, _erase_radius(block, bounds) * 2))
     surrounding = crop[rim]
     pale = surrounding[surrounding.min(axis=1) >= 225]
-    if not len(pale) or len(pale) < .72 * len(surrounding):
+    if len(surrounding) < 24 or len(pale) < .9 * len(surrounding):
         return None
-    if np.max(np.ptp(np.percentile(pale, (10, 90), axis=0), axis=0)) > 18:
+    if np.max(np.ptp(np.percentile(pale, (10, 90), axis=0), axis=0)) > 2:
         return None
     seed = (mask[top:bottom, left:right] != 0) & (_line_support(block, bounds) != 0)
     if not seed.any():
@@ -429,16 +485,25 @@ def source_review(block: TextBlock) -> str | None:
 
 def _complete_complex_ink(
     block: TextBlock, crop: np.ndarray, seed: np.ndarray, area: np.ndarray,
-    bounds: tuple[int, int, int, int], radius: int,
-) -> np.ndarray:
-    support = (_grow(_line_support(block, bounds), radius * 2) & area
-               & _grow(seed, radius * 5))
+    bounds: tuple[int, int, int, int], radius: int, inside_bubble: bool,
+) -> tuple[np.ndarray, np.ndarray]:
+    detected = seed
+    measured = _source_colour_ink(block, crop, bounds) & area
+    if measured.any():
+        seed = measured
+    reach = max(radius * 5, round(max(0., block._detected_font_size) * .9))
+    support = (_grow(_line_support(block, bounds), reach) & area
+               & _grow(seed, reach))
     # OCR colours are RGB, as are engine images. Include measured extremes:
     # default/missing OCR colours must not hide a coloured fill or halo.
     colours = [np.asarray(block.fg_colors), np.asarray(block.bg_colors)]
     if seed.any():
         colours.append(np.median(crop[seed], axis=0))
     pixels = crop[support]
+    backing = area & ~_grow(_line_support(block, bounds), radius * 2)
+    if np.count_nonzero(backing) < 24:
+        backing = area & ~_grow(seed, radius * 2)
+    backing_colour = np.median(crop[backing], axis=0) if backing.any() else None
     if len(pixels):
         luminance = pixels.mean(axis=1)
         ordered = np.sort(luminance)
@@ -446,24 +511,51 @@ def _complete_complex_ink(
             # Use an observed luminance so quantisation/gaps cannot leave an
             # empty colour cluster at an interpolated percentile.
             target = ordered[round((len(luminance) - 1) * percentile / 100)]
-            colours.append(np.median(pixels[np.abs(luminance - target) <= 8], axis=0))
+            colour = np.median(pixels[np.abs(luminance - target) <= 8], axis=0)
+            # In a closed bubble an extreme can be the backing itself. On
+            # unframed text, keep the halo even beside a white page margin.
+            if (backing_colour is None or np.max(np.abs(colour - backing_colour)) > 18
+                    or (not inside_bubble and percentile == 95 and colour.min() >= 225)):
+                colours.append(colour)
     matches = seed.copy()
     pixels_float = crop.astype(np.float32)
     for colour in colours:
         if colour.shape == (3,) and np.isfinite(colour).all():
             matches |= np.max(np.abs(pixels_float - colour), axis=2) <= 36
-    matches &= support
+    matches &= area
     count, labels = cv2.connectedComponents(matches.astype(np.uint8), connectivity=8)
     selected = np.zeros(count, bool)
     selected[np.unique(labels[seed])] = True
     selected[0] = False
-    return _grow(selected[labels] | seed, radius) & area
+    complete = (selected[labels] & support) | seed
+    continuing = np.zeros(count, bool)
+    continuing[np.unique(labels[area & ~support])] = True
+    continuing[0] = False
+    # A halo can join pale veil/paper or a border. Keep its nearby part, not
+    # the whole connected backing feature, so textured bubbles retain context.
+    complete &= ~continuing[labels] | _grow(seed, max(radius * 3, round(block._detected_font_size * .25)))
+    # Isolated pale halos are also source evidence. Checking only the dark
+    # core would certify a repair that leaves a white glyph outline. Other
+    # measured extremes can be real texture and must not become ink anchors.
+    anchors = (seed & detected) | (complete & ~continuing[labels] & (crop.min(axis=2) >= 225))
+    if not anchors.any():
+        anchors = detected
+    return _grow(complete, radius) & area, anchors
 
 
 def _residue_found(
     repaired: np.ndarray, ink: np.ndarray, area: np.ndarray, radius: int,
     model: np.ndarray, spread: float, ring: np.ndarray,
+    *, original: np.ndarray | None = None,
 ) -> bool:
+    """Reject strokes, allowing unchanged context and continuing backing lines.
+
+    >>> pixels = np.full((12, 12, 3), 100, np.uint8)
+    >>> ink = np.zeros((12, 12), bool); ink[4:8, 4:8] = True
+    >>> bool(_residue_found(pixels, ink, np.ones_like(ink), 1,
+    ...                    pixels.astype(np.float32), 0., ~ink, original=pixels))
+    False
+    """
     zone = _grow(ink, radius) & area
     if not zone.any() or not ring.any() or not math.isfinite(spread):
         return True
@@ -472,7 +564,24 @@ def _residue_found(
     energy = np.hypot(cv2.Sobel(grey, cv2.CV_32F, 1, 0), cv2.Sobel(grey, cv2.CV_32F, 0, 1)) / 4
     outliers = residual > max(18., 2.5 * spread + 8)
     edges = energy > max(20., float(np.percentile(energy[ring], 99)) * 1.8 + 8)
-    return np.count_nonzero((outliers | edges) & zone) > max(3, np.count_nonzero(zone) * .015)
+    suspicious = outliers | edges
+    if original is not None:
+        # Untouched context is evidence, not a demand that the backing be
+        # flat. Do not count its old border/texture in the mask's outer halo.
+        changed = np.max(np.abs(repaired.astype(np.int16) - original.astype(np.int16)), axis=2) > 2
+        suspicious &= ink | _grow(changed, 1)
+        # Exempt only the straight part of a feature continuing from outside
+        # the repair, never its whole component (a glyph may touch a border).
+        length = max(9, radius * 6 + 1)
+        for kernel in (np.ones((1, length), np.uint8), np.ones((length, 1), np.uint8),
+                       np.eye(length, dtype=np.uint8), np.fliplr(np.eye(length, dtype=np.uint8))):
+            lines = cv2.morphologyEx((outliers | edges).astype(np.uint8), cv2.MORPH_OPEN, kernel)
+            count, labels = cv2.connectedComponents(lines, connectivity=8)
+            continues = np.zeros(count, bool)
+            continues[np.unique(labels[ring])] = True
+            continues[0] = False
+            suspicious &= ~continues[labels]
+    return np.count_nonzero(suspicious & zone) > max(3, np.count_nonzero(zone) * .015)
 
 
 def _repair_complex(
@@ -485,19 +594,24 @@ def _repair_complex(
     x1, y1, x2, y2 = bounds
     crop = original[y1:y2, x1:x2]
     radius = _erase_radius(block, bounds)
-    ink = _complete_complex_ink(block, crop, seed, area, bounds, radius)
+    ink, source = _complete_complex_ink(block, crop, seed, area, bounds, radius,
+                                      _inside_bubble(block, original.shape[:2]))
     for attempt in range(2):
         if attempt:
             block.manga_residue_retried = True
             ink = _grow(ink, radius * 2) & area
         zone = _grow(ink, radius) & area
-        ring = _grow(zone, max(3, radius * 4)) & area & ~zone
+        # Keep JPEG/antialiased outline fringes out of the fitting samples.
+        ring = _grow(zone, max(6, radius * 5)) & area & ~_grow(ink, radius * 2)
         model, spread = _background_model(crop, ring)
         repaired = crop.copy()
         if spread <= 10:
             repaired[ink] = np.rint(model[ink]).astype(np.uint8)
         else:
-            left, top, right, bottom = enlarge_window(bounds, original.shape[1], original.shape[0], ratio=1.7)
+            layout_bounds = _bounds(_polygon(block, original.shape[:2]))
+            left, top, right, bottom = enlarge_window(layout_bounds, original.shape[1], original.shape[0], ratio=1.7)
+            left, top = min(left, x1), min(top, y1)
+            right, bottom = max(right, x2), max(bottom, y2)
             crop_mask = np.zeros((bottom - top, right - left), np.uint8)
             crop_mask[y1 - top:y2 - top, x1 - left:x2 - left][ink] = 255
             context = original[top:bottom, left:right].copy()
@@ -508,12 +622,13 @@ def _repair_complex(
                     inpainter.load_model()
                 result = inpainter.memory_safe_inpaint(context, crop_mask)
             repaired[ink] = result[y1 - top:y2 - top, x1 - left:x2 - left][ink]
-        # On very busy art the ring's spread can hide even strong text from a
-        # statistical threshold. An unchanged, contrasting source is no repair.
-        seed_error = np.max(np.abs(crop[seed].astype(np.float32) - model[seed]), axis=1)
-        unchanged = (np.array_equal(repaired[seed], crop[seed])
-                     and np.count_nonzero(seed_error > max(12., spread * .5)) >= 3)
-        if not _residue_found(repaired, ink, area, radius, model, spread, ring) and not unchanged:
+        # Busy backing can hide strokes from the ring's statistical threshold.
+        # Changing a few source pixels must not certify the remaining glyphs.
+        seed_error = np.max(np.abs(crop[source].astype(np.float32) - model[source]), axis=1)
+        source_change = np.max(np.abs(repaired[source].astype(np.float32) - crop[source]), axis=1)
+        remaining = (source_change < 12) & (seed_error > max(12., spread * .5))
+        unchanged = np.count_nonzero(remaining) > max(3, np.count_nonzero(source) * .015)
+        if not _residue_found(repaired, ink, area, radius, model, spread, ring, original=crop) and not unchanged:
             return repaired, ink
     block.manga_erase_failed = True
     return crop, np.zeros_like(ink)
@@ -528,6 +643,7 @@ def prepare_background(
     allowed = np.zeros(mask.shape, np.uint8)
     protected = np.zeros_like(allowed)
     claims = np.zeros(mask.shape, np.int32)
+    owners = _erase_owners(blocks, mask.shape)
     regions = []
     for block in blocks:
         block.manga_complex_background = False
@@ -537,6 +653,12 @@ def prepare_background(
         guard = None
         if region is not None:
             (x1, y1, x2, y2), ink = region
+            if (not ink.any() and source_review(block) is None
+                    and block.translation.strip() and block.translation.strip() != block.get_text().strip()):
+                # Saved applied masks can omit a previously withheld block.
+                # Use its existing OCR colour and line geometry, not a detector.
+                ink = _source_colour_ink(block, original[y1:y2, x1:x2], region[0])
+                region = region[0], ink
             guard = _grow(ink, _erase_radius(block, region[0]) * 2)
             claims[y1:y2, x1:x2] += guard
         regions.append((region, guard))
@@ -544,7 +666,7 @@ def prepare_background(
             points = _polygon(block, mask.shape)
             if points is not None:
                 cv2.fillPoly(protected, [points], 255)
-    for block, (region, guard) in zip(blocks, regions):
+    for index, (block, (region, guard)) in enumerate(zip(blocks, regions)):
         if region is None:
             continue
         (x1, y1, x2, y2), ink = region
@@ -561,7 +683,7 @@ def prepare_background(
                 allowed[top:bottom, left:right][complete] = 255
                 continue
         crop = original[y1:y2, x1:x2]
-        points = _polygon(block, mask.shape)
+        points = _erase_polygon(block, mask.shape)
         interior = _area_mask(points, (x1, y1, x2, y2), inset=2) != 0
         pale = (crop.min(axis=2) >= 211) & interior
         pale_fraction = np.count_nonzero(pale) / max(1, np.count_nonzero(interior))
@@ -569,8 +691,15 @@ def prepare_background(
         # reliable common backing plate. Keep it visible for manual review.
         if not inside_bubble and (x2 - x1) >= 6 * (y2 - y1) and .24 < pale_fraction < .74:
             continue
-        samples = crop[pale]
-        if pale_fraction >= .58 and np.max(np.ptp(np.percentile(samples, (12, 88), axis=0), axis=0)) <= 20:
+        backing = interior & ~_grow(_line_support(block, (x1, y1, x2, y2)),
+                                    max(3, _erase_radius(block, region[0]) * 2))
+        backing_pale = pale & backing
+        samples = crop[backing_pale]
+        verified_pale = (np.count_nonzero(backing) >= 24
+                         and np.count_nonzero(backing_pale) >= .9 * np.count_nonzero(backing))
+        flat_limit = 8 if inside_bubble else 2
+        if (verified_pale and pale_fraction >= .58
+                and np.max(np.ptp(np.percentile(samples, (12, 88), axis=0), axis=0)) <= flat_limit):
             base = np.median(samples, axis=0).astype(np.int16)
             stroke = (np.max(np.abs(crop.astype(np.int16) - base), axis=2) > 10) & interior
             if not inside_bubble:
@@ -586,6 +715,8 @@ def prepare_background(
             if not ink.any():
                 continue
             repaired, ink = _repair_complex(original, block, (x1, y1, x2, y2), ink, area, inpainter)
+            # Ownership limits publication, not the available backing samples.
+            ink &= owners[y1:y2, x1:x2] == index
             filled[y1:y2, x1:x2][ink] = repaired[ink]
         allowed[y1:y2, x1:x2][ink] = 255
     allowed[protected != 0] = 0
@@ -901,6 +1032,7 @@ def compose_page(
     cleaned = image.copy()
     overlays = []
     lettering = np.zeros_like(reserved)
+    owners = _erase_owners(blocks, valid.shape)
     # Rectangular detected interiors are narration boxes, even when their
     # pale connected component was found by the speech-bubble detector.
     kinds = []
@@ -922,6 +1054,9 @@ def compose_page(
         if block.manga_review is None and block.manga_erase_failed:
             block.manga_review = 'geometry'
         region = _region_ink(block, valid, inside_bubble=inside_bubble)
+        if region is not None and block.manga_complex_background:
+            (x1, y1, x2, y2), ink = region
+            region = region[0], ink & (owners[y1:y2, x1:x2] == index)
         if not inside_bubble:
             white = _unframed_white_ink(block, image, valid)
             if white is not None:
