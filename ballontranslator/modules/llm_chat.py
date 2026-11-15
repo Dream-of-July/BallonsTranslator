@@ -364,6 +364,10 @@ class LLMChatRequester:
         self.request_count_minute = 0
         self.minute_start_time = time.monotonic()
         self.stop_event: Optional[threading.Event] = None
+        # Feature owners may share a budget across recovery attempts without
+        # changing request_chat_completion's override contract. Keep concurrent
+        # callers on this requester isolated as well as separate instances.
+        self._request_deadline = threading.local()
         self._codex_sessions: Dict[Tuple[str, str, int], CodexChatSession] = {}
         self._openai_session: Optional[OpenAIResponsesSession] = None
         self._openai_session_identity: Optional[Tuple] = None
@@ -584,12 +588,12 @@ class LLMChatRequester:
         api_args: Dict[str, Any],
         *,
         codex_turn: Optional[CodexTurnState] = None,
-        deadline: Optional[float] = None,
     ) -> LLMChatResult:
         """Perform one request, optionally sharing a deadline across owner retries."""
         # Throttling and client/session setup can overlap a run change. Never
         # adopt the replacement run's token for this request's existing inputs.
         stop_event = self.stop_event
+        deadline: Optional[float] = getattr(self._request_deadline, 'value', None)
         self._check_request_current(stop_event)
         if deadline is not None and time.monotonic() >= deadline:
             raise TimeoutError('LLM request timed out.')

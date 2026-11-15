@@ -1223,7 +1223,7 @@ class LLMTranslator(LLMChatRequester, BaseTranslator):
         stop_event = self.stop_event
         # The recovery belongs to this request, not the normal provider retry
         # budget. Share its deadline and never mutate the saved/runtime profile.
-        request_kwargs['deadline'] = time.monotonic() + self._request_timeout()
+        deadline = time.monotonic() + self._request_timeout()
         request_profile = profile
         # Native translation (including its page summary) defaults to Disabled;
         # independent memory compaction and other shared requester users do not.
@@ -1234,6 +1234,8 @@ class LLMTranslator(LLMChatRequester, BaseTranslator):
         ):
             request_profile = replace(profile, thinking_level=THINKING_DISABLED)
         exhausted: Optional[LLMOutputLimitError] = None
+        previous_deadline = getattr(self._request_deadline, 'value', None)
+        self._request_deadline.value = deadline
         try:
             for _ in range(2):
                 self._check_request_current(stop_event)
@@ -1267,6 +1269,10 @@ class LLMTranslator(LLMChatRequester, BaseTranslator):
             if is_context_length_error(error.provider_error):
                 raise ContextLengthError(str(error)) from error.provider_error
             raise
+        finally:
+            # Restore a surrounding request on reentry; otherwise clear the
+            # budget on success, failure, or Stop before another page runs.
+            self._request_deadline.value = previous_deadline
 
         self._log_token_usage(
             result,

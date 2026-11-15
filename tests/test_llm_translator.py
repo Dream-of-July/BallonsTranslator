@@ -176,7 +176,7 @@ class LLMTranslatorTest(unittest.TestCase):
         self.assertIs(caught.exception, original)
         self.assertEqual(request.call_count, 2)
         first, retry = request.call_args_list
-        self.assertEqual(first.kwargs['deadline'], retry.kwargs['deadline'])
+        self.assertEqual(first.kwargs, retry.kwargs)
         self.assertEqual(retry.args[1]['extra_body']['thinking'], {'type': 'disabled'})
         for error_type in (LLMApiKeyRequiredError, LLMModelRequiredError,
                            LLMBaseURLRequiredError, LLMAuthenticationError):
@@ -219,9 +219,9 @@ class LLMTranslatorTest(unittest.TestCase):
         error = LLMOutputLimitError(profile.id, profile.name, profile.max_tokens, 'Auto')
         received = []
 
-        def request(request_profile, args, **kwargs):
+        def request(request_profile, args, *, codex_turn=None):
             self.assertIs(request_profile, profile)
-            received.append((args, kwargs['deadline']))
+            received.append((args, self.translator._request_deadline.value))
             if len(received) == 1:
                 raise error
             return LLMChatResult(content='{"translations":[{"id":1,"translation":"target"}]}')
@@ -233,12 +233,12 @@ class LLMTranslatorTest(unittest.TestCase):
 
         profile = default_profile('DeepSeek')
         received.clear()
-        def expire(request_profile, args, **kwargs):
-            received.append(kwargs['deadline'])
+        def expire(request_profile, args, *, codex_turn=None):
+            received.append(self.translator._request_deadline.value)
             if len(received) == 1:
                 time.sleep(.02)
                 raise error
-            self.assertLess(kwargs['deadline'], time.monotonic())
+            self.assertLess(self.translator._request_deadline.value, time.monotonic())
             raise TimeoutError('Request deadline expired')
 
         with mock.patch.object(self.translator, '_request_timeout', return_value=.01), \
