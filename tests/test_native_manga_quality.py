@@ -271,3 +271,273 @@ def test_retry_does_not_replace_an_accepted_line_with_empty_or_worse_text():
     assert block.text == ['甲']
     assert block.manga_line_confidence == [.8, .1]
     assert block.manga_partial is True
+
+
+def box_block(bounds, translation, size=24, vertical=True, source_bounds=None):
+    from ballontranslator.utils.textblock import TextBlock
+
+    x1, y1, x2, y2 = bounds
+    area = [[x1, y1], [x2, y1], [x2, y2], [x1, y2]]
+    u1, v1, u2, v2 = source_bounds or bounds
+    line = [[u1, v1], [u2, v1], [u2, v2], [u1, v2]]
+    block = TextBlock(xyxy=[u1, v1, u2, v2], lines=[line], manga_area=area,
+                      text=['原文'], translation=translation, src_is_vertical=vertical,
+                      _detected_font_size=size)
+    block.font_size = size
+    block.vertical = vertical
+    return block
+
+
+def test_vertical_balances_real_columns_and_preserves_translation():
+    from ballontranslator.engine.manga_quality import _fit, _layout_runs, _balanced_breaks, _NO_LINE_START
+    from ballontranslator.ui.text_engine.item import TextBlkItem
+    from ballontranslator.ui.text_engine.rendering.indexing import _grapheme_count
+    from qtpy.QtWidgets import QGraphicsScene
+
+    text = '天地玄黃宇宙，洪荒日月盈昃辰宿列張寒來暑往秋收冬藏'
+    block = box_block((10, 10, 85, 200), text)
+    rendered = _fit(block, np.asarray(block.manga_area, np.int32), True)
+    assert rendered is not None
+    scene = QGraphicsScene()
+    item = TextBlkItem(block, 0)
+    scene.addItem(item)
+    runs = _layout_runs(item)
+    lengths = [_grapheme_count(run) for run in runs]
+    assert len(runs) > 1
+    assert all(run[0] not in _NO_LINE_START for run in runs[1:])
+    assert lengths[-1] != 1
+    assert max(lengths) - min(lengths) <= 2
+    assert _balanced_breaks(runs)
+    assert ''.join(runs) == text
+    assert block.translation == text and '\n' not in block.translation
+    scene.clear()
+
+
+@pytest.mark.parametrize('runs', [
+    ['天地', '，玄'], ['天地「', '玄黃宇'], ['天地…', '…玄黃'],
+    ['天地—', '—玄黃'], ['天地', 'ゃ玄'], ['天地', 'ー玄'], ['天地玄', '黃'],
+])
+def test_rejects_prohibited_breaks(runs):
+    from ballontranslator.engine.manga_quality import _balanced_breaks
+
+    assert not _balanced_breaks(runs)
+
+
+def test_search_at_old_minimum_fits_without_any_ink_outside_area():
+    import copy
+    from ballontranslator.engine.manga_quality import _fit, _glyph_silhouette, _area_mask, _bounds
+
+    block = box_block((10, 10, 75, 130), ('天地玄黃宇宙洪荒日月盈昃辰宿列張' * 4)[:35], size=36)
+    # The previous smallest candidate used the full box and 48% size.
+    old = copy.deepcopy(block)
+    old.font_size *= .48
+    old._bounding_rect = [13, 13, 60, 115]
+    pixels, _, _ = _glyph_silhouette(old)
+    assert pixels.shape[1] > 61 or pixels.shape[0] > 116
+    points = np.asarray(block.manga_area, np.int32)
+    pixels, x, y = _fit(block, points, True)
+    assert 9 <= block.font_size <= 36 * .48
+    assert block.letter_spacing == 1.0
+    area = _area_mask(points, _bounds(points))
+    h, w = pixels.shape[:2]
+    assert not np.any((pixels[..., 3] != 0) & (area[y - 10:y - 10 + h, x - 10:x - 10 + w] == 0))
+
+
+def test_readable_floor_withholds_and_keeps_original_pixels():
+    from ballontranslator.engine.manga_quality import prepare_background, compose_page
+
+    image = np.full((100, 100, 3), 250, np.uint8)
+    mask = np.zeros((100, 100), np.uint8)
+    cv2.rectangle(mask, (25, 25), (35, 60), 255, -1)
+    image[mask != 0] = 15
+    block = box_block((20, 20, 60, 80), '天地玄黃宇宙洪荒' * 20, size=12)
+    draft = prepare_background(image, mask, [block], None)
+    cleaned, result, applied = compose_page(image, draft, [block])
+    assert block.manga_review == 'overflow'
+    assert block.font_size == 12
+    assert np.array_equal(cleaned, image) and np.array_equal(result, image)
+    assert not applied.any()
+
+
+def test_collision_retries_once_and_repositions_inside_remaining_area(monkeypatch):
+    import ballontranslator.engine.manga_quality as quality
+
+    image = np.full((180, 280, 3), 250, np.uint8)
+    mask = np.zeros(image.shape[:2], np.uint8)
+    blocks = [box_block((10, 10, 200, 160), '天地玄黃宇宙洪荒日月盈昃辰宿', source_bounds=(20, 35, 26, 100)),
+              box_block((30, 10, 220, 160), '天地玄黃宇宙洪荒日月盈昃辰宿', source_bounds=(208, 35, 214, 100))]
+    for block in blocks:
+        x1, y1, x2, y2 = block.xyxy
+        mask[y1:y2, x1:x2] = 255
+    image[mask != 0] = 15
+    calls = []
+    original_fit = quality._fit
+
+    def observed_fit(*args, **kwargs):
+        rendered = original_fit(*args, **kwargs)
+        calls.append((args[4] if len(args) > 4 else None, rendered))
+        return rendered
+
+    monkeypatch.setattr(quality, '_fit', observed_fit)
+    draft = quality.prepare_background(image, mask, blocks, None)
+    cleaned, result, applied = quality.compose_page(image, draft, blocks)
+    assert all(block.manga_review is None for block in blocks)
+    retries = [(available, render) for available, render in calls if available is not None]
+    assert len(retries) == 1 and retries[0][1] is not None
+    available, (pixels, x, y) = retries[0]
+    h, w = pixels.shape[:2]
+    assert not np.any((pixels[..., 3] != 0) & ~available[y - 10:y - 10 + h, x - 30:x - 30 + w])
+    assert applied.any() and np.any(result != cleaned)
+
+
+def test_collision_with_protected_ink_withholds_after_one_retry(monkeypatch):
+    import ballontranslator.engine.manga_quality as quality
+
+    image = np.full((150, 150, 3), 80, np.uint8)
+    valid = np.zeros(image.shape[:2], np.uint8)
+    valid[10:140, 10:140] = 255
+    target = box_block((10, 10, 139, 139), '天地玄黃')
+    protected = box_block((10, 10, 139, 139), '')
+    protected.text = ['@synthetic']
+    draft = np.dstack((np.full_like(image, 250), valid))
+    calls = []
+    original_fit = quality._fit
+
+    def observed_fit(*args, **kwargs):
+        calls.append(len(args) > 4)
+        return original_fit(*args, **kwargs)
+
+    monkeypatch.setattr(quality, '_fit', observed_fit)
+    cleaned, result, applied = quality.compose_page(image, draft, [target, protected])
+    assert calls == [False, True]
+    assert target.manga_review == 'geometry'
+    assert protected.manga_review == 'protected'
+    assert not applied.any()
+    assert np.array_equal(cleaned, image) and np.array_equal(result, image)
+
+
+def test_single_line_strip_only_scales_and_never_wraps():
+    from ballontranslator.engine.manga_quality import _fit, _layout_runs
+    from ballontranslator.ui.text_engine.item import TextBlkItem
+    from qtpy.QtWidgets import QGraphicsScene
+
+    text = '天地玄黃宇宙洪荒日月盈昃辰宿列張寒來'
+    block = box_block((10, 10, 310, 45), text, size=28, vertical=False)
+    spacing = (block.letter_spacing, block.line_spacing)
+    assert _fit(block, np.asarray(block.manga_area, np.int32), True) is not None
+    scene = QGraphicsScene()
+    item = TextBlkItem(block, 0)
+    scene.addItem(item)
+    assert _layout_runs(item) == [text]
+    assert block.font_size < 28
+    assert (block.letter_spacing, block.line_spacing) == spacing
+    scene.clear()
+
+
+def test_horizontal_rows_are_balanced_without_prohibited_start():
+    from ballontranslator.engine.manga_quality import _fit, _layout_runs, _balanced_breaks
+    from ballontranslator.ui.text_engine.item import TextBlkItem
+    from qtpy.QtWidgets import QGraphicsScene
+
+    block = box_block((10, 10, 130, 110), '天地玄黃宇宙，洪荒日月盈昃辰宿列張寒來暑往', vertical=False)
+    assert _fit(block, np.asarray(block.manga_area, np.int32), True) is not None
+    scene = QGraphicsScene()
+    item = TextBlkItem(block, 0)
+    scene.addItem(item)
+    runs = _layout_runs(item)
+    assert len(runs) > 1 and _balanced_breaks(runs)
+    assert ''.join(runs) == block.translation
+    scene.clear()
+
+
+def test_page_font_consensus_uses_majority_family_and_median_weight(monkeypatch):
+    from ballontranslator.engine.manga_font import FontMatcher
+    from ballontranslator.engine.manga_quality import compose_page
+
+    image = np.full((160, 500, 3), 250, np.uint8)
+    mask = np.zeros(image.shape[:2], np.uint8)
+    blocks = [box_block((10 + i * 160, 10, 150 + i * 160, 149), '天地玄黃', size=24,
+                        source_bounds=(40 + i * 160, 35, 55 + i * 160, 90)) for i in range(3)]
+    for block in blocks:
+        x1, y1, x2, y2 = block.xyxy
+        mask[y1:y2, x1:x2] = 255
+    image[mask != 0] = 15
+    ranks = {blocks[0].xyxy[0]: [('PingFang SC', 400)],
+             blocks[1].xyxy[0]: [('PingFang SC', 800)],
+             blocks[2].xyxy[0]: [('Songti SC', 600)]}
+    monkeypatch.setattr(FontMatcher, 'rank', lambda self, image, mask, block: ranks[block.xyxy[0]])
+    draft = np.dstack((np.full_like(image, 250), mask))
+    compose_page(image, draft, blocks)
+    assert all(block.manga_review is None for block in blocks)
+    assert {(block.font_family, block.fontformat.font_weight) for block in blocks} == {('PingFang SC', 400)}
+
+
+def test_complex_background_uses_sequential_crops_and_commits_only_accepted_blocks():
+    import copy
+    from ballontranslator.engine.manga_quality import prepare_background, compose_page
+    from ballontranslator.modules.inpaint.base import enlarge_window
+
+    y, x = np.indices((280, 360))
+    image = np.stack(((x + y) % 140, (2 * x + y) % 140, (x + 2 * y) % 140), axis=2).astype(np.uint8)
+    mask = np.zeros(image.shape[:2], np.uint8)
+    blocks = [box_block((25, 35, 110, 120), '天地', size=16),
+              box_block((220, 140, 305, 225), '天地玄黃宇宙洪荒' * 60, size=16)]
+    for block in blocks:
+        x1, y1, x2, y2 = block.xyxy
+        mask[y1 + 10:y2 - 10, x1 + 20:x1 + 30] = 255
+    calls = []
+
+    class CropInpainter:
+        def all_model_loaded(self):
+            return True
+
+        def memory_safe_inpaint(self, crop, ink):
+            calls.append(crop.shape[:2])
+            # Deliberately change the whole crop: only validated ink may commit.
+            return np.full_like(crop, 230)
+
+    crops = []
+    for block in blocks:
+        x1, y1, width, height = cv2.boundingRect(np.asarray(block.manga_area, np.int32))
+        crops.append(enlarge_window((x1, y1, x1 + width, y1 + height), 360, 280, ratio=1.7))
+    outside = np.ones(mask.shape, bool)
+    for left, top, right, bottom in crops:
+        outside[top:bottom, left:right] = False
+    draft = prepare_background(image, mask, blocks, CropInpainter())
+    assert len(calls) == 2
+    assert all(shape != image.shape[:2] for shape in calls)
+    assert np.array_equal(draft[outside, :3], image[outside])
+    copies = copy.deepcopy(blocks)
+    first = compose_page(image, draft, blocks)
+    second = compose_page(image, draft, copies)
+    assert blocks[0].manga_review is None and blocks[1].manga_review == 'overflow'
+    assert all(np.array_equal(a, b) for a, b in zip(first, second))
+    cleaned, result, applied = first
+    assert np.array_equal(cleaned[outside], image[outside])
+    assert np.array_equal(result[outside], image[outside])
+    assert np.array_equal(result[140:226, 220:306], image[140:226, 220:306])
+    assert np.array_equal(cleaned[applied == 0], image[applied == 0])
+    # The same draft remains usable for update_blocks, including a later fit.
+    blocks[1].translation = '日月'
+    cleaned, result, applied = compose_page(image, draft, blocks, refit={1})
+    assert blocks[1].manga_review is None and applied[140:226, 220:306].any()
+
+
+
+def test_protected_complex_ink_does_not_load_or_call_inpainter():
+    from ballontranslator.engine.manga_quality import prepare_background
+
+    image = np.full((120, 120, 3), 80, np.uint8)
+    mask = np.zeros(image.shape[:2], np.uint8)
+    mask[40:60, 40:60] = 255
+    target = box_block((20, 20, 100, 100), '天地')
+    protected = box_block((20, 20, 100, 100), '')
+    protected.text = ['@synthetic']
+
+    class UnusedInpainter:
+        def all_model_loaded(self):
+            pytest.fail('Protected ink must not initialize a model')
+
+    draft = prepare_background(image, mask, [target, protected], UnusedInpainter())
+    assert not draft[..., 3].any()
+    assert np.array_equal(draft[..., :3], image)
