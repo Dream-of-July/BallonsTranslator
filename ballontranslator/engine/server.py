@@ -246,7 +246,8 @@ class Server(QObject):
         if self.operation_failed or Path(self.project.directory) != path:
             raise ProtocolError('internal', 'Project could not be opened.')
         self.revisions = {}
-        return dict(path=str(path), name=self.project.proj_name(),
+        # The folder name is what the user recognises; proj_name() is the JSON file stem.
+        return dict(path=str(path), name=path.name,
                     pages=[self.page(name) for name in self.project.pages])
 
     def get_page(self, params: dict) -> dict:
