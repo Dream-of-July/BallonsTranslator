@@ -2,7 +2,14 @@
 from __future__ import annotations
 
 import os
+import threading
+import time
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import numpy as np
+    from ballontranslator.utils.textblock import TextBlock
 
 
 def bootstrap() -> tuple:
@@ -28,7 +35,7 @@ def bootstrap() -> tuple:
     from ballontranslator.utils import config
     config.load_config(os.environ.get('BALLOONTRANS_ENGINE_CONFIG', shared.CONFIG_PATH))
     pcfg = config.pcfg
-    from qtpy.QtCore import QLocale
+    from qtpy.QtCore import QLocale, Signal, Slot, Qt
     shared.DEFAULT_DISPLAY_LANG = QLocale.system().name().replace('en_CN', 'zh_CN')
     from qtpy import API_NAME, QT_VERSION
     from qtpy.QtWidgets import QApplication
@@ -64,6 +71,54 @@ def bootstrap() -> tuple:
     from ballontranslator.ui.mainwindow import MainWindow
 
     class EngineWindow(MainWindow):
+        quality_compose_requested = Signal(object)
+
+        @Slot(object)
+        def compose_quality_on_main(self, job: dict) -> None:
+            # Native text layout/scene objects retain their existing Qt-thread
+            # ownership. Only this short render crosses back from page work.
+            try:
+                if job['stop'].is_set() or time.monotonic() >= job['deadline']:
+                    return
+                from .manga_quality import compose_page
+                job['result'] = compose_page(job['image'], job['draft'], job['blocks'],
+                                             job['refit'], force_outline=job['outline'])
+            except Exception as error:
+                job['error'] = error
+            finally:
+                job['done'].set()
+
+        def compose_quality(
+            self, image: np.ndarray, draft: np.ndarray, blocks: list[TextBlock], refit: set[int] | None,
+            outline: set[int] | None, deadline: float, stop: threading.Event,
+        ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+            from ballontranslator.modules.exceptions import LLMRequestStopped
+            job = dict(image=image, draft=draft, blocks=blocks, refit=refit, outline=outline,
+                       deadline=deadline, stop=stop, done=threading.Event())
+            self.quality_compose_requested.emit(job)
+            while not job['done'].wait(.05):
+                if stop.is_set():
+                    raise LLMRequestStopped()
+                if time.monotonic() >= deadline:
+                    raise TimeoutError('Enhance composition timed out.')
+            if 'error' in job:
+                raise job['error']
+            if 'result' not in job:
+                raise LLMRequestStopped()
+            return job['result']
+
+        def process_quality_page(self, name: str, image: np.ndarray, blocks: list[TextBlock]) -> None:
+            worker = self.module_manager.imgtrans_thread
+            draft = worker.manga_drafts[name]
+            normal = self.compose_quality(image, draft, blocks, None, None,
+                                          float('inf'), worker.stop_event)
+            session = getattr(self, 'enhance_session', None)
+            if session is not None:
+                draft, normal = session.process(image, draft, blocks, normal,
+                    stop=worker.stop_event, translator=worker.translator, compose=self.compose_quality)
+            worker.manga_drafts[name] = draft
+            worker.manga_composed[name] = normal
+
         def on_pagtrans_finished(self, page_index: int) -> None:
             worker = self.module_manager.imgtrans_thread
             if not worker.manga_quality_enabled:
@@ -73,7 +128,7 @@ def bootstrap() -> tuple:
             if draft is not None and self.imgtrans_proj.get_page_progress(name):
                 from .manga_quality import save_page
                 try:
-                    save_page(self, name, draft)
+                    save_page(self, name, draft, composed=worker.manga_composed.pop(name, None))
                 except Exception as error:
                     from ballontranslator.ui import module_manager
                     module_manager._create_page_error_dialog(
@@ -105,6 +160,7 @@ def bootstrap() -> tuple:
         # Keep startup-only overrides out of subsequent explicit config saves.
         pcfg.open_recent_on_startup, pcfg.check_update_on_startup = old_recent, old_update
     window.save_on_page_changed = False
+    window.quality_compose_requested.connect(window.compose_quality_on_main, Qt.ConnectionType.QueuedConnection)
     window.module_manager.imgtrans_thread.native_quality = True
     window.hide()
     return app, window

@@ -787,6 +787,8 @@ class ImgtransThread(QThread):
         self.native_quality = False
         self.manga_quality_enabled = False
         self.manga_drafts: dict[str, np.ndarray] = {}
+        self.manga_composed: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+        self.quality_page_processor: Optional[Callable[[str, np.ndarray, list[TextBlock]], None]] = None
         register_global_callback('user_request_stop', self.isStopRequested)
 
     def on_module_thread_stopped(self) -> None:
@@ -832,6 +834,7 @@ class ImgtransThread(QThread):
     ):
         self.imgtrans_proj = imgtrans_proj
         self.manga_drafts.clear()
+        self.manga_composed.clear()
         self.manga_quality_enabled = (
             self.native_quality and cfg_module.translate_source == '日本語'
             and cfg_module.enable_detect and cfg_module.enable_ocr and cfg_module.enable_inpaint
@@ -1123,6 +1126,10 @@ class ImgtransThread(QThread):
             self.parallel_trans = not self.translator.is_computational_intensive() and not low_vram_trans
         else:
             self.parallel_trans = False
+        if manga_quality is not None and self.quality_page_processor is not None:
+            # The engine's final quality render/review belongs to this page
+            # worker, before either progress signal can publish its result.
+            self.parallel_trans = False
         if self.parallel_trans and cfg_module.enable_translate:
             self.translate_thread.runTranslatePipeline(self.imgtrans_proj, self.stop_event)
 
@@ -1353,6 +1360,11 @@ class ImgtransThread(QThread):
                             self.tr('Page'),
                         )
                     
+                if (manga_quality is not None and self.quality_page_processor is not None
+                        and not low_vram_trans and imgname in self.manga_drafts):
+                    self.quality_page_processor(imgname, img, blk_list)
+                if self.isStopRequested():
+                    break
                 self.inpaint_counter += 1
                 self.imgtrans_proj.update_page_progress(imgname, RunStatus.FIN_INPAINT)
                 self.update_inpaint_progress.emit(self.inpaint_counter)
@@ -1374,6 +1386,11 @@ class ImgtransThread(QThread):
                     imgname,
                     blk_list,
                 )
+                if self.isStopRequested():
+                    break
+                if (manga_quality is not None and self.quality_page_processor is not None
+                        and imgname in self.manga_drafts):
+                    self.quality_page_processor(imgname, self.imgtrans_proj.read_img(imgname), blk_list)
                 if self.isStopRequested():
                     break
                 self.translate_counter += 1

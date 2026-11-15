@@ -107,6 +107,8 @@ class ModuleConfig(Config):
     llm_profiles: List[LLMProfile] = field(default_factory=lambda: list())
     codex_models: Dict = field(default_factory=dict)
     translator_llm_id: str = ''
+    enhance_enabled: bool = False
+    enhance_profile_id: Optional[str] = None
     ocr_llm_id: str = ''
     inpaint_llm_id: str = ''
     inpainter_params: Dict = field(default_factory=lambda: dict())

@@ -113,7 +113,36 @@ Removes blocks (their text is no longer drawn) and re-renders.
 After a page is composed, hard text blocks are re-checked by a vision model — image
 crops of the page are sent to the chosen service — and corrected once. Off by default.
 `profile_id: null` uses the translation service's profile. The app only offers to turn
-it on when that effective profile's `vision` is `yes`.
+it on when that effective profile's `vision` is `yes`. The engine also enforces
+this measured capability: no automatic probes, and no images when disabled or
+when the effective profile is missing/unmeasured/negative. A null profile has no
+effect for a non-LLM translator. One `log` event per run explains a skipped mode.
+
+On the Japanese manga quality path, only suspicious text blocks are sent to the
+chosen profile: withheld unreadable/geometry/overflow/untranslated blocks, at
+most six largest skipped blocks, and drawn blocks with uncertain OCR, complex
+cleanup or legibility adjustments. There are at most 24 blocks per page, two
+margin crops per block (original and composed, each at most 512 pixels on its
+long side), and one request, or two batches when more than 12 blocks qualify.
+Clean pages send nothing. Prompts contain block indexes, OCR and translation;
+the engine adds no file paths or project names. Translation and OCR remain
+text/local-image operations; only this opt-in review sends page crops.
+
+There is one review round. Its total per-page budget, including correction and
+local reprocessing, is the LLM request timeout (120 seconds by default). Advice
+is type-checked and limited to requested indexes. Corrected source text is
+translated through the existing text-only path; local fit, collision and
+residue checks remain authoritative. Non-dialogue keeps original pixels and
+reports `skipped`. Rejected changes preserve the pre-review result; a locally
+confirmed erase failure restores original pixels and withholds the affected
+block with its normal review reason. A timeout,
+HTTP error, invalid JSON or missing required response field discards the page's
+review, logs a sanitized reason, and preserves the ordinary result without an
+`error` event or failed page. Cancel interrupts review without publishing late
+results. Logs give checked/corrected/re-erased/restyled/non-dialogue/abandoned
+counts. `stage_progress(enhance)` precedes the page's single `page_done`, which
+still means the final image was written. Block project records retain a
+default-false `manga_enhanced` flag when an accepted review changed that block.
 `Profile`: `{"id", "name", "base_url", "model", "model_options": [str…],
 "require_api_key": bool, "has_api_key": bool, "vision": "yes"|"no"|"unknown"}` —
 the key itself is never sent. `vision` is the persisted measurement from
@@ -123,7 +152,7 @@ report `unknown`; the app reads a missing `vision` as `unknown`.
 ### `set_settings` `{source_language?, target_language?, translator?: {"kind": "google"}
 | {"kind": "llm", "profile_id"}, output?: {...}, enhance?: {enabled?, profile_id?}}` → Settings
 In `enhance`, omitted keys are left untouched and `profile_id: null` selects the
-translation service's profile; an unknown `profile_id` is `not_found`.
+translation service's profile; an unknown enhance `profile_id` is `bad_request`.
 
 ### `create_profile` `{template}` → Profile
 New LLM profile from a provider template (see `provider_templates`).
