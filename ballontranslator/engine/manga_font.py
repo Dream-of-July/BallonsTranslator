@@ -1,6 +1,7 @@
 """Match source lettering against the fonts the local renderer can use."""
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass, field
 from unicodedata import east_asian_width, normalize
 
@@ -201,3 +202,33 @@ class FontMatcher:
             if score < .65:
                 matches.append((score, face.choice))
         return [choice for _, choice in sorted(matches, key=lambda match: match[0])[:2]]
+
+    def page_choices(
+        self, image: np.ndarray, mask: np.ndarray, blocks: list[TextBlock], kinds: list[bool],
+    ) -> dict[int, FontChoice]:
+        """Use a majority family and median weight per bubble/narration group.
+
+        An explicit source bold weight plus agreement from glyph matching is
+        required for a bold exception. Missing evidence never invents emphasis.
+        """
+        ranks = [self.rank(image, mask, block) for block in blocks]
+        choices = {}
+        for kind in (False, True):
+            indices = [i for i, value in enumerate(kinds) if value == kind]
+            votes = [ranks[i][0] for i in indices if ranks[i]]
+            if not votes:
+                common = (shared.DEFAULT_FONT_FAMILY, FontWeight.Normal)
+            else:
+                # Counter preserves page order for deterministic ties.
+                family = Counter(face[0] for face in votes).most_common(1)[0][0]
+                weights = sorted(weight for name, weight in votes if name == family)
+                common = (family, weights[(len(weights) - 1) // 2])
+            for i in indices:
+                choice = common
+                if (blocks[i].fontformat.font_weight >= FontWeight.Bold and ranks[i]
+                        and ranks[i][0][0] == common[0]
+                        and ranks[i][0][1] >= FontWeight.Bold
+                        and len(_source_glyphs(image, mask, blocks[i])) >= 4):
+                    choice = ranks[i][0]
+                choices[i] = choice
+        return choices

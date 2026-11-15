@@ -5,7 +5,10 @@ import copy
 import math
 import re
 from pathlib import Path
-from typing import Callable
+from typing import Callable, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ballontranslator.ui.text_engine.item import TextBlkItem
 
 import cv2
 import numpy as np
@@ -332,6 +335,7 @@ def prepare_background(
     filled = original.copy()
     allowed = np.zeros(mask.shape, np.uint8)
     complex_ink = np.zeros_like(allowed)
+    complex_bounds = []
     protected = np.zeros_like(allowed)
     for block in blocks:
         region = _region_ink(block, mask)
@@ -370,19 +374,31 @@ def prepare_background(
             filled[y1:y2, x1:x2][ink] = base.astype(np.uint8)
         else:
             complex_ink[y1:y2, x1:x2][ink] = 255
+            complex_bounds.append((x1, y1, x2, y2))
         allowed[y1:y2, x1:x2][ink] = 255
     complex_ink[protected != 0] = 0
     allowed[protected != 0] = 0
-    if np.any(complex_ink):
-        if inpainter is None:
-            repaired = cv2.inpaint(original.copy(), complex_ink, 3, cv2.INPAINT_TELEA)
-        else:
-            # The model sees surrounding context, but its output never
-            # overwrites pixels outside the independently validated mask.
-            if not inpainter.all_model_loaded():
-                inpainter.load_model()
-            repaired = inpainter.memory_safe_inpaint(original.copy(), complex_ink.copy())
-        filled[complex_ink != 0] = repaired[complex_ink != 0]
+    if complex_bounds and np.any(complex_ink):
+        # Share the legacy crop geometry, but commit only this block's ink.
+        # Sequential crops bound model memory and retain full-resolution detail.
+        from ballontranslator.modules.inpaint.base import enlarge_window
+
+        if inpainter is not None and not inpainter.all_model_loaded():
+            inpainter.load_model()
+        for bounds in complex_bounds:
+            x1, y1, x2, y2 = bounds
+            local = complex_ink[y1:y2, x1:x2]
+            if not local.any():
+                continue
+            left, top, right, bottom = enlarge_window(bounds, mask.shape[1], mask.shape[0], ratio=1.7)
+            crop_mask = np.zeros((bottom - top, right - left), np.uint8)
+            crop_mask[y1 - top:y2 - top, x1 - left:x2 - left] = local
+            crop = original[top:bottom, left:right].copy()
+            repaired = (cv2.inpaint(crop, crop_mask, 3, cv2.INPAINT_TELEA)
+                        if inpainter is None else inpainter.memory_safe_inpaint(crop, crop_mask))
+            selected = crop_mask != 0
+            filled[top:bottom, left:right][selected] = repaired[selected]
+            complex_ink[y1:y2, x1:x2] = 0
     filled[allowed == 0] = original[allowed == 0]
     return np.dstack((filled, allowed))
 
@@ -439,7 +455,122 @@ def retry_uncertain_ocr(image: np.ndarray, blocks: list[TextBlock], ocr: object)
                                       for value in block.manga_line_confidence)
 
 
-def _glyph_silhouette(block: TextBlock) -> tuple[np.ndarray, int, int] | None:
+_NO_LINE_START = frozenset('、。，．？！：；…‥」』）〉》】〕ーぁぃぅぇぉっゃゅょゎゕゖァィゥェォッャュョヮヵヶㇰㇱㇲㇳㇴㇵㇶㇷㇸㇹㇺㇻㇼㇽㇾㇿ')
+_NO_LINE_END = frozenset('「『（〈《【〔')
+
+
+def _layout_runs(item: TextBlkItem) -> list[str]:
+    """Read actual Qt rows/columns, preserving UTF-16 grapheme boundaries."""
+    from ballontranslator.ui.text_engine.rendering.indexing import _utf16_slice
+
+    runs: list[str] = []
+    paragraph = item.document().firstBlock()
+    while paragraph.isValid():
+        layout = paragraph.layout()
+        previous_x = None
+        for index in range(layout.lineCount()):
+            line = layout.lineAt(index)
+            text = _utf16_slice(paragraph.text(), line.textStart(), line.textLength())
+            if item.blk.vertical and previous_x is not None and abs(line.x() - previous_x) < .5:
+                runs[-1] += text
+            else:
+                runs.append(text)
+            previous_x = line.x()
+        paragraph = paragraph.next()
+    return runs
+
+
+def _balanced_breaks(runs: list[str], single_line: bool = False) -> bool:
+    """Validate real breaks without adding paragraph separators.
+
+    >>> _balanced_breaks(['天地玄', '黃宇宙'])
+    True
+    >>> _balanced_breaks(['天地玄', '，宇宙'])
+    False
+    """
+    from ballontranslator.ui.text_engine.rendering.indexing import _grapheme_count
+
+    runs = [text.strip() for text in runs if text.strip()]
+    if not runs or (single_line and len(runs) != 1):
+        return False
+    lengths = [_grapheme_count(text) for text in runs]
+    if max(lengths) - min(lengths) > 2:
+        return False
+    if len(runs) > 1 and sum(lengths) > 3 and lengths[-1] == 1:
+        return False
+    for before, after in zip(runs, runs[1:]):
+        if after[0] in _NO_LINE_START or before[-1] in _NO_LINE_END:
+            return False
+        if before[-1] == after[0] and before[-1] in '…—':
+            return False
+    return True
+
+
+def _balanced_boxes(block: TextBlock, width: float, height: float, single_line: bool) -> list[tuple[float, float]]:
+    """Measure native advances, then search balanced capacities, fewest flows first.
+
+    >>> boxes = _balanced_boxes(block, 120, 180, False)  # doctest: +SKIP
+    >>> all(w <= 120 and h <= 180 for w, h in boxes)  # doctest: +SKIP
+    True
+    """
+    from ballontranslator.ui.text_engine.item import TextBlkItem
+    from ballontranslator.ui.text_engine.rendering.indexing import _grapheme_ranges, _grapheme_count
+
+    block._bounding_rect[2:] = [width, height]
+    probe = TextBlkItem(copy.deepcopy(block), 0, show_rect=False)
+    try:
+        runs = _layout_runs(probe)
+        n = _grapheme_count(block.translation)
+        if not n:
+            return []
+        if single_line:
+            return [(width, height)]
+        margin = probe.document().documentMargin() * 2
+        if block.vertical:
+            # CharFontFormat uses the same glyph metrics and spacing as the
+            # vertical layout; punctuation may have a different cell advance.
+            metrics = [probe.layout.get_char_fontfmt(0, start)
+                       for start, _ in _grapheme_ranges(probe.document().firstBlock().text())]
+            cells = [metric.tbr.height() * block.letter_spacing for metric in metrics]
+            cell = max(1., float(np.median(cells))) if cells else block.font_size
+            column = max(1., float(np.median([metric.tbr.width() for metric in metrics]))
+                         * block.line_spacing) if metrics else block.font_size
+            maximum = max(1, math.floor((height - margin) / cell))
+            first = max(1, min(len(runs), math.ceil(n / maximum)))
+            last = min(n, max(first, math.ceil(width / column) + 1))
+        else:
+            widths, heights = [], []
+            paragraph = probe.document().firstBlock()
+            while paragraph.isValid():
+                layout = paragraph.layout()
+                widths.extend(layout.lineAt(i).naturalTextWidth() for i in range(layout.lineCount()))
+                heights.extend(layout.lineAt(i).height() for i in range(layout.lineCount()))
+                paragraph = paragraph.next()
+            cell = max(1., sum(widths) / n)
+            first = max(1, len(runs))
+            row = max(1., float(np.median(heights)) * block.line_spacing) if heights else block.font_size
+            last = min(n, max(first, math.ceil(height / row) + 1))
+        boxes = []
+        for count in range(first, last + 1):
+            balanced = math.ceil(n / count)
+            for capacity in (balanced, balanced + 1, balanced - 1):
+                if capacity < 1:
+                    continue
+                extent = capacity * cell + margin + .25
+                size = (width, min(height, extent)) if block.vertical else (min(width, extent), height)
+                if size not in boxes:
+                    boxes.append(size)
+        if (width, height) not in boxes:
+            boxes.append((width, height))
+        return boxes
+    finally:
+        # These items never enter a scene; destroy their Qt children promptly
+        # during a potentially long font/box search.
+        from qtpy import sip
+        sip.delete(probe)
+
+
+def _glyph_silhouette(block: TextBlock, *, balanced: bool = False, single_line: bool = False) -> tuple[np.ndarray, int, int] | None:
     from qtpy.QtCore import QRectF
     from qtpy.QtGui import QImage, QPainter
     from qtpy.QtWidgets import QGraphicsScene
@@ -450,10 +581,14 @@ def _glyph_silhouette(block: TextBlock) -> tuple[np.ndarray, int, int] | None:
     item = TextBlkItem(block, 0, show_rect=False)
     item.set_ui_guide_suppressed(True)
     scene.addItem(item)
+    if balanced and not _balanced_breaks(_layout_runs(item), single_line):
+        scene.clear()
+        return None
     bounds = item.sceneBoundingRect().adjusted(-2, -2, 2, 2)
     left, top = math.floor(bounds.left()), math.floor(bounds.top())
     width, height = math.ceil(bounds.right()) - left, math.ceil(bounds.bottom()) - top
     if min(width, height) < 1 or max(width, height) > 8192 or width * height > 8_000_000:
+        scene.clear()
         return None
     layer = QImage(width, height, QImage.Format.Format_ARGB32)
     layer.fill(0)
@@ -464,6 +599,7 @@ def _glyph_silhouette(block: TextBlock) -> tuple[np.ndarray, int, int] | None:
     finally:
         painter.end()
     raster = pixmap2ndarray(layer, keep_alpha=True).copy()
+    scene.clear()
     y, x = np.where(raster[:, :, 3] != 0)
     if not len(x):
         return None
@@ -472,13 +608,17 @@ def _glyph_silhouette(block: TextBlock) -> tuple[np.ndarray, int, int] | None:
 
 def _fit(
     block: TextBlock, points: np.ndarray, refit: bool, font: FontChoice | None = None,
+    available: np.ndarray | None = None,
 ) -> tuple[np.ndarray, int, int] | None:
     from ballontranslator.utils import shared
 
     bounds = _bounds(points)
     x1, y1, x2, y2 = bounds
     area = _area_mask(points, bounds, inset=1 if min(x2 - x1, y2 - y1) < 28 else 2)
-    rect = block.bounding_rect()
+    if available is not None:
+        area[~available] = 0
+    if not area.any():
+        return None
     candidate = copy.deepcopy(block)
     candidate.rich_text = ''
     if font is not None:
@@ -486,44 +626,70 @@ def _fit(
     if not candidate.font_family:
         candidate.font_family = shared.DEFAULT_FONT_FAMILY
     detected_size = candidate.font_size if candidate.font_size > 0 else 16
-    # The same real Qt text renderer is used to measure the ink and place the
-    # accepted pixels. Studying the geometry alone misses strokes and rotation.
-    scales = (1, .88, .76, .66, .56, .48) if refit else (1,)
-    for scale in scales:
-        candidate.font_size = max(7, detected_size * scale)
-        if refit:
-            # Use the source line's writing direction but keep right-to-left
-            # columns readable after replacing the taller/narrower characters.
-            candidate.angle = max(-13, min(13, block.angle)) if min(x2 - x1, y2 - y1) > 32 else 0
-            candidate.alignment = 1
-            if min(x2 - x1, y2 - y1) <= 25 and x2 - x1 > (y2 - y1) * 4:
-                candidate.vertical = False
-            width, height = (x2 - x1 - 6), (y2 - y1 - 6)
-            candidate._bounding_rect = [x1 + 3, y1 + 3, width, height]
-        else:
-            candidate._bounding_rect = list(rect)
-        if min(candidate._bounding_rect[2:]) <= 0:
-            return None
-        rendered = _glyph_silhouette(candidate)
-        if rendered is None:
-            continue
-        pixels, x, y = rendered
-        h, w = pixels.shape[:2]
-        if refit:
-            x, y = (x1 + x2 - w) // 2, (y1 + y2 - h) // 2
-        if x < x1 or y < y1 or x + w > x2 or y + h > y2:
-            continue
-        section = area[y - y1:y + h - y1, x - x1:x + w - x1]
-        if np.any((pixels[:, :, 3] > 0) & (section == 0)):
-            continue
-        if refit:
-            remapped = list(candidate._bounding_rect)
-            remapped[0] += int(x - rendered[1])
-            remapped[1] += int(y - rendered[2])
-            block._bounding_rect = remapped
-            block.fontformat = candidate.fontformat
-            block.angle = candidate.angle
-        return pixels, x, y
+    # Never turn small source lettering into illegibly tiny output. A manual
+    # update without refitting keeps the user's exact size/spacing/rectangle.
+    floor = max(9., block.detected_font_size * .55 if block.detected_font_size <= 16 else 9.)
+    sizes = list(dict.fromkeys(max(floor, detected_size * scale)
+                              for scale in (1, .88, .76, .66, .56, .48, .40))) if refit else [detected_size]
+    distance = cv2.distanceTransform(area, cv2.DIST_L2, 5)
+    cy, cx = np.unravel_index(np.argmax(distance), distance.shape)
+    centers = [(x1 + cx, y1 + cy)]
+    # A small deterministic neighbourhood also handles flat distance maxima
+    # (rectangles/strips). Keep the bbox centre as a later candidate.
+    step = max(2, min(12, round(float(distance[cy, cx]) * .25)))
+    centers.extend((x1 + cx + dx * step, y1 + cy + dy * step)
+                   for dx, dy in ((0, -1), (0, 1), (-1, 0), (1, 0),
+                                  (-1, -1), (1, -1), (-1, 1), (1, 1)))
+    centers.append(((x1 + x2) / 2, (y1 + y2) / 2))
+    single_line = (len(block.lines) == 1 and not block.src_is_vertical
+                   and x2 - x1 >= 4 * (y2 - y1))
+    spacing = [(block.letter_spacing, block.line_spacing)]
+    if refit and not single_line:
+        compact = (min(block.letter_spacing, 1.), min(block.line_spacing, 1.1))
+        if compact != spacing[0]:
+            spacing.append(compact)
+    for size in sizes:
+        candidate.font_size = size
+        for letters, lines in spacing:
+            candidate.fontformat.letter_spacing = letters
+            candidate.line_spacing = lines
+            if refit:
+                candidate.angle = max(-13, min(13, block.angle)) if min(x2 - x1, y2 - y1) > 32 else 0
+                candidate.alignment = 1
+                if single_line:
+                    candidate.vertical = False
+                width, height = x2 - x1 - 6, y2 - y1 - 6
+                if min(width, height) <= 0:
+                    return None
+                candidate._bounding_rect = [x1 + 3, y1 + 3, width, height]
+                boxes = _balanced_boxes(candidate, width, height, single_line)
+            else:
+                candidate._bounding_rect = list(block.bounding_rect())
+                boxes = [tuple(candidate._bounding_rect[2:])]
+            for width, height in boxes:
+                candidate._bounding_rect[2:] = [width, height]
+                rendered = _glyph_silhouette(candidate, balanced=refit, single_line=single_line)
+                if rendered is None:
+                    continue
+                pixels, original_x, original_y = rendered
+                h, w = pixels.shape[:2]
+                if w > x2 - x1 or h > y2 - y1:
+                    continue
+                positions = [(round(cx - w / 2), round(cy - h / 2)) for cx, cy in centers] if refit else [(original_x, original_y)]
+                for x, y in positions:
+                    if x < x1 or y < y1 or x + w > x2 or y + h > y2:
+                        continue
+                    section = area[y - y1:y + h - y1, x - x1:x + w - x1]
+                    if np.any((pixels[:, :, 3] > 0) & (section == 0)):
+                        continue
+                    if refit:
+                        remapped = list(candidate._bounding_rect)
+                        remapped[0] += int(x - original_x)
+                        remapped[1] += int(y - original_y)
+                        block._bounding_rect = remapped
+                        block.fontformat = copy.deepcopy(candidate.fontformat)
+                        block.angle = candidate.angle
+                    return pixels, x, y
     return None
 
 
@@ -539,7 +705,18 @@ def compose_page(
     cleaned = image.copy()
     overlays = []
     lettering = np.zeros_like(reserved)
-    matcher = FontMatcher() if refit is None else None
+    # Rectangular detected interiors are narration boxes, even when their
+    # pale connected component was found by the speech-bubble detector.
+    kinds = []
+    for block in blocks:
+        points = _polygon(block, valid.shape)
+        if points is None:
+            kinds.append(False)
+            continue
+        left, top, right, bottom = _bounds(points)
+        rectangular = cv2.contourArea(points) / max(1, (right - left - 1) * (bottom - top - 1)) >= .92
+        kinds.append(not rectangular and block.manga_area != _plain_area(block, valid.shape[1], valid.shape[0]))
+    fonts = FontMatcher().page_choices(image, valid, blocks, kinds) if refit is None else {}
     for index, block in enumerate(blocks):
         block.manga_review = source_review(block)
         points = _polygon(block, valid.shape)
@@ -557,33 +734,85 @@ def compose_page(
                 block.manga_review = 'geometry'
         if block.manga_review is None:
             resize = refit is None or index in refit
-            ranked = matcher.rank(image, valid, block) if matcher is not None else []
-            for choice in (*ranked, None):
-                rendered = _fit(block, points, resize, choice)
-                if rendered is not None:
-                    break
+            candidate = copy.deepcopy(block)
+            rendered = _fit(candidate, points, resize, fonts.get(index))
             if rendered is not None:
-                overlays.append((block, region, rendered))
+                overlays.append([index, block, candidate, region, rendered])
                 continue
             block.manga_review = 'overflow'
         if region is not None:
             (x1, y1, x2, y2), ink = region
             reserved[y1:y2, x1:x2] |= ink
 
-    for block, region, rendered in overlays:
+    retried = set()
+    for entry in overlays:
+        index, block, candidate, region, rendered = entry
         (x1, y1, x2, y2), ink = region
         pixels, x, y = rendered
         h, w = pixels.shape[:2]
         visible = pixels[:, :, 3] != 0
-        if (np.any(ink & reserved[y1:y2, x1:x2])
-                or np.any((reserved[y:y + h, x:x + w] | lettering[y:y + h, x:x + w]) & visible)):
-            block.manga_review = 'geometry'
-            continue
-        applied[y1:y2, x1:x2][ink] = 255
+        source_collision = np.any(ink & reserved[y1:y2, x1:x2])
+        if source_collision or np.any((reserved[y:y + h, x:x + w] | lettering[y:y + h, x:x + w]) & visible):
+            points = _polygon(block, valid.shape)
+            left, top, right, bottom = _bounds(points)
+            remaining = ~(reserved[top:bottom, left:right] | lettering[top:bottom, left:right])
+            candidate = copy.deepcopy(block)
+            # Exactly one re-placement search, starting from the original size
+            # and spacing. Source erasure itself may never cross protected ink.
+            retried.add(index)
+            retry = _fit(candidate, points, refit is None or index in refit, fonts.get(index), remaining)
+            if source_collision or retry is None:
+                block.manga_review = 'geometry'
+                reserved[y1:y2, x1:x2] |= ink
+                continue
+            entry[2], entry[4] = candidate, retry
+            pixels, x, y = retry
+            h, w = pixels.shape[:2]
+            visible = pixels[:, :, 3] != 0
         lettering[y:y + h, x:x + w] |= visible
+
+    # A later rejected block can reveal original ink under an earlier
+    # placement. Withholding is monotonic; never publish that earlier overlap.
+    changed = True
+    while changed:
+        changed = False
+        for entry in overlays:
+            index, block, _, region, (pixels, x, y) = entry
+            if block.manga_review:
+                continue
+            (x1, y1, x2, y2), ink = region
+            h, w = pixels.shape[:2]
+            if (np.any(ink & reserved[y1:y2, x1:x2])
+                    or np.any(reserved[y:y + h, x:x + w] & (pixels[:, :, 3] != 0))):
+                lettering[y:y + h, x:x + w][pixels[:, :, 3] != 0] = False
+                retry = None
+                if index not in retried:
+                    retried.add(index)
+                    points = _polygon(block, valid.shape)
+                    left, top, right, bottom = _bounds(points)
+                    remaining = ~(reserved[top:bottom, left:right] | lettering[top:bottom, left:right])
+                    candidate = copy.deepcopy(block)
+                    retry = _fit(candidate, points, refit is None or index in refit, fonts.get(index), remaining)
+                if retry is not None and not np.any(ink & reserved[y1:y2, x1:x2]):
+                    entry[2], entry[4] = candidate, retry
+                    pixels, x, y = retry
+                    h, w = pixels.shape[:2]
+                    lettering[y:y + h, x:x + w] |= pixels[:, :, 3] != 0
+                else:
+                    block.manga_review = 'geometry'
+                    reserved[y1:y2, x1:x2] |= ink
+                    changed = True
+    for _, block, candidate, region, _ in overlays:
+        if block.manga_review:
+            continue
+        (x1, y1, x2, y2), ink = region
+        applied[y1:y2, x1:x2][ink] = 255
+        block._bounding_rect = candidate._bounding_rect
+        block.fontformat = candidate.fontformat
+        block.angle = candidate.angle
     cleaned[applied != 0, :3] = draft[applied != 0, :3]
     result = cleaned.copy()
-    for block, _, (pixels, x, y) in overlays:
+    for _, block, _, _, (pixels, x, y) in overlays:
         if block.manga_review:
             continue
         h, w = pixels.shape[:2]
