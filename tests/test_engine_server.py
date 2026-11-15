@@ -20,8 +20,10 @@ class EngineTests(unittest.TestCase):
     def setUpClass(cls):
         from ballontranslator.utils import shared
         from ballontranslator.utils.logger import logger
+        # Bootstrap sets LDPI from the offscreen screen (72 on macOS); do not
+        # leave later layout tests using the engine's point/pixel conversion.
         cls.enterClassContext(patch.multiple(shared,
-            HEADLESS=shared.HEADLESS, ENGINE_IMAGES_LOCAL=shared.ENGINE_IMAGES_LOCAL,
+            HEADLESS=shared.HEADLESS, LDPI=shared.LDPI, ENGINE_IMAGES_LOCAL=shared.ENGINE_IMAGES_LOCAL,
             ENGINE_TRANSLATION_AUTO_THINKING_DISABLED=shared.ENGINE_TRANSLATION_AUTO_THINKING_DISABLED))
         cls.enterClassContext(patch.object(logger, 'disabled', logger.disabled))
         cls.root = tempfile.TemporaryDirectory()
