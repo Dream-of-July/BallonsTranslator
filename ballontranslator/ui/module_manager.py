@@ -262,6 +262,14 @@ class ModuleThread(QThread):
                     new_module = module()
             if self.cancel_event.is_set():
                 raise DownloadCancelled('Module preparation cancelled by user.')
+            if shared.ENGINE_IMAGES_LOCAL and 'device' in (new_module.params or {}):
+                from ballontranslator.modules import base as module_runtime
+                module_runtime.refresh_torch_device_info()
+                if (new_module.get_param_value('device') == 'mps'
+                        and 'mps' not in module_runtime.AVAILABLE_DEVICES):
+                    from copy import deepcopy
+                    new_module.params = deepcopy(new_module.params)
+                    new_module.set_param_value('device', 'cpu')
             self._emit_prepare_progress({'event': 'loading_model', 'message': self.tr('Loading model')})
             new_module.load_model()
             if self.cancel_event.is_set():
@@ -775,6 +783,9 @@ class ImgtransThread(QThread):
         self.stop_event = threading.Event()
         self._pipeline_stop_emitted = False
         self.pages_to_process = None
+        self.native_quality = False
+        self.manga_quality_enabled = False
+        self.manga_drafts: dict[str, np.ndarray] = {}
         register_global_callback('user_request_stop', self.isStopRequested)
 
     def on_module_thread_stopped(self) -> None:
@@ -819,6 +830,11 @@ class ImgtransThread(QThread):
         pages_to_process=None,
     ):
         self.imgtrans_proj = imgtrans_proj
+        self.manga_drafts.clear()
+        self.manga_quality_enabled = (
+            self.native_quality and cfg_module.translate_source == '日本語'
+            and cfg_module.enable_detect and cfg_module.enable_ocr and cfg_module.enable_inpaint
+        )
         self.pages_to_process = pages_to_process  # 保存需要处理的页面列表
         self.num_pages = len(self.imgtrans_proj.pages)
         self.clearStopRequest()
@@ -1055,6 +1071,9 @@ class ImgtransThread(QThread):
         self.finish_blktrans.emit(mode, blk_ids)
 
     def _imgtrans_pipeline(self):
+        manga_quality = None
+        if self.manga_quality_enabled:
+            from ballontranslator.engine import manga_quality
         self.detect_counter = 0
         self.ocr_counter = 0
         self.translate_counter = 0
@@ -1122,7 +1141,11 @@ class ImgtransThread(QThread):
                 self.imgtrans_proj.begin_detection(imgname)
                 try:
                     mask, blk_list = self.textdetector.detect(img, self.imgtrans_proj)
-                    need_save_mask = True
+                    if manga_quality is not None:
+                        mask, blk_list = manga_quality.enhance_detection(
+                            img, mask, blk_list, self.textdetector, self.isStopRequested,
+                        )
+                    need_save_mask = manga_quality is None
                 except ModuleRunError as e:
                     self._stop_on_stage_failure(
                         e,
@@ -1166,10 +1189,12 @@ class ImgtransThread(QThread):
                         ocr_result = self.ocr.run_ocr(img, blk_list)
                     if isinstance(ocr_result, list):
                         blk_list = ocr_result
+                    if manga_quality is not None and not self.isStopRequested():
+                        manga_quality.retry_uncertain_ocr(img, blk_list, self.ocr)
                     self.imgtrans_proj.pages[imgname] = blk_list
                     self.ocr_counter += 1
 
-                    if pcfg.restore_ocr_empty:
+                    if pcfg.restore_ocr_empty and manga_quality is None:
                         blk_list_updated = []
                         for blk in blk_list:
                             text = blk.get_text()
@@ -1259,8 +1284,13 @@ class ImgtransThread(QThread):
                     
                 if mask is not None or cfg_module.inpainter == LLM_INPAINT_KEY:
                     try:
-                        inpainted = self.inpainter.inpaint(img, mask, blk_list)
-                        self.imgtrans_proj.save_inpainted(imgname, inpainted)
+                        if manga_quality is None:
+                            inpainted = self.inpainter.inpaint(img, mask, blk_list)
+                            self.imgtrans_proj.save_inpainted(imgname, inpainted)
+                        else:
+                            self.manga_drafts[imgname] = manga_quality.prepare_background(
+                                img, mask, blk_list, self.inpainter,
+                            )
                     except LLMUserActionRequiredError as e:
                         _show_llm_user_action_required_dialog(
                             e,
@@ -2123,6 +2153,10 @@ class ModuleManager(QObject):
             required_modules.append(('translator', cfg_module.translator))
         if cfg_module.enable_inpaint:
             required_modules.append(('inpainter', cfg_module.inpainter))
+        # Preparation can be requested before setupThread() has created the worker.
+        if getattr(getattr(self, 'imgtrans_thread', None), 'native_quality', False):
+            from ballontranslator.engine.manga_quality import local_module
+            required_modules = [(key, local_module(key, name)) for key, name in required_modules]
         self._prepare_modules_then(
             required_modules,
             lambda: self._startImgtransPipeline(

@@ -74,6 +74,7 @@ from ballontranslator.modules.exceptions import (
     LLMRequestStopped,
     LLMUserActionRequiredError,
 )
+from ballontranslator.utils import shared
 from ballontranslator.utils.config import (
     LLMTranslateContext,
     RunStatus,
@@ -203,7 +204,7 @@ class LLMTranslator(LLMChatRequester, BaseTranslator):
     def translation_run_description(self) -> str:
         """Describe the effective LLM context settings for run diagnostics."""
         profile = self.profile
-        vision_enabled = bool(pcfg.module.llm_translate_vision)
+        vision_enabled = bool(pcfg.module.llm_translate_vision) and not shared.ENGINE_IMAGES_LOCAL
         summary_memory_enabled = bool(
             pcfg.module.llm_translate_summary_memory
         )
@@ -338,7 +339,7 @@ class LLMTranslator(LLMChatRequester, BaseTranslator):
         >>> LLMTranslator('日本語', '简体中文').translate([])
         []
         """
-        vision_enabled = bool(pcfg.module.llm_translate_vision)
+        vision_enabled = bool(pcfg.module.llm_translate_vision) and not shared.ENGINE_IMAGES_LOCAL
         summary_memory_enabled = bool(pcfg.module.llm_translate_summary_memory)
         empty_page_summary = (
             text == []

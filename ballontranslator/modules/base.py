@@ -414,8 +414,15 @@ def refresh_torch_device_info(raise_missing: bool = False):
         DEFAULT_DEVICE = 'xpu'
         AVAILABLE_DEVICES.append(DEFAULT_DEVICE)
     if hasattr(torch, 'backends') and hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-        DEFAULT_DEVICE = 'mps'
-        AVAILABLE_DEVICES.append(DEFAULT_DEVICE)
+        # MPS can report available even when this engine process has no Metal access.
+        try:
+            if shared.ENGINE_IMAGES_LOCAL:
+                torch.empty(1, device='mps')
+        except RuntimeError:
+            pass
+        else:
+            DEFAULT_DEVICE = 'mps'
+            AVAILABLE_DEVICES.append(DEFAULT_DEVICE)
 
     try:
         import torch_directml

@@ -312,7 +312,8 @@ class TextDetector:
         return lines, mask
 
     @torch.no_grad()
-    def __call__(self, img, refine_mode=REFINEMASK_INPAINT, keep_undetected_mask=False) -> Tuple[np.ndarray, np.ndarray, List[TextBlock]]:
+    def __call__(self, img, refine_mode=REFINEMASK_INPAINT, keep_undetected_mask=False,
+                 *, line_box_threshold: float = 0.6) -> Tuple[np.ndarray, np.ndarray, List[TextBlock]]:
         
         detect_size = self.detect_size if not self.backend == 'opencv' else 1024
         im_h, im_w = img.shape[:2]
@@ -335,8 +336,7 @@ class TextDetector:
 
         mask = postprocess_mask(mask)
         lines, scores = self.seg_rep(None, lines_map, height=im_h, width=im_w)
-        box_thresh = 0.6
-        idx = np.where(scores[0] > box_thresh)
+        idx = np.where(scores[0] > line_box_threshold)
         lines, scores = lines[0][idx], scores[0][idx]
 
         # map output to input img

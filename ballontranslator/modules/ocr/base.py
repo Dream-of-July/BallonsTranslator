@@ -87,11 +87,16 @@ class OCRBase(BaseModule):
             if isinstance(ordered_blk_list, list):
                 blk_list = ordered_blk_list
             for blk in blk_list:
-                blk.text = postprocess_ocr_text(
-                    blk.get_text(),
+                source = blk.get_text()
+                processed = postprocess_ocr_text(
+                    source,
                     pcfg.ocr_sublist,
                     pcfg.module.ocr_text_postprocess,
                 )
+                if (blk.manga_area is not None and self._line_only and isinstance(blk.text, list)
+                        and len(blk.text) == len(blk.lines) and source == processed):
+                    continue  # Retain the source glyphs' line correspondence for typesetting.
+                blk.text = processed
 
             if pcfg.module.ocr_font_detect:
                 self._detect_fonts(img, blk_list)

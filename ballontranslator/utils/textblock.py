@@ -125,6 +125,10 @@ class TextBlock:
     det_model: str = None
     label: str = None # ysg yolo label
 
+    manga_area: Optional[List] = None
+    manga_review: Optional[str] = None
+    manga_ocr_confidence: Optional[float] = None
+
     region_mask: np.ndarray = None
     region_inpaint_dict: Dict = None
 

@@ -190,7 +190,8 @@ class Server(QObject):
         blocks = self.blocks(name)
         proj = self.project
         size = QImageReader(str(Path(proj.directory) / name)).size()
-        result, inpainted = Path(proj.get_result_path(name)), Path(proj.get_inpainted_path(name))
+        result = Path(proj.get_result_path(name))
+        inpainted = Path(proj.get_inpainted_path(name, get_last_modified=True))
         return dict(name=name, source=str(Path(proj.directory) / name), width=size.width(),
                     height=size.height(), result=str(result) if result.is_file() else None,
                     inpainted=str(inpainted) if inpainted.is_file() else None,
@@ -200,28 +201,34 @@ class Server(QObject):
     @staticmethod
     def block(index: int, blk: object) -> dict:
         fmt = blk.fontformat
+        x1, y1, x2, y2 = blk.xyxy
         return dict(index=index, rect=[float(v) for v in blk.bounding_rect()], angle=float(blk.angle),
+                    source_rect=[float(v) for v in (x1, y1, max(0, x2 - x1), max(0, y2 - y1))],
+                    review_reason=blk.manga_review,
                     source_text=blk.get_text(), translation=blk.translation, vertical=bool(blk.vertical),
-                    font_family=fmt.font_family, font_size=float(fmt.font_size), color=list(fmt.frgb),
+                    font_family=fmt.font_family or shared.DEFAULT_FONT_FAMILY, font_size=float(fmt.font_size),
+                    color=[max(0, min(255, round(float(value)))) for value in fmt.frgb],
                     alignment=('left', 'center', 'right')[int(fmt.alignment)],
-                    bold=fmt.font_weight >= 600, italic=bool(fmt.italic))
+                    bold=bool(fmt.font_weight >= 600), italic=bool(fmt.italic))
 
     def hello(self, params: dict) -> dict:
         from ballontranslator.utils.version import APP_VERSION
         installed = importlib.util.find_spec('torch') is not None
         device = None
         if installed:
-            import torch
-            device = 'cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu'
+            from ballontranslator.modules import base as module_runtime
+            module_runtime.refresh_torch_device_info()
+            device = module_runtime.DEFAULT_DEVICE
         ready = self.models_ready()
         return dict(protocol=1, engine_version=APP_VERSION,
                     device=device,
                     torch_installed=installed, models_ready=ready)
 
     def models_ready(self) -> bool:
+        from .manga_quality import local_module
         from ballontranslator.modules.prepare_local_files import _missing_module_requirements
         for key in ('textdetector', 'ocr', 'inpainter'):
-            name = getattr(config.pcfg.module, key)
+            name = local_module(key, getattr(config.pcfg.module, key))
             spec = self.manager._registry_for_module_key(key).get_spec(name)
             if spec is None or not spec.available or _missing_module_requirements(spec):
                 return False
@@ -440,6 +447,27 @@ class Server(QObject):
         if delete:
             updated = [blk for i, blk in enumerate(updated) if i not in indexes]
             indexes = []
+        from .manga_quality import draft_path, save_page
+        draft_file = draft_path(self.project.directory, page)
+        if any(b.manga_area is not None for b in blocks) and draft_file.is_file():
+            from ballontranslator.utils.io_utils import imread
+            draft = imread(str(draft_file))
+            if draft is None or draft.ndim != 3 or draft.shape[-1] != 4:
+                raise ProtocolError('internal', 'The page needs to be analysed again.')
+            refit = {i for i in indexes if params.get('autofit', False)
+                     or blocks[i].manga_review is not None}
+            baseline = self.revisions.get(page, 0)
+            previous_blocks = blocks[:]
+            self.rendering = True
+            try:
+                blocks[:] = updated
+                save_page(self.window, page, draft, refit)
+                self.pending = (request_id, page, {}, indexes, baseline)
+            except Exception:
+                blocks[:] = previous_blocks
+                self.rendering = False
+                raise
+            return
         self.project.pages[page][:] = updated
         snapshots = {i: copy.deepcopy(b) for i, b in enumerate(updated) if i not in indexes}
         manager = self.window.st_manager
@@ -466,12 +494,12 @@ class Server(QObject):
 
     @staticmethod
     def apply_edit(blk: object, edit: dict) -> None:
-        allowed = {'index', 'translation', 'rect', 'angle', 'font_family', 'font_size',
+        allowed = {'index', 'source_text', 'translation', 'rect', 'angle', 'font_family', 'font_size',
                    'color', 'alignment', 'bold', 'italic'}
         if set(edit) - allowed:
             raise ValueError('edit')
         for key, value in edit.items():
-            if key in ('translation', 'font_family') and not isinstance(value, str):
+            if key in ('source_text', 'translation', 'font_family') and not isinstance(value, str):
                 raise ValueError(key)
             if key in ('bold', 'italic') and type(value) is not bool:
                 raise ValueError(key)
@@ -487,12 +515,16 @@ class Server(QObject):
                 if key == 'color' and any(type(v) is not int or not 0 <= v <= 255 for v in value):
                     raise ValueError(key)
         fmt = blk.fontformat
+        if 'source_text' in edit:
+            blk.text = [edit['source_text']]
+            blk.manga_ocr_confidence = None
         for key in ('translation', 'angle'):
             if key in edit:
                 setattr(blk, key, edit[key])
         if 'rect' in edit:
             blk._bounding_rect = edit['rect'][:]
-            blk.sync_xyxy_from_bounding_rect()
+            if blk.manga_area is None:
+                blk.sync_xyxy_from_bounding_rect()
         for key in ('font_family', 'font_size', 'italic'):
             if key in edit:
                 setattr(fmt, key, edit[key])

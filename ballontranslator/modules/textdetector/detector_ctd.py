@@ -72,8 +72,13 @@ class ComicTextDetector(TextDetectorBase):
         else:
             self.model = load_ctd_model(CTD_ONNX_PATH, self.device, self.detect_size)
 
-    def _detect(self, img: np.ndarray, proj: ProjImgTrans) -> Tuple[np.ndarray, List[TextBlock]]:
-        _, mask, blk_list = self.model(img)
+    def detect_detail(self, img: np.ndarray) -> Tuple[np.ndarray, List[TextBlock]]:
+        """Recheck a local crop for weaker text outlines using the loaded model."""
+        return self._detect(np.ascontiguousarray(img[..., :3]), None, line_box_threshold=.48)
+
+    def _detect(self, img: np.ndarray, proj: ProjImgTrans,
+                *, line_box_threshold: float = .6) -> Tuple[np.ndarray, List[TextBlock]]:
+        _, mask, blk_list = self.model(img, line_box_threshold=line_box_threshold)
         
         fnt_rsz = self.get_param_value('font size multiplier')
         fnt_max = self.get_param_value('font size max')

@@ -14,6 +14,7 @@ def bootstrap() -> tuple:
         os.environ['QT_FONT_DPI'] = '72'
     from ballontranslator.utils import shared
     shared.HEADLESS = True  # MainWindow chooses its Qt base at import time.
+    shared.ENGINE_IMAGES_LOCAL = True
     os.environ.setdefault('HF_HOME', str(Path(shared.PROGRAM_PATH) / 'data/models'))
     from ballontranslator.launch import parser, setup_locks, application_arguments
     args = parser.parse_args([])
@@ -62,6 +63,22 @@ def bootstrap() -> tuple:
     from ballontranslator.ui.mainwindow import MainWindow
 
     class EngineWindow(MainWindow):
+        def on_pagtrans_finished(self, page_index: int) -> None:
+            worker = self.module_manager.imgtrans_thread
+            if not worker.manga_quality_enabled:
+                return super().on_pagtrans_finished(page_index)
+            name = self.imgtrans_proj.idx2pagename(page_index)
+            draft = worker.manga_drafts.pop(name, None)
+            if draft is not None and self.imgtrans_proj.get_page_progress(name):
+                from .manga_quality import save_page
+                try:
+                    save_page(self, name, draft)
+                except Exception as error:
+                    from ballontranslator.ui import module_manager
+                    module_manager._create_page_error_dialog(
+                        error, 'Page could not be rendered.', 'MangaQualityRenderFailed', name,
+                    )
+
         def run_batch(self, exec_dirs: str = '', **kwargs: object) -> None:
             self.exec_dirs = []
 
@@ -87,5 +104,6 @@ def bootstrap() -> tuple:
         # Keep startup-only overrides out of subsequent explicit config saves.
         pcfg.open_recent_on_startup, pcfg.check_update_on_startup = old_recent, old_update
     window.save_on_page_changed = False
+    window.module_manager.imgtrans_thread.native_quality = True
     window.hide()
     return app, window

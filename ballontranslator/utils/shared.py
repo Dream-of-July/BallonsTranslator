@@ -147,6 +147,7 @@ def _detect_apple_silicon() -> bool:
 
 ON_APPLE_SILICON = _detect_apple_silicon()
 HEADLESS = False
+ENGINE_IMAGES_LOCAL = False
 DEBUG = False
 args = None
 TORCH_INSTALL_PREFERRED_DEVICE = None

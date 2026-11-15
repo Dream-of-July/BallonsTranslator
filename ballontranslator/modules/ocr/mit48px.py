@@ -167,6 +167,11 @@ class Model48pxOCR:
             with torch.no_grad():
                 ret = self.model.infer_beam_batch_tensor(image_tensor, widths, beams_k = 5, max_seq_length = 255)
             for i, (pred_chars_index, prob, fg_pred, bg_pred, fg_ind_pred, bg_ind_pred) in enumerate(ret):
+                block_index = textblk_lst_indices[i + chunck_idx]
+                cur_region = textblk_lst[block_index]
+                if cur_region.manga_area is not None:
+                    previous = cur_region.manga_ocr_confidence
+                    cur_region.manga_ocr_confidence = float(prob) if previous is None else min(previous, float(prob))
                 if prob < 0.2:
                     continue
                 has_fg = (fg_ind_pred[:, 1] > fg_ind_pred[:, 0])
@@ -208,8 +213,6 @@ class Model48pxOCR:
                 bb = min(max(int(bb()), 0), 255)
                 # self.logger.info(f'prob: {prob} {txt} fg: ({fr}, {fg}, {fb}) bg: ({br}, {bg}, {bb})')
                 
-                block_index = textblk_lst_indices[i+chunck_idx]
-                cur_region = textblk_lst[block_index]
                 cur_region.text.append(txt)
                 color_totals[block_index][0] += np.array([fr, fg, fb])
                 color_totals[block_index][1] += np.array([br, bg, bb])
