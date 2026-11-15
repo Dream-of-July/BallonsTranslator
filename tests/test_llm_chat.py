@@ -425,11 +425,12 @@ class LLMChatRequesterTest(unittest.TestCase):
         self.assertEqual(compatible, {'type': 'json_object'})
 
     def test_expired_shared_deadline_does_not_start_request(self) -> None:
-        with mock.patch.object(self.requester, '_initialize_client') as initialize:
+        with mock.patch.object(self.requester, '_initialize_client') as initialize, \
+                mock.patch.object(self.requester._request_deadline, 'value',
+                                  time.monotonic() - 1, create=True):
             with self.assertRaises(TimeoutError):
                 self.requester.request_chat_completion(
                     self.profile, {'model': 'offline', 'messages': []},
-                    deadline=time.monotonic() - 1,
                 )
         initialize.assert_not_called()
 
