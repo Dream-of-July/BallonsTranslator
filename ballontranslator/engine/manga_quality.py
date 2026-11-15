@@ -633,6 +633,12 @@ def _fit(
     floor = max(9., block.detected_font_size * .55 if block.detected_font_size <= 16 else 9.)
     sizes = list(dict.fromkeys(max(floor, detected_size * scale)
                               for scale in (1, .88, .76, .66, .56, .48, .40))) if refit else [detected_size]
+    # Large source fonts can leave every scaled candidate above the readable
+    # floor. Continue in pixel steps so a larger compact fit precedes the floor.
+    if refit:
+        smallest = sizes[-1]
+        sizes.extend(max(floor, smallest - step)
+                     for step in range(1, math.ceil(smallest - floor) + 1))
     distance = cv2.distanceTransform(area, cv2.DIST_L2, 5)
     cy, cx = np.unravel_index(np.argmax(distance), distance.shape)
     centers = [(x1 + cx, y1 + cy)]
