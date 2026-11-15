@@ -18,8 +18,14 @@ os.environ.setdefault('BALLOONTRANS_APP_ROOT', str(Path(__file__).resolve().pare
 class EngineTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        from ballontranslator.utils import shared
+        from ballontranslator.utils.logger import logger
+        cls.enterClassContext(patch.multiple(shared,
+            HEADLESS=shared.HEADLESS, ENGINE_IMAGES_LOCAL=shared.ENGINE_IMAGES_LOCAL))
+        cls.enterClassContext(patch.object(logger, 'disabled', logger.disabled))
         cls.root = tempfile.TemporaryDirectory()
-        os.environ['BALLOONTRANS_ENGINE_CONFIG'] = str(Path(cls.root.name) / 'config.json')
+        cls.enterClassContext(patch.dict(os.environ,
+            BALLOONTRANS_ENGINE_CONFIG=str(Path(cls.root.name) / 'config.json')))
         from ballontranslator.engine.bootstrap import bootstrap
         cls.app, cls.window = bootstrap()
         from ballontranslator.engine.server import Server
@@ -69,12 +75,101 @@ class EngineTests(unittest.TestCase):
     def test_hello_page_fonts(self):
         hello = self.call('hello')['result']
         self.assertEqual(hello['protocol'], 1)
+        self.assertEqual(hello['capabilities'], ['keep_original'])
         self.assertIn(hello['device'], ('cpu', 'mps', 'cuda', None))
         page = self.call('get_page', {'name': '001.png'})['result']
         self.assertEqual((page['width'], page['height']), (480, 320))
         self.assertEqual(len(page['blocks']), 2)
         self.assertEqual(page['blocks'][0]['source_text'], 'source')
         self.assertTrue(self.call('list_fonts')['result']['fonts'])
+
+    def quality_page(self, translation: str) -> None:
+        from PIL import Image, ImageDraw
+        import numpy as np
+        from ballontranslator.engine.manga_quality import draft_path, prepare_background
+        from ballontranslator.utils.io_utils import imwrite
+
+        original = Image.new('RGB', (480, 320), 'white')
+        ImageDraw.Draw(original).rectangle((75, 45, 85, 85), fill='black')
+        original.save(self.directory / '001.png')
+        data = json.loads(self.project_file.read_text())
+        block = data['pages']['001.png'][0]
+        block.update(text=['原文'], translation=translation,
+                     manga_area=[[20,20],[210,20],[210,110],[20,110]])
+        self.project_file.write_text(json.dumps(data))
+        self.call('open_project', dict(path=str(self.directory)))
+        mask = np.zeros((320, 480), dtype=np.uint8)
+        mask[44:87, 74:87] = 255
+        draft = prepare_background(np.array(original), mask, self.server.project.pages['001.png'], None)
+        path = draft_path(str(self.directory), '001.png')
+        path.parent.mkdir(exist_ok=True)
+        imwrite(str(path), draft)
+
+    def test_keep_original_withheld_persists_and_false_refits(self):
+        from PIL import Image
+        import numpy as np
+
+        self.quality_page('')
+        withheld = self.call('update_blocks', dict(page='001.png', edits=[]))['result']
+        self.assertEqual(withheld['blocks'][0]['review_reason'], 'untranslated')
+        protected = self.call('update_blocks', dict(page='001.png',
+            edits=[dict(index=0, keep_original=True)]))['result']
+        self.assertEqual(protected['blocks'][0]['review_reason'], 'protected')
+        self.assertNotIn('keep_original', protected['blocks'][0])
+        self.assertTrue(np.array_equal(np.array(Image.open(protected['result']))[20:110,20:210],
+                                       np.array(Image.open(self.directory/'001.png'))[20:110,20:210]))
+        saved = json.loads(self.project_file.read_text())['pages']['001.png'][0]
+        self.assertTrue(saved['manga_keep_original'])
+        self.call('open_project', dict(path=str(self.directory)))
+        self.assertTrue(self.server.project.pages['001.png'][0].manga_keep_original)
+        other_edit = self.call('update_blocks', dict(page='001.png',
+            edits=[dict(index=1, translation='Other edit')]))['result']
+        self.assertEqual(other_edit['blocks'][0]['review_reason'], 'protected')
+        # Continue skips a finished page and must not replace its saved blocks.
+        from ballontranslator.utils.config import pcfg
+        self.server.project.set_page_progress('001.png', pcfg.module.finish_code)
+        self.call('set_settings', dict(translator=dict(kind='google')))
+        with patch.object(self.window, 'on_run_imgtrans') as run:
+            self.assertTrue(self.call('run', dict(mode='continue'))['result']['started'])
+            run.assert_not_called()
+        self.server.settle()
+        self.assertTrue(self.server.project.pages['001.png'][0].manga_keep_original)
+        released = self.call('update_blocks', dict(page='001.png',
+            edits=[dict(index=0, keep_original=False, translation='中文')]))['result']
+        self.assertIsNone(released['blocks'][0]['review_reason'])
+        self.assertFalse(self.server.project.pages['001.png'][0].manga_keep_original)
+        withheld_again = self.call('update_blocks', dict(page='001.png',
+            edits=[dict(index=0, keep_original=False, translation='')]))['result']
+        self.assertEqual(withheld_again['blocks'][0]['review_reason'], 'untranslated')
+
+    def test_keep_original_restores_previously_translated_pixels(self):
+        from PIL import Image
+        import numpy as np
+
+        self.quality_page('中文')
+        translated = self.call('update_blocks', dict(page='001.png',
+            edits=[dict(index=0, translation='中文')], autofit=True))['result']
+        self.assertIsNone(translated['blocks'][0]['review_reason'])
+        original = np.array(Image.open(self.directory/'001.png'))[20:110,20:210]
+        self.assertFalse(np.array_equal(np.array(Image.open(translated['result']))[20:110,20:210], original))
+        protected = self.call('update_blocks', dict(page='001.png',
+            edits=[dict(index=0, keep_original=True)]))['result']
+        self.assertEqual(protected['blocks'][0]['review_reason'], 'protected')
+        self.assertTrue(np.array_equal(np.array(Image.open(protected['result']))[20:110,20:210], original))
+
+    def test_keep_original_rejects_non_bool_and_legacy_page(self):
+        for value in (True, False, 1, 0, 'true', None, []):
+            response = self.call('update_blocks', dict(page='001.png',
+                edits=[dict(index=0, keep_original=value)]))
+            self.assertEqual(response['error']['code'], 'bad_request')
+            if type(value) is bool:
+                self.assertIn('manga-quality', response['error']['message'])
+        self.assertFalse(self.server.project.pages['001.png'][0].manga_keep_original)
+        self.quality_page('中文')
+        for value in (1, 0, 'true', None, []):
+            response = self.call('update_blocks', dict(page='001.png',
+                edits=[dict(index=0, keep_original=value)]))
+            self.assertEqual(response['error']['code'], 'bad_request')
 
     def test_edit_delete_real_pixels_and_persistence(self):
         from PIL import Image, ImageChops
