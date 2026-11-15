@@ -21,7 +21,8 @@ class EngineTests(unittest.TestCase):
         from ballontranslator.utils import shared
         from ballontranslator.utils.logger import logger
         cls.enterClassContext(patch.multiple(shared,
-            HEADLESS=shared.HEADLESS, ENGINE_IMAGES_LOCAL=shared.ENGINE_IMAGES_LOCAL))
+            HEADLESS=shared.HEADLESS, ENGINE_IMAGES_LOCAL=shared.ENGINE_IMAGES_LOCAL,
+            ENGINE_TRANSLATION_AUTO_THINKING_DISABLED=shared.ENGINE_TRANSLATION_AUTO_THINKING_DISABLED))
         cls.enterClassContext(patch.object(logger, 'disabled', logger.disabled))
         cls.root = tempfile.TemporaryDirectory()
         cls.enterClassContext(patch.dict(os.environ,
@@ -82,6 +83,26 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(len(page['blocks']), 2)
         self.assertEqual(page['blocks'][0]['source_text'], 'source')
         self.assertTrue(self.call('list_fonts')['result']['fonts'])
+
+    def test_translation_auto_override_keeps_get_settings_unchanged(self) -> None:
+        from ballontranslator.modules.llm_chat import LLMChatResult
+        from ballontranslator.modules.translators.trans_llm import LLMTranslator
+        from ballontranslator.utils import config, shared
+        from ballontranslator.utils.llm_profiles import default_profile
+
+        self.assertTrue(shared.ENGINE_TRANSLATION_AUTO_THINKING_DISABLED)
+        profile = default_profile('DeepSeek')
+        before_profile = copy.deepcopy(profile)
+        translator = LLMTranslator('日本語', '简体中文')
+        with patch.object(config.pcfg.module, 'llm_profiles', [profile]):
+            before_settings = self.call('get_settings')['result']
+            with patch.object(translator, 'request_chat_completion',
+                    return_value=LLMChatResult(content='target')) as request:
+                self.assertEqual(translator._request_translation(profile, []), 'target')
+            self.assertEqual(request.call_args.args[1]['extra_body'], {'thinking': {'type': 'disabled'}})
+            self.assertEqual(self.call('get_settings')['result'], before_settings)
+        self.assertEqual(profile, before_profile)
+        self.assertEqual(profile.thinking_level, 'Auto')
 
     def quality_page(self, translation: str) -> None:
         from PIL import Image, ImageDraw
@@ -455,6 +476,11 @@ class EngineTests(unittest.TestCase):
 
 
 class TransportTests(unittest.TestCase):
+    def test_engine_translation_flag_restored(self) -> None:
+        from ballontranslator.utils import shared
+
+        self.assertFalse(shared.ENGINE_TRANSLATION_AUTO_THINKING_DISABLED)
+
     def test_real_pipes_print_isolation_framing_and_eof(self):
         code = """
 from ballontranslator.engine.transport import Writer, isolate_stdout, decode, ProtocolError

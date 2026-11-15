@@ -15,6 +15,7 @@ def bootstrap() -> tuple:
     from ballontranslator.utils import shared
     shared.HEADLESS = True  # MainWindow chooses its Qt base at import time.
     shared.ENGINE_IMAGES_LOCAL = True
+    shared.ENGINE_TRANSLATION_AUTO_THINKING_DISABLED = True
     os.environ.setdefault('HF_HOME', str(Path(shared.PROGRAM_PATH) / 'data/models'))
     from ballontranslator.launch import parser, setup_locks, application_arguments
     args = parser.parse_args([])

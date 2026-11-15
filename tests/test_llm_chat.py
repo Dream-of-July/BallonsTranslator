@@ -24,6 +24,7 @@ from ballontranslator.modules.llm_chat import (
     openai_json_response_format,
 )
 from ballontranslator.utils.llm_profiles import LLMProfile, PROVIDER_DEFAULTS, default_profile
+from ballontranslator.utils import shared
 from ballontranslator.utils.secret_store import SecretStore
 
 
@@ -385,6 +386,16 @@ class LLMChatRequesterTest(unittest.TestCase):
         )
         self.assertEqual(explicit['reasoning_effort'], 'low')
         self.assertNotIn('extra_body', explicit)
+
+    def test_native_translation_switch_does_not_change_shared_auto_args(self) -> None:
+        for provider in ('OpenAI', 'DeepSeek', 'OpenRouter', 'LM Studio'):
+            with self.subTest(provider=provider):
+                profile = default_profile(provider)
+                with mock.patch.object(shared, 'ENGINE_TRANSLATION_AUTO_THINKING_DISABLED', False):
+                    before = json.dumps(openai_chat_completion_args(profile, 'offline-model'))
+                with mock.patch.object(shared, 'ENGINE_TRANSLATION_AUTO_THINKING_DISABLED', True):
+                    after = json.dumps(openai_chat_completion_args(profile, 'offline-model'))
+                self.assertEqual(after, before)
 
     def test_json_response_format_preserves_strict_and_compatible_shapes(self):
         schema = {'type': 'object', 'properties': {}}

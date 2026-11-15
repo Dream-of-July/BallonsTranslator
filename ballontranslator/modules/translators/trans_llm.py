@@ -88,6 +88,7 @@ from ballontranslator.utils.llm_profiles import (
     LLMProfile,
     THINKING_AUTO,
     THINKING_DISABLED,
+    normalize_thinking_level,
     runtime_profile,
 )
 from ballontranslator.utils.proj_imgtrans import (
@@ -1224,6 +1225,14 @@ class LLMTranslator(LLMChatRequester, BaseTranslator):
         # budget. Share its deadline and never mutate the saved/runtime profile.
         request_kwargs['deadline'] = time.monotonic() + self._request_timeout()
         request_profile = profile
+        # Native translation (including its page summary) defaults to Disabled;
+        # independent memory compaction and other shared requester users do not.
+        if (
+            shared.ENGINE_TRANSLATION_AUTO_THINKING_DISABLED
+            and normalize_thinking_level(profile.thinking_level) == THINKING_AUTO
+            and THINKING_DISABLED in profile.thinking_level_options
+        ):
+            request_profile = replace(profile, thinking_level=THINKING_DISABLED)
         exhausted: Optional[LLMOutputLimitError] = None
         try:
             for _ in range(2):
@@ -1249,8 +1258,11 @@ class LLMTranslator(LLMChatRequester, BaseTranslator):
                     if not isinstance(error, LLMOutputLimitError):
                         raise
                     exhausted = error
-                    if THINKING_DISABLED in profile.thinking_level_options:
-                        request_profile = replace(profile, thinking_level=THINKING_DISABLED)
+                    if (
+                        THINKING_DISABLED in request_profile.thinking_level_options
+                        and normalize_thinking_level(request_profile.thinking_level) != THINKING_DISABLED
+                    ):
+                        request_profile = replace(request_profile, thinking_level=THINKING_DISABLED)
         except LLMChatRequestError as error:
             if is_context_length_error(error.provider_error):
                 raise ContextLengthError(str(error)) from error.provider_error
