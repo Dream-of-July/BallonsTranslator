@@ -3,6 +3,7 @@ import json
 import threading
 import time
 import unittest
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest import mock
 
@@ -19,6 +20,7 @@ from ballontranslator.modules.exceptions import (
     LLMUserActionRequiredError,
 )
 from ballontranslator.modules.context.errors import ContextLengthError
+from ballontranslator.modules.context.translation_context import PageSummary
 from ballontranslator.modules.context.token_usage import format_token_usage
 from ballontranslator.modules.llm_chat import LLMChatRequestError, LLMChatResult
 from ballontranslator.modules.translators.llm_translation_contract import (
@@ -27,6 +29,7 @@ from ballontranslator.modules.translators.llm_translation_contract import (
     translation_system_prompt,
 )
 from ballontranslator.modules.translators.trans_llm import LLMTranslator
+from ballontranslator.utils import shared
 from ballontranslator.utils.config import LLMTranslateContext, pcfg
 from ballontranslator.utils.llm_profiles import default_codex_profile, default_profile
 from ballontranslator.utils.proj_imgtrans import ProjImgTrans
@@ -48,6 +51,88 @@ class FakeStatusError(Exception):
 class LLMTranslatorTest(unittest.TestCase):
     def setUp(self):
         self.translator = LLMTranslator('日本語', '简体中文')
+
+    def test_native_translation_thinking_override_preserves_profile_and_arguments(self) -> None:
+        messages = [{'role': 'user', 'content': 'source'}]
+        for provider in ('DeepSeek', 'OpenAI', 'OpenRouter', 'LM Studio'):
+            for level in ('Auto', 'None', ' auto ', 'Disabled', 'low', 'high'):
+                for native in (False, True):
+                    with self.subTest(provider=provider, level=level, native=native):
+                        profile = default_profile(provider)
+                        profile.thinking_level = level
+                        before = copy.deepcopy(profile)
+                        expected_profile = (
+                            replace(profile, thinking_level='Disabled')
+                            if native and level in ('Auto', 'None', ' auto ')
+                            else profile
+                        )
+                        expected = json.dumps(self.translator._api_args(
+                            expected_profile, messages, summary_enabled=True))
+                        with mock.patch.object(shared, 'ENGINE_TRANSLATION_AUTO_THINKING_DISABLED', native), \
+                                mock.patch.object(self.translator, 'request_chat_completion',
+                                    return_value=LLMChatResult(content='target')) as request:
+                            self.assertEqual(self.translator._request_translation(
+                                profile, messages, summary_enabled=True), 'target')
+                        request.assert_called_once()
+                        self.assertEqual(json.dumps(request.call_args.args[1]), expected)
+                        self.assertEqual(request.call_args.args[0], expected_profile)
+                        self.assertEqual(profile, before)
+
+    def test_native_translation_keeps_profiles_without_disabled_support(self) -> None:
+        for profile in (default_profile('DeepSeek'), default_codex_profile()):
+            with self.subTest(backend=profile.backend):
+                profile.model, profile.model_options = 'offline-model', ['offline-model']
+                profile.thinking_level = 'Auto'
+                profile.thinking_level_options = ['Auto', 'high']
+                before = copy.deepcopy(profile)
+                messages = [{'role': 'user', 'content': 'source'}]
+                expected = json.dumps(self.translator._api_args(profile, messages))
+                with mock.patch.object(shared, 'ENGINE_TRANSLATION_AUTO_THINKING_DISABLED', True), \
+                        mock.patch.object(self.translator, 'request_chat_completion',
+                            return_value=LLMChatResult(content='target')) as request:
+                    self.translator._request_translation(profile, messages)
+                self.assertIs(request.call_args.args[0], profile)
+                self.assertEqual(json.dumps(request.call_args.args[1]), expected)
+                self.assertEqual(profile, before)
+
+    def test_native_translation_exhaustion_retries_once_without_reapplying_override(self) -> None:
+        profile = default_profile('DeepSeek')
+        before = copy.deepcopy(profile)
+        original = LLMOutputLimitError(profile.id, profile.name, profile.max_tokens, 'Disabled')
+        second = LLMOutputLimitError(profile.id, profile.name, profile.max_tokens, 'Disabled')
+        for outcome in (LLMChatResult(content='target'), second):
+            with self.subTest(succeeds=isinstance(outcome, LLMChatResult)), \
+                    mock.patch.object(shared, 'ENGINE_TRANSLATION_AUTO_THINKING_DISABLED', True), \
+                    mock.patch.object(self.translator, 'request_chat_completion',
+                        side_effect=[original, outcome]) as request:
+                if isinstance(outcome, LLMChatResult):
+                    self.assertEqual(self.translator._request_translation(profile, []), 'target')
+                else:
+                    with self.assertRaises(LLMOutputLimitError) as caught:
+                        self.translator._request_translation(profile, [])
+                    self.assertIs(caught.exception, original)
+                self.assertEqual(request.call_count, 2)
+                first, retry = request.call_args_list
+                self.assertIs(first.args[0], retry.args[0])
+                self.assertEqual(first, retry)
+                self.assertEqual(first.args[1]['extra_body'], {'thinking': {'type': 'disabled'}})
+                self.assertEqual(profile, before)
+
+    def test_native_memory_compaction_keeps_auto_thinking(self) -> None:
+        profile = default_profile('DeepSeek')
+        before = copy.deepcopy(profile)
+        with mock.patch.object(shared, 'ENGINE_TRANSLATION_AUTO_THINKING_DISABLED', True), \
+                mock.patch.object(self.translator, 'request_chat_completion',
+                    return_value=LLMChatResult(content='memory')) as request:
+            result = self.translator._compact_summary_batch(
+                previous=None, summaries=(PageSummary('001.png', 'summary'),),
+                profile=profile, model='offline-model', target_language='Chinese')
+        request.assert_called_once()
+        self.assertIs(request.call_args.args[0], profile)
+        self.assertNotIn('extra_body', request.call_args.args[1])
+        self.assertNotIn('reasoning_effort', request.call_args.args[1])
+        self.assertEqual(result.text, 'memory')
+        self.assertEqual(profile, before)
 
     def test_exhausted_translation_retries_once_without_persisting_thinking(self) -> None:
         profile = default_profile('DeepSeek')
