@@ -4,13 +4,20 @@ import ImageIO
 import UniformTypeIdentifiers
 
 public enum ProjectImporter {
+    private static let ordinaryImageExtensions: Set<String> = [
+        "png", "jpg", "jpeg", "webp", "gif", "tif", "tiff", "bmp", "heic", "heif", "jxl"
+    ]
+
     /// `~/Library/Application Support/MangaTranslator/Projects`
     public static var projectsDirectory: URL {
         URL.applicationSupportDirectory.appendingPathComponent("MangaTranslator/Projects", isDirectory: true)
     }
 
     public static func isImage(_ url: URL) -> Bool {
-        UTType(filenameExtension: url.pathExtension)?.conforms(to: .image) ?? false
+        let ext = url.pathExtension.lowercased()
+        // Extension lookup can return an unclassified dynamic type while
+        // Launch Services is unavailable. The common import formats still work.
+        return ordinaryImageExtensions.contains(ext) || UTType(filenameExtension: ext)?.conforms(to: .image) == true
     }
 
     public static func isDirectory(_ url: URL) -> Bool {

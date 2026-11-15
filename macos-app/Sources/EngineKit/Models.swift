@@ -58,6 +58,7 @@ public struct Page: Codable, Equatable, Sendable, Identifiable {
 
     public var id: String { name }
     public var size: CGSize { CGSize(width: width, height: height) }
+    public var reviewCount: Int { blocks.count(where: \.needsReview) }
 
     public init(name: String, source: String, width: Int, height: Int, result: String? = nil,
                 inpainted: String? = nil, done: Bool = false, revision: Int = 0, blocks: [Block] = []) {
@@ -121,6 +122,8 @@ public struct Block: Codable, Equatable, Sendable, Identifiable {
     public var index: Int
     /// Unrotated render box in image pixels.
     public var rect: CGRect
+    public var sourceRect: CGRect?
+    public var reviewReason: String?
     public var angle: Double
     public var sourceText: String
     public var translation: String
@@ -134,9 +137,12 @@ public struct Block: Codable, Equatable, Sendable, Identifiable {
     public var italic: Bool
 
     public var id: Int { index }
+    public var needsReview: Bool { reviewReason != nil && reviewReason != "protected" }
 
     enum CodingKeys: String, CodingKey {
         case index, rect, angle
+        case sourceRect = "source_rect"
+        case reviewReason = "review_reason"
         case sourceText = "source_text"
         case translation, vertical
         case fontFamily = "font_family"
@@ -147,9 +153,11 @@ public struct Block: Codable, Equatable, Sendable, Identifiable {
     public init(index: Int, rect: CGRect, angle: Double = 0, sourceText: String = "", translation: String = "",
                 vertical: Bool = false, fontFamily: String = "", fontSize: Double = 24,
                 color: RGB = RGB(r: 0, g: 0, b: 0), alignment: BlockAlignment = .center,
-                bold: Bool = false, italic: Bool = false) {
+                bold: Bool = false, italic: Bool = false, sourceRect: CGRect? = nil, reviewReason: String? = nil) {
         self.index = index
         self.rect = rect
+        self.sourceRect = sourceRect
+        self.reviewReason = reviewReason
         self.angle = angle
         self.sourceText = sourceText
         self.translation = translation
@@ -166,6 +174,9 @@ public struct Block: Codable, Equatable, Sendable, Identifiable {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         index = try c.decode(Int.self, forKey: .index)
         rect = try decodeRect(try c.decode([Double].self, forKey: .rect), codingPath: c.codingPath + [CodingKeys.rect])
+        sourceRect = try c.decodeIfPresent([Double].self, forKey: .sourceRect)
+            .map { try decodeRect($0, codingPath: c.codingPath + [CodingKeys.sourceRect]) }
+        reviewReason = try c.decodeIfPresent(String.self, forKey: .reviewReason)
         angle = try c.decode(Double.self, forKey: .angle)
         sourceText = try c.decode(String.self, forKey: .sourceText)
         translation = try c.decode(String.self, forKey: .translation)
@@ -182,6 +193,8 @@ public struct Block: Codable, Equatable, Sendable, Identifiable {
         var c = encoder.container(keyedBy: CodingKeys.self)
         try c.encode(index, forKey: .index)
         try c.encode(encodeRect(rect), forKey: .rect)
+        try c.encodeIfPresent(sourceRect.map(encodeRect), forKey: .sourceRect)
+        try c.encodeIfPresent(reviewReason, forKey: .reviewReason)
         try c.encode(angle, forKey: .angle)
         try c.encode(sourceText, forKey: .sourceText)
         try c.encode(translation, forKey: .translation)
@@ -198,6 +211,7 @@ public struct Block: Codable, Equatable, Sendable, Identifiable {
 /// One entry of `update_blocks.edits`; nil fields are left untouched.
 public struct BlockEdit: Codable, Equatable, Sendable {
     public var index: Int
+    public var sourceText: String?
     public var translation: String?
     public var rect: CGRect?
     public var angle: Double?
@@ -210,6 +224,7 @@ public struct BlockEdit: Codable, Equatable, Sendable {
 
     enum CodingKeys: String, CodingKey {
         case index, translation, rect, angle
+        case sourceText = "source_text"
         case fontFamily = "font_family"
         case fontSize = "font_size"
         case color, alignment, bold, italic
@@ -217,8 +232,10 @@ public struct BlockEdit: Codable, Equatable, Sendable {
 
     public init(index: Int, translation: String? = nil, rect: CGRect? = nil, angle: Double? = nil,
                 fontFamily: String? = nil, fontSize: Double? = nil, color: RGB? = nil,
-                alignment: BlockAlignment? = nil, bold: Bool? = nil, italic: Bool? = nil) {
+                alignment: BlockAlignment? = nil, bold: Bool? = nil, italic: Bool? = nil,
+                sourceText: String? = nil) {
         self.index = index
+        self.sourceText = sourceText
         self.translation = translation
         self.rect = rect
         self.angle = angle
@@ -233,6 +250,7 @@ public struct BlockEdit: Codable, Equatable, Sendable {
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         index = try c.decode(Int.self, forKey: .index)
+        sourceText = try c.decodeIfPresent(String.self, forKey: .sourceText)
         translation = try c.decodeIfPresent(String.self, forKey: .translation)
         rect = try c.decodeIfPresent([Double].self, forKey: .rect)
             .map { try decodeRect($0, codingPath: c.codingPath + [CodingKeys.rect]) }
@@ -248,6 +266,7 @@ public struct BlockEdit: Codable, Equatable, Sendable {
     public func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
         try c.encode(index, forKey: .index)
+        try c.encodeIfPresent(sourceText, forKey: .sourceText)
         try c.encodeIfPresent(translation, forKey: .translation)
         try c.encodeIfPresent(rect.map(encodeRect), forKey: .rect)
         try c.encodeIfPresent(angle, forKey: .angle)
@@ -262,6 +281,7 @@ public struct BlockEdit: Codable, Equatable, Sendable {
     /// Later values win; used to coalesce queued edits of one block.
     public func merging(_ other: BlockEdit) -> BlockEdit {
         var merged = self
+        merged.sourceText = other.sourceText ?? sourceText
         merged.translation = other.translation ?? translation
         merged.rect = other.rect ?? rect
         merged.angle = other.angle ?? angle
@@ -275,6 +295,7 @@ public struct BlockEdit: Codable, Equatable, Sendable {
     }
 
     public func apply(to block: inout Block) {
+        if let sourceText { block.sourceText = sourceText }
         if let translation { block.translation = translation }
         if let rect { block.rect = rect }
         if let angle { block.angle = angle }
@@ -298,7 +319,8 @@ public struct BlockEdit: Codable, Equatable, Sendable {
             color: color.map { _ in block.color },
             alignment: alignment.map { _ in block.alignment },
             bold: bold.map { _ in block.bold },
-            italic: italic.map { _ in block.italic }
+            italic: italic.map { _ in block.italic },
+            sourceText: sourceText.map { _ in block.sourceText }
         )
     }
 }

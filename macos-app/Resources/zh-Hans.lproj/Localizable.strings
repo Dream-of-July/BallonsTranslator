@@ -27,6 +27,8 @@
 "Translation service" = "翻译服务";
 "Add Service…" = "添加服务…";
 "%lld of %lld pages translated" = "已翻译 %1$lld / %2$lld 页";
+"%lld of %lld pages translated · %lld need review" = "已翻译 %1$lld / %2$lld 页 · %3$lld 页需校对";
+"needs review" = "需校对";
 
 /* Start screen and engine status */
 "Drop a folder of pages" = "拖入漫画文件夹";
@@ -53,6 +55,16 @@
 "Getting ready…" = "正在准备…";
 "Updating page" = "正在更新页面";
 "Original" = "原图";
+"Page preview" = "页面预览";
+"Detection" = "识别";
+"Cleaned" = "修补";
+"Result" = "译图";
+"Recognized text" = "识别原文";
+"Save correction" = "保存原文校对";
+"Check the recognized text. The original is kept." = "请校对识别内容。原字已保留。";
+"Shorten the translation so it fits." = "请缩短译文，以放入文字区域。";
+"The text overlaps artwork or a nearby bubble." = "文字区域与画面或邻近气泡重叠。";
+"Add or check the translation." = "请填写或校对译文。";
 "Show the untranslated page" = "查看未翻译的原图";
 
 /* Inspector */

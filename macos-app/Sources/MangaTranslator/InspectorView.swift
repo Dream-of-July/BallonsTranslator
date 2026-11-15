@@ -23,6 +23,7 @@ private struct BlockForm: View {
     var page: String
     var block: Block
     @State private var draft: String
+    @State private var sourceDraft: String
     @State private var color: Color
     @FocusState private var isEditingTranslation: Bool
 
@@ -30,6 +31,7 @@ private struct BlockForm: View {
         self.page = page
         self.block = block
         _draft = State(initialValue: block.translation)
+        _sourceDraft = State(initialValue: block.sourceText)
         _color = State(initialValue: Color(block.color))
     }
 
@@ -37,9 +39,19 @@ private struct BlockForm: View {
         Form {
             // Own strings table: "Original" and "Translation" mean other things elsewhere in the app.
             Section {
-                Text(verbatim: block.sourceText)
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                if block.needsReview {
+                    Label(reviewMessage, systemImage: "exclamationmark.circle")
+                        .foregroundStyle(.orange)
+                    TextField("Recognized text", text: $sourceDraft, axis: .vertical)
+                    Button("Save correction") {
+                        model.apply(BlockEdit(index: block.index, sourceText: sourceDraft), autofit: true, to: page)
+                    }
+                    .disabled(sourceDraft == block.sourceText)
+                } else {
+                    Text(verbatim: block.sourceText)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
             } header: {
                 Text("Original", tableName: "Inspector")
             }
@@ -112,6 +124,7 @@ private struct BlockForm: View {
             // Undo, auto-fit or the engine changed it under us.
             if !isEditingTranslation { draft = block.translation }
         }
+        .onChange(of: block.sourceText) { sourceDraft = block.sourceText }
         .onChange(of: block.color) {
             if RGB(color) != block.color { color = Color(block.color) }
         }
@@ -124,6 +137,15 @@ private struct BlockForm: View {
             model.apply(BlockEdit(index: block.index, color: picked), to: page)
         }
         .onDisappear(perform: commitTranslation)
+    }
+
+    private var reviewMessage: LocalizedStringKey {
+        switch block.reviewReason {
+        case "unreadable": "Check the recognized text. The original is kept."
+        case "overflow": "Shorten the translation so it fits."
+        case "geometry": "The text overlaps artwork or a nearby bubble."
+        default: "Add or check the translation."
+        }
     }
 
     @ViewBuilder private var fontOptions: some View {

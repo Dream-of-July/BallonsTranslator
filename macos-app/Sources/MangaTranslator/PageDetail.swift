@@ -141,7 +141,7 @@ private struct RunProgress: View {
     }
 }
 
-/// Floating controls under the page: original/translated and zoom.
+/// Compare the processing stages without changing canvas zoom.
 private struct CanvasBar: View {
     @Environment(AppModel.self) private var model
     var page: Page
@@ -157,11 +157,19 @@ private struct CanvasBar: View {
                         .glassEffect()
                         .accessibilityLabel("Updating page")
                 }
-                if page.result != nil {
-                    Toggle("Original", systemImage: "photo", isOn: $model.showsOriginal)
-                        .toggleStyle(.button)
-                        .labelStyle(.titleAndIcon)
-                        .help("Show the untranslated page")
+                if page.result != nil || !page.blocks.isEmpty || page.inpainted != nil {
+                    Picker("Page preview", selection: Binding(
+                        get: { model.preview.available(on: page) ? model.preview : .original },
+                        set: { model.preview = $0 }
+                    )) {
+                        Text("Original").tag(AppModel.PagePreview.original)
+                        Text("Detection").tag(AppModel.PagePreview.detection).disabled(page.blocks.isEmpty)
+                        Text("Cleaned").tag(AppModel.PagePreview.cleaned).disabled(page.inpainted == nil)
+                        Text("Result").tag(AppModel.PagePreview.result).disabled(page.result == nil)
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .fixedSize()
                 }
                 Button("Zoom Out", systemImage: "minus.magnifyingglass") { model.zoomOut() }
                     .disabled(model.zoom <= AppModel.zoomRange.lowerBound)
@@ -187,8 +195,16 @@ struct PageCanvas: View {
 
     private static let padding: CGFloat = 24
 
+    private var preview: AppModel.PagePreview {
+        model.preview.available(on: page) ? model.preview : .original
+    }
+
     private var imagePath: String {
-        model.showsOriginal ? page.source : page.result ?? page.source
+        switch preview {
+        case .original, .detection: page.source
+        case .cleaned: page.inpainted ?? page.source
+        case .result: page.result ?? page.source
+        }
     }
 
     var body: some View {
@@ -204,9 +220,11 @@ struct PageCanvas: View {
                             model.selectedBlock = nil
                             isFocused = true
                         }
-                    if page.result != nil, !model.showsOriginal {
-                        BlockLayer(page: page, geometry: geometry) { isFocused = true }
-                            .allowsHitTesting(model.canEdit(page: page.name))
+                    if preview == .detection || preview == .result {
+                        BlockLayer(page: page, geometry: geometry, detection: preview == .detection) {
+                            isFocused = true
+                        }
+                        .allowsHitTesting(model.canEdit(page: page.name))
                     }
                 }
                 .coordinateSpace(.named(BlockLayer.space))
@@ -259,7 +277,7 @@ struct PageCanvas: View {
     }
 
     private func nudge(_ press: KeyPress) -> Bool {
-        guard let block = model.currentBlock else { return false }
+        guard preview == .result, let block = model.currentBlock else { return false }
         let step: CGFloat = press.modifiers.contains(.shift) ? 10 : 1
         let delta: CGSize = switch press.key {
         case .leftArrow: CGSize(width: -step, height: 0)
@@ -281,6 +299,7 @@ struct BlockLayer: View {
     @Environment(AppModel.self) private var model
     var page: Page
     var geometry: PageGeometry
+    var detection: Bool
     var takeFocus: () -> Void
     @State private var dragged: (index: Int, rect: CGRect)?
     @State private var hovered: Int?
@@ -291,7 +310,7 @@ struct BlockLayer: View {
                 let frame = geometry.toView(rect(of: block))
                 let isSelected = model.selectedBlock == block.index
                 Rectangle()
-                    .strokeBorder(Color.accentColor.opacity(isSelected ? 1 : hovered == block.index ? 0.55 : 0),
+                    .strokeBorder(outlineColor(block, selected: isSelected),
                                   lineWidth: isSelected ? 2 : 1)
                     .frame(width: frame.width, height: frame.height)
                     .contentShape(.rect)
@@ -299,15 +318,15 @@ struct BlockLayer: View {
                         if inside { hovered = block.index } else if hovered == block.index { hovered = nil }
                     }
                     .onTapGesture { select(block) }
-                    .gesture(move(block))
-                    .rotationEffect(.degrees(block.angle))
+                    .gesture(move(block), including: detection ? .none : .all)
+                    .rotationEffect(.degrees(detection ? 0 : block.angle))
                     .position(x: frame.midX, y: frame.midY)
                     .accessibilityElement()
-                    .accessibilityLabel(Text(verbatim: block.translation.isEmpty ? block.sourceText : block.translation))
+                    .accessibilityLabel(Text(verbatim: block.translation.isEmpty || detection ? block.sourceText : block.translation))
                     .accessibilityAddTraits(isSelected ? [.isButton, .isSelected] : .isButton)
                     .accessibilityAction { select(block) }
             }
-            if let block = page.blocks.first(where: { $0.index == model.selectedBlock }) {
+            if !detection, let block = page.blocks.first(where: { $0.index == model.selectedBlock }) {
                 ForEach(ResizeHandle.allCases, id: \.self) { handle in
                     let point = geometry.toView(BlockGeometry.position(of: handle.unit, rect: rect(of: block), angle: block.angle))
                     Circle()
@@ -326,7 +345,15 @@ struct BlockLayer: View {
     }
 
     private func rect(of block: Block) -> CGRect {
-        if let dragged, dragged.index == block.index { dragged.rect } else { block.rect }
+        if detection { return block.sourceRect ?? block.rect }
+        if let dragged, dragged.index == block.index { return dragged.rect }
+        return block.rect
+    }
+
+    private func outlineColor(_ block: Block, selected: Bool) -> Color {
+        if selected { return .accentColor }
+        if detection { return block.needsReview ? .orange : Color.accentColor.opacity(0.7) }
+        return Color.accentColor.opacity(hovered == block.index ? 0.55 : 0)
     }
 
     private func select(_ block: Block) {

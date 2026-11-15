@@ -156,7 +156,11 @@ struct ProjectView: View {
     private var subtitle: String {
         guard let project = model.project else { return "" }
         if case .starting = model.engineState { return String(localized: "Starting engine…") }
-        let done = project.pages.count(where: \.done)
+        let done = project.pages.count { $0.done && $0.reviewCount == 0 }
+        let review = project.pages.count { $0.result != nil && $0.reviewCount > 0 }
+        if review > 0 {
+            return String(localized: "\(done) of \(project.pages.count) pages translated · \(review) need review")
+        }
         return String(localized: "\(done) of \(project.pages.count) pages translated")
     }
 }
@@ -317,6 +321,8 @@ struct PageRow: View {
             ProgressView().controlSize(.small)
         case .done:
             Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+        case .needsReview:
+            Image(systemName: "exclamationmark.circle.fill").foregroundStyle(.orange)
         case .failed:
             Image(systemName: "exclamationmark.triangle.fill").symbolRenderingMode(.multicolor)
         }
@@ -327,6 +333,7 @@ struct PageRow: View {
         case .pending: String(localized: "not translated")
         case .inProgress: String(localized: "translating")
         case .done: String(localized: "translated")
+        case .needsReview: String(localized: "needs review")
         case .failed: String(localized: "failed")
         }
     }

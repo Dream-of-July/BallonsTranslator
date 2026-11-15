@@ -25,7 +25,20 @@ public final class AppModel {
     }
 
     public enum PageStatus: Sendable {
-        case pending, inProgress, done, failed
+        case pending, inProgress, done, needsReview, failed
+    }
+
+    public enum PagePreview: Hashable, Sendable {
+        case original, detection, cleaned, result
+
+        public func available(on page: Page) -> Bool {
+            switch self {
+            case .original: true
+            case .detection: !page.blocks.isEmpty
+            case .cleaned: page.inpainted != nil
+            case .result: page.result != nil
+            }
+        }
     }
 
     /// An inline, dismissible message with at most one way to fix it.
@@ -61,7 +74,11 @@ public final class AppModel {
     }
     public var selectedBlock: Int?
     public var notice: Notice?
-    public var showsOriginal = false
+    public var preview: PagePreview = .result
+    public var showsOriginal: Bool {
+        get { preview == .original }
+        set { preview = newValue ? .original : .result }
+    }
     /// Multiplier on the fit-to-window scale; 1 shows the whole page.
     public var zoom = 1.0
     /// Profile to show when Settings opens after a "translator not ready" error.
@@ -226,6 +243,7 @@ public final class AppModel {
         if failedPages.contains(page.name) { return .failed }
         // A page of the current run counts as in progress until its result arrives.
         if let run, run.pages.contains(page.name), !finishedInRun.contains(page.name) { return .inProgress }
+        if page.result != nil, page.reviewCount > 0 { return .needsReview }
         return page.done ? .done : .pending
     }
 
