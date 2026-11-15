@@ -1,0 +1,130 @@
+/* Window, menus, toolbar */
+"Manga Translator" = "漫画翻译";
+"Open…" = "打开…";
+"Open" = "打开";
+"Open a folder of pages" = "打开漫画文件夹";
+"Export…" = "导出…";
+"Export" = "导出";
+"Export translated pages" = "导出译图";
+"Choose where to save the translated pages." = "选择译图的存放位置。";
+"Show Inspector" = "显示检查器";
+"Hide Inspector" = "隐藏检查器";
+"Inspector" = "检查器";
+"Show Original" = "显示原图";
+"Zoom In" = "放大";
+"Zoom Out" = "缩小";
+"Zoom to Fit" = "缩放到适合大小";
+"Translate" = "翻译";
+"Translate all pages" = "翻译全部页面";
+"Translate This Page" = "翻译此页";
+"Stop" = "停止";
+"Stop translating" = "停止翻译";
+"Stopping…" = "正在停止…";
+"From" = "原文语言";
+"To" = "译文语言";
+"Languages" = "语言";
+"Service" = "翻译服务";
+"Translation service" = "翻译服务";
+"Add Service…" = "添加服务…";
+"%lld of %lld pages translated" = "已翻译 %1$lld / %2$lld 页";
+
+/* Start screen and engine status */
+"Drop a folder of pages" = "拖入漫画文件夹";
+"Opening…" = "正在打开…";
+"Starting engine…" = "正在启动引擎…";
+"Show Log" = "显示日志";
+"Restart Engine" = "重启引擎";
+
+/* Sidebar */
+"Page %lld, %@" = "第 %1$lld 页,%2$@";
+"not translated" = "未翻译";
+"translating" = "翻译中";
+"translated" = "已翻译";
+"failed" = "失败";
+
+/* Page */
+"No Page Selected" = "未选择页面";
+"Open Settings" = "打开设置";
+"Dismiss" = "关闭";
+"Finding text" = "检测文字";
+"Reading text" = "识别文字";
+"Translating" = "翻译";
+"Cleaning pages" = "擦除原文";
+"Getting ready…" = "正在准备…";
+"Updating page" = "正在更新页面";
+"Original" = "原图";
+"Show the untranslated page" = "查看未翻译的原图";
+
+/* Inspector */
+"Select a bubble to edit" = "选中气泡即可编辑";
+"Apply" = "应用";
+"Text" = "文字";
+"Font" = "字体";
+"Size" = "字号";
+"Style" = "样式";
+"Bold" = "粗体";
+"Italic" = "斜体";
+"Alignment" = "对齐";
+"Left" = "左对齐";
+"Center" = "居中";
+"Right" = "右对齐";
+"Color" = "颜色";
+"Auto-Fit" = "自动排版";
+"Fit the text to its bubble again" = "让文字重新适应气泡";
+"Delete" = "删除";
+"Added" = "已添加";
+"System" = "系统";
+
+/* Settings */
+"Translation" = "翻译";
+"Output" = "输出";
+"Engine" = "引擎";
+"Engine Not Running" = "引擎未运行";
+"Add Service" = "添加服务";
+"Remove Service" = "移除服务";
+"Works without an account." = "无需账号即可使用。";
+"Use for Translation" = "用于翻译";
+"In use" = "使用中";
+"Name" = "名称";
+"Base URL" = "接口地址";
+"Model" = "模型";
+"Choose Model" = "选择模型";
+"API Key" = "API Key";
+"Remove Key" = "移除密钥";
+"Remove the saved key" = "移除已保存的密钥";
+"Test Connection" = "测试连接";
+"Testing…" = "正在测试…";
+"Saved" = "已保存";
+"Required" = "必填";
+"Optional" = "选填";
+"Format" = "格式";
+"Quality" = "质量";
+"Status" = "状态";
+"Version" = "版本";
+"Device" = "设备";
+"Models" = "模型";
+"Downloaded on first use" = "首次使用时下载";
+"Location" = "位置";
+"Engine Folder" = "引擎文件夹";
+"Python" = "Python";
+"Automatic" = "自动";
+"Choose…" = "选择…";
+"Starting…" = "正在启动…";
+"Running" = "运行中";
+"Apple GPU" = "Apple GPU";
+"Not installed yet" = "尚未安装";
+"Copy" = "拷贝";
+"Done" = "完成";
+
+/* Messages */
+"The engine and the app are different versions." = "引擎与应用的版本不一致。";
+"1 page couldn't be translated." = "1 页未能翻译。";
+"%lld pages couldn't be translated." = "%lld 页未能翻译。";
+"The engine quit unexpectedly." = "引擎意外退出。";
+"The engine is not running." = "引擎未运行。";
+"The engine sent an unexpected reply." = "引擎返回了无法识别的内容。";
+"Drop a folder or image files." = "请拖入文件夹或图片。";
+"Nothing to export yet." = "还没有可导出的译图。";
+"Can't find the translation engine. Set its location in Settings." = "找不到翻译引擎,请在设置中指定位置。";
+"No engine in %@." = "%@ 中没有引擎。";
+"Python not found at %@." = "找不到 Python:%@";
