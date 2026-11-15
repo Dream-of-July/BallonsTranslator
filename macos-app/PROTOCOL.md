@@ -32,7 +32,10 @@ same commit as either side.
 
 ### `hello` → engine and environment status
 Result: `{"protocol": 1, "engine_version": "1.5.21", "device": "mps"|"cpu"|"cuda"|null,
-"torch_installed": bool, "models_ready": bool}`.
+"torch_installed": bool, "models_ready": bool,
+"capabilities": ["keep_original", "vision_probe"]}`.
+`capabilities` lists supported optional protocol features. `vision_probe` advertises
+the separate image-capability check and the measured `Profile.vision` field.
 `models_ready` is false when the selected detector/OCR/inpainter still need a download
 or package install; the first `run` will then emit `prepare_progress` events.
 Sent by the app first; the engine may take several seconds to answer (imports).
@@ -72,7 +75,7 @@ Requests a stop. Takes effect between stages/pages; `run_finished` follows with
 `"cancelled": true`.
 
 ### `update_blocks` `{page, edits: [{index, source_text?, translation?, rect?, angle?, font_family?,
-font_size?, color?, alignment?, bold?, italic?}], autofit?: bool}` → Page
+font_size?, color?, alignment?, bold?, italic?, keep_original?}], autofit?: bool}` → Page
 Applies the edits, re-renders **that page only**, saves the project and the result
 image, and returns the updated Page (new `revision`). `autofit: true` re-runs the
 engine's automatic layout for the edited blocks (may change their `rect` and
@@ -80,11 +83,11 @@ engine's automatic layout for the edited blocks (may change their `rect` and
 progress (`busy`).
 `source_text` records a manual OCR correction. A Japanese page analysed by the
 native engine keeps its independently evaluated cleanup mask through edits.
-`keep_original` (optional bool in an edit; **not implemented by the Python engine yet**):
+`keep_original` (implemented; optional bool in an edit):
 `true` leaves a withheld block untranslated on purpose, so its `review_reason` becomes
 `protected` and the source pixels stay; `false` withdraws that and the block is evaluated
-again. An engine that accepts the field lists `"keep_original"` in an optional
-`capabilities` string array of its `hello` result; the app offers the action only then.
+again. The engine lists `"keep_original"` in the `capabilities` string array of its
+`hello` result; the app offers the action only then.
 
 ### `delete_blocks` `{page, indexes: [int…]}` → Page
 Removes blocks (their text is no longer drawn) and re-renders.
@@ -102,7 +105,10 @@ Removes blocks (their text is no longer drawn) and re-renders.
  "output": {"format": ".png"|".jpg"|".webp", "quality": int}}
 ```
 `Profile`: `{"id", "name", "base_url", "model", "model_options": [str…],
-"require_api_key": bool, "has_api_key": bool}` — the key itself is never sent.
+"require_api_key": bool, "has_api_key": bool, "vision": "yes"|"no"|"unknown"}` —
+the key itself is never sent. `vision` is the persisted measurement from
+`probe_vision`, never a provider-template guess. New and older unmeasured profiles
+report `unknown`.
 
 ### `set_settings` `{source_language?, target_language?, translator?: {"kind": "google"}
 | {"kind": "llm", "profile_id"}, output?: {...}}` → Settings
@@ -112,11 +118,32 @@ New LLM profile from a provider template (see `provider_templates`).
 
 ### `update_profile` `{id, name?, base_url?, model?, api_key?}` → Profile
 `api_key` is write-only; pass `""` to clear it.
+Changing `base_url` or `model` resets the vision measurement to `unknown`.
 
 ### `delete_profile` `{id}` → Settings
 
 ### `test_profile` `{id}` → `{"ok": bool, "message": str, "kind": str, "models": [str…]}`
 Network call on a worker thread; other requests keep being served meanwhile.
+This connection check does not send an image.
+
+### `probe_vision` `{profile_id}` → `{"vision": "yes"|"no"}`
+Runs on a worker thread using the existing connection-test request path and its
+15-second timeout. Sends exactly one chat request with a small synthetic image
+generated in memory; no user image or disk file is used. Uses `vision_model` if
+configured, otherwise `model`, and disables thinking when the profile allows it.
+Only a reply containing the exact random four digits drawn in the image yields
+`yes`; a wrong/empty reply or image request rejection (HTTP 400/415/422) yields `no`.
+The result survives restart and synchronizes the profile's `support_vision` flag.
+
+Authentication, network, timeout and other connection failures return the same
+failure result shape as `test_profile`:
+`{"ok": false, "message": "Connection failed.", "kind": str, "models": []}`.
+They leave the stored measurement unchanged. Raw provider errors are never returned.
+Invalid parameters and missing profiles use the usual protocol `error` envelope.
+If the profile's endpoint/model changes during a probe, its result is discarded
+with `error.code = "busy"`; a deleted profile returns `not_found`.
+Translation and OCR keep their existing local-image behavior; this method alone
+explicitly sends the synthetic probe image.
 
 ### `export` `{destination, what: "images"|"translation_txt"|"source_txt"}` → `{"files": [path…]}`
 `images` copies every existing result image into `destination` (created if needed),

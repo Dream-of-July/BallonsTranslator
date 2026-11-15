@@ -256,6 +256,7 @@ class LLMProfile(Config):
     model_options: List[str] = field(default_factory=list)
     support_text: bool = True
     support_vision: bool = False
+    vision_probe_result: Optional[bool] = None
     vision_model: str = ""
     vision_model_options: List[str] = field(default_factory=list)
     vision_detail_level: str = "None"
