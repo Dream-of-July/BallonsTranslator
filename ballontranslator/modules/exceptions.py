@@ -8,6 +8,10 @@ class LLMUserActionRequiredError(Exception):
     True
     """
 
+    # Unknown failures remain run-level until explicitly classified as local
+    # to a response, rather than a setup problem affecting every page.
+    stops_pipeline: bool = True
+
 
 class CodexSignInRequiredError(LLMUserActionRequiredError):
     """Require explicit ChatGPT sign-in without exposing provider diagnostics.
@@ -119,6 +123,8 @@ class LLMOutputLimitError(LLMUserActionRequiredError):
     True
     """
 
+    stops_pipeline: bool = False
+
     def __init__(
         self,
         profile_id: str,
@@ -147,6 +153,10 @@ class LLMMemoryCompactionError(LLMUserActionRequiredError):
     >>> 'after 3 attempts' in str(error)
     True
     """
+
+    # A failed request leaves committed memory unchanged; a later page can
+    # attempt compaction again without requiring a configuration change.
+    stops_pipeline: bool = False
 
     def __init__(
         self,

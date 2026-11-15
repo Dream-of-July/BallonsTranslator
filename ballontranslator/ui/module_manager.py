@@ -1,5 +1,6 @@
 import threading
 import time
+from copy import deepcopy
 from typing import Callable, List, Optional, Union
 import os.path as osp
 
@@ -674,7 +675,7 @@ class TranslateThread(ModuleThread):
                 page_key,
                 self.tr('Page'),
             )
-            if self.pipeline_stop_event is not None:
+            if e.stops_pipeline and self.pipeline_stop_event is not None:
                 self.pipeline_stop_event.set()
         except LLMRequestStopped:
             success = False
@@ -916,7 +917,8 @@ class ImgtransThread(QThread):
                 page_key,
                 self.tr('Page'),
             )
-            self.requestStop()
+            if e.stops_pipeline:
+                self.requestStop()
         except LLMRequestStopped:
             LOGGER.info('Translation stopped by user.')
         except Exception as e:
@@ -1139,13 +1141,31 @@ class ImgtransThread(QThread):
                 # Detection can replace or reorder blocks, so old translations
                 # are never compatible even if detection later fails.
                 self.imgtrans_proj.begin_detection(imgname)
+                need_save_mask = manga_quality is None
                 try:
                     mask, blk_list = self.textdetector.detect(img, self.imgtrans_proj)
                     if manga_quality is not None:
-                        mask, blk_list = manga_quality.enhance_detection(
-                            img, mask, blk_list, self.textdetector, self.isStopRequested,
-                        )
-                    need_save_mask = manga_quality is None
+                        try:
+                            # Enhancement mutates blocks, but copies its mask.
+                            # Commit only a complete result so fallback retains
+                            # the detector's own blocks and mask.
+                            mask, blk_list = manga_quality.enhance_detection(
+                                img, mask, deepcopy(blk_list), self.textdetector, self.isStopRequested,
+                            )
+                        except (LLMUserActionRequiredError, LLMRequestStopped, ModuleRunError):
+                            raise
+                        except Exception as e:
+                            _create_page_error_dialog(
+                                e,
+                                self.tr('Detection enhancement failed.'),
+                                'MangaDetectionEnhancementFailed',
+                                imgname,
+                                self.tr('Page'),
+                            )
+                            need_save_mask = True
+                except LLMRequestStopped:
+                    self.requestStop()
+                    break
                 except ModuleRunError as e:
                     self._stop_on_stage_failure(
                         e,
@@ -1153,6 +1173,8 @@ class ImgtransThread(QThread):
                         'TextDetectFailed',
                         imgname,
                     )
+                    break
+                if self.isStopRequested():
                     break
                 self.detect_counter += 1
                 if pcfg.module.keep_exist_textlines:
@@ -1190,7 +1212,24 @@ class ImgtransThread(QThread):
                     if isinstance(ocr_result, list):
                         blk_list = ocr_result
                     if manga_quality is not None and not self.isStopRequested():
-                        manga_quality.retry_uncertain_ocr(img, blk_list, self.ocr)
+                        try:
+                            # Retry may update several blocks before failing;
+                            # preserve the complete plain OCR result on failure.
+                            retried_blocks = deepcopy(blk_list)
+                            manga_quality.retry_uncertain_ocr(img, retried_blocks, self.ocr)
+                            blk_list = retried_blocks
+                        except (LLMUserActionRequiredError, LLMRequestStopped, ModuleRunError):
+                            raise
+                        except Exception as e:
+                            _create_page_error_dialog(
+                                e,
+                                self.tr('OCR refinement failed.'),
+                                'MangaOCRRefinementFailed',
+                                imgname,
+                                self.tr('Page'),
+                            )
+                    if self.isStopRequested():
+                        break
                     self.imgtrans_proj.pages[imgname] = blk_list
                     self.ocr_counter += 1
 
