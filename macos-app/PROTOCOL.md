@@ -210,6 +210,7 @@ keeping file names. Text exports write one file into `destination`.
 
 ## Engine notes
 
+- `BALLOONTRANS_ENHANCE_DEBUG_DIR`: opt-in existing directory for one text-only JSON diagnostic per page (request text, raw model reply, parsed verdicts and block actions; no images, credentials or headers); unset by default.
 - On macOS the engine pins Qt's offscreen font DPI to 72 and sets `shared.LDPI`
   from that screen. Both sides of the px/pt conversion must agree; changing only
   `LDPI` changes glyph size. This matches the normal Cocoa 72-DPI point convention

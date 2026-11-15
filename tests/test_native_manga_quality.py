@@ -88,6 +88,51 @@ def test_overflow_keeps_original_pixels_and_translation_draft():
     assert block.manga_review == 'overflow'
 
 
+@pytest.mark.parametrize('source', ['…', '……', '!?', ' — -- ♡ ★ \t', ' \t\n'])
+@pytest.mark.parametrize('keep_original', [False, True])
+def test_symbols_only_source_keeps_original_and_is_not_a_review_item(source, keep_original):
+    from ballontranslator.engine.manga_quality import identify_regions, prepare_background, compose_page
+
+    image, mask, merged = comic_page()
+    block = identify_regions(image, [merged])[0]
+    block.text, block.translation = [source], source
+    block.manga_keep_original = keep_original
+    draft = prepare_background(image, mask, [block], None)
+    cleaned, result, applied = compose_page(image, draft, [block])
+    assert block.manga_review == ('protected' if keep_original else 'skipped')
+    assert np.array_equal(cleaned, image) and np.array_equal(result, image)
+    assert not applied.any()
+
+
+def test_symbols_only_source_ink_is_preserved_when_another_block_overlaps():
+    import copy
+    from ballontranslator.engine.manga_quality import identify_regions, prepare_background, compose_page
+
+    image, mask, merged = comic_page()
+    block = identify_regions(image, [merged])[0]
+    other = copy.deepcopy(block)
+    block.text, block.translation = ['…'], '…'
+    other.text, other.translation = ['原文'], '中文'
+    draft = prepare_background(image, mask, [block, other], None)
+    cleaned, result, applied = compose_page(image, draft, [block, other])
+    assert block.manga_review == 'skipped'
+    assert other.manga_review == 'geometry'
+    assert np.array_equal(cleaned, image) and np.array_equal(result, image)
+    assert not applied.any()
+
+
+@pytest.mark.parametrize('source', ['', 'あ…', 'カ!?', '漢字…', 'A—', '1!', '１?', 'é…'])
+def test_empty_ocr_or_source_with_letters_and_digits_still_needs_review(source):
+    from ballontranslator.engine.manga_quality import identify_regions, prepare_background, compose_page
+
+    image, mask, merged = comic_page()
+    block = identify_regions(image, [merged])[0]
+    block.text, block.translation = [source], source
+    draft = prepare_background(image, mask, [block], None)
+    compose_page(image, draft, [block])
+    assert block.manga_review == ('unreadable' if not source else 'untranslated')
+
+
 def test_user_protected_block_precedes_unreadable_review_and_can_be_released():
     from ballontranslator.engine.manga_quality import identify_regions, prepare_background, compose_page
 

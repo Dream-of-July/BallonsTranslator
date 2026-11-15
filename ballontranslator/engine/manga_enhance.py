@@ -3,10 +3,13 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import threading
 import time
 from collections.abc import Callable
+from pathlib import Path
 from typing import TYPE_CHECKING
+from uuid import uuid4
 
 import cv2
 import numpy as np
@@ -36,7 +39,12 @@ Return only strict JSON: {"blocks":[{"index":0,"is_dialogue":true,
 For every supplied index, is_dialogue means readable language intended to be read,
 including narration, excluding sound effects, artwork and signatures.
 Read only the original crop for corrected_text: exact source-language text, never a
-translation or a guess. Leave it empty if unchanged, uncertain or not dialogue.
+translation or a guess. If OCR is empty or wrong and ORIGINAL contains readable
+text, corrected_text MUST contain its exact transcription and source_text_correct
+MUST be false. Empty OCR is not an unchanged transcription of readable text.
+Use each block's orientation hint (vertical/horizontal) to read the original.
+Leave corrected_text empty only if OCR is correct, text is uncertain, or there is
+no readable language intended to be read.
 residue means original lettering remains visible in RESULT. legible means the new
 translation is easy to read. Do not invent indexes or missing text.'''
 
@@ -57,10 +65,11 @@ def suspicious_blocks(blocks: list[TextBlock]) -> list[int]:
     [0]
     """
     skipped = sorted((i for i, b in enumerate(blocks) if b.manga_review == 'skipped'
-                      and not b.manga_keep_original),
+                      and not b.manga_keep_original and not quality.symbols_only(b)),
                      key=lambda i: max(0, blocks[i].xyxy[2] - blocks[i].xyxy[0])
                      * max(0, blocks[i].xyxy[3] - blocks[i].xyxy[1]), reverse=True)[:6]
-    hard = [i for i, b in enumerate(blocks) if not b.manga_keep_original and (
+    hard = [i for i, b in enumerate(blocks) if not b.manga_keep_original
+        and not quality.symbols_only(b) and (
         b.manga_review in {'unreadable', 'geometry', 'overflow', 'untranslated'}
         or b.manga_review is None and (
             b.manga_complex_background or b.manga_residue_retried or b.manga_outline_applied
@@ -110,6 +119,20 @@ def _parse(content: str, indexes: list[int]) -> dict[int, dict]:
     if not accepted:
         raise ValueError('No valid enhance advice.')
     return accepted
+
+
+def _write_debug(directory: str, diagnostic: dict) -> None:
+    """Best-effort text-only diagnostics; never create the requested directory."""
+    if not directory:
+        return
+    try:
+        root = Path(directory)
+        if root.is_dir():
+            with (root / f'enhance-page-{uuid4().hex}.json').open('x', encoding='utf-8') as stream:
+                json.dump(diagnostic, stream, ensure_ascii=False, indent=2)
+    except (OSError, ValueError, TypeError, RuntimeError):
+        # Optional diagnostics must not change the page result or expose paths.
+        pass
 
 
 class EnhanceRequester(LLMChatRequester):
@@ -178,10 +201,16 @@ class EnhanceSession:
         translator: BaseTranslator | None, compose: ComposePage,
     ) -> tuple[np.ndarray, PageImages]:
         indexes = suspicious_blocks(blocks) if self.profile is not None else []
+        debug_dir = os.environ.get('BALLOONTRANS_ENHANCE_DEBUG_DIR', '')
+        diagnostic = {'page': self.completed + 1, 'requests': [], 'blocks': {
+            index: {'review_before': blocks[index].manga_review, 'action': 'unchanged'}
+            for index in indexes}, 'outcome': 'unchanged'} if debug_dir else None
         if not indexes:
             self.completed += 1
             if self.profile is not None:
                 self.log('Enhance: checked=0 corrected=0 re-erased=0 restyled=0 non-dialogue=0 abandoned=0.')
+            if diagnostic is not None:
+                _write_debug(debug_dir, diagnostic)
             return draft, normal
         self.emit(dict(event='stage_progress', stage='enhance', done=self.completed, total=None))
         requester = EnhanceRequester(self.params)
@@ -203,28 +232,49 @@ class EnhanceSession:
                         block = snapshots[index]
                         parts.append({'type': 'text', 'text': json.dumps({
                             'index': index, 'ocr_source': block.get_text(),
-                            'translation': block.translation}, ensure_ascii=False)})
+                            'translation': block.translation,
+                            'orientation': 'vertical' if block.src_is_vertical else 'horizontal',
+                            'inside_bubble': quality._inside_bubble(block, image.shape[:2])},
+                            ensure_ascii=False)})
                         for label, pixels in (('ORIGINAL', image), ('RESULT', normal[1])):
                             parts.append({'type': 'text', 'text': f'Index {index} {label}'})
                             parts.append(encode_chat_image(_crop(pixels, block),
                                 detail=self.profile.vision_detail_level).image_part())
                     model = self.profile.vision_model.strip() or self.profile.model.strip()
+                    record = None
+                    if diagnostic is not None:
+                        # Allowlist text parts; never retain images or transport args.
+                        record = {'request_text': [PROMPT] + [p['text'] for p in parts if p['type'] == 'text'],
+                                  'raw_reply': None, 'verdicts': {}}
+                        diagnostic['requests'].append(record)
                     result = request.request_chat_completion(self.profile, {
                         'model': model, 'messages': [{'role': 'system', 'content': PROMPT},
                                                     {'role': 'user', 'content': parts}],
                         'response_format': openai_json_response_format(self.profile, 'manga_review', _SCHEMA),
                         **openai_chat_completion_args(self.profile, model)})
-                    advice.update(_parse(result.content, batch))
+                    if record is not None:
+                        record['raw_reply'] = result.content
+                    parsed = _parse(result.content, batch)
+                    if record is not None:
+                        record['verdicts'] = {i: {key: item[key] for key in _FIELDS}
+                                              for i, item in parsed.items()}
+                    advice.update(parsed)
                 candidates = copy.deepcopy(snapshots)
                 corrected, erased, styled, skipped, changed = set(), set(), set(), set(), set()
                 for index, item in advice.items():
                     block = candidates[index]
-                    if not item['is_dialogue']:
+                    inside_bubble = quality._inside_bubble(block, image.shape[:2])
+                    if not item['is_dialogue'] and not inside_bubble:
                         block.manga_non_dialogue = True
                         skipped.add(index)
                         changed.add(index)
                         continue
                     text = item['corrected_text']
+                    # In-bubble review reasons survive a negative verdict unless
+                    # a source correction can pass translation and composition.
+                    if (not item['is_dialogue'] and inside_bubble and block.manga_review is not None
+                            and not (text.strip() and text != block.get_text())):
+                        continue
                     if text.strip() and text != block.get_text():
                         block.text, block.rich_text = [text], ''
                         block.manga_partial = False
@@ -332,6 +382,15 @@ class EnhanceSession:
                     candidates[index] = snapshots[index]
                 counts = (len(indexes), len(corrected & accepted), len(erased & accepted),
                           len(styled & accepted), len(skipped & accepted), abandoned + len(rejected))
+                if diagnostic is not None:
+                    for index in indexes:
+                        entry = diagnostic['blocks'][index]
+                        entry['action'] = ('rejected' if index in rejected else
+                            'applied' if index in accepted else 'unchanged')
+                        entry['changes'] = [name for name, group in (
+                            ('corrected', corrected), ('re-erased', erased),
+                            ('restyled', styled), ('skipped', skipped))
+                            if index in group and index in accepted]
                 return next_draft, output, candidates, counts
             finally:
                 # Transport teardown may block; the outer deadline also bounds it.
@@ -341,13 +400,23 @@ class EnhanceSession:
             if stop.is_set():
                 raise LLMRequestStopped()
             blocks[:] = candidates
+            if diagnostic is not None:
+                diagnostic['outcome'] = 'completed'
             self.log('Enhance: checked=%d corrected=%d re-erased=%d restyled=%d non-dialogue=%d abandoned=%d.' % counts)
             return next_draft, output
         except Exception as error:
             # Never forward exception messages, OCR, paths, profile names or HTTP bodies.
             reason = 'cancelled' if isinstance(error, LLMRequestStopped) else 'timeout' if isinstance(error, TimeoutError) else 'review failed'
+            if diagnostic is not None:
+                diagnostic['outcome'] = reason
+                for entry in diagnostic['blocks'].values():
+                    entry['action'], entry['changes'] = 'unchanged', []
             self.log(f'Enhance skipped: {reason}; checked={len(indexes)} corrected=0 re-erased=0 restyled=0 non-dialogue=0 abandoned={len(indexes)}.')
             return draft, normal
         finally:
+            if diagnostic is not None:
+                for index in indexes:
+                    diagnostic['blocks'][index]['review_after'] = blocks[index].manga_review
+                _write_debug(debug_dir, diagnostic)
             self.completed += 1
             self.emit(dict(event='stage_progress', stage='enhance', done=self.completed, total=None))

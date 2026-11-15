@@ -6,6 +6,7 @@ import os
 import socket
 import threading
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -212,12 +213,14 @@ def test_selection_caps_and_only_suspicious_crops():
     assert all(args['response_format']['type'] == 'json_schema' for _, args in payloads)
 
 
-def test_corrected_unreadable_is_retranslated_and_drawn():
+@pytest.mark.parametrize('is_dialogue', [True, False])
+def test_corrected_unreadable_is_retranslated_and_drawn(is_dialogue):
     data = page(unreadable=True)
     run, events = session()
     Translator.calls.clear()
     with patch.object(enhance.EnhanceRequester, 'request_chat_completion',
-                      return_value=response([reply(0) | {'corrected_text': '修正文', 'source_text_correct': False}])):
+                      return_value=response([reply(0) | {'is_dialogue': is_dialogue,
+                          'corrected_text': '修正文', 'source_text_correct': False}])):
         _, output = process(run, data)
     block = data[2][0]
     assert Translator.calls == [['修正文']]
@@ -229,6 +232,9 @@ def test_corrected_unreadable_is_retranslated_and_drawn():
 
 def test_not_dialogue_preserves_original_and_marks_skipped():
     data = page(unreadable=True)
+    block = data[2][0]
+    block.manga_area = quality._plain_area(block, data[0].shape[1], data[0].shape[0])
+    assert not quality._inside_bubble(block, data[0].shape[:2])
     run, _ = session()
     with patch.object(enhance.EnhanceRequester, 'request_chat_completion',
                       return_value=response([reply(0) | {'is_dialogue': False}])):
@@ -237,6 +243,147 @@ def test_not_dialogue_preserves_original_and_marks_skipped():
     assert data[2][0].manga_non_dialogue
     assert np.array_equal(output[1][:, 120:], data[0][:, 120:])
     assert quality.source_review(data[2][0]) == 'skipped'
+
+
+@pytest.mark.parametrize('unreadable', [True, False])
+@pytest.mark.parametrize('tier', ['pale', 'nonwhite'])
+def test_in_bubble_negative_verdict_preserves_review_and_drawn_pixels(unreadable, tier):
+    if tier == 'pale':
+        data = page(unreadable=unreadable)
+    else:
+        import cv2
+        y, x = np.indices((240, 320))
+        art = np.stack((35 + x * .2, 55 + y * .15, 70 + x * .1), axis=2).astype(np.uint8)
+        image = art.copy()
+        bubble = np.zeros(image.shape[:2], np.uint8)
+        cv2.ellipse(bubble, (105, 120), (66, 78), 0, 0, 360, 255, -1)
+        image[bubble != 0] = ((art[bubble != 0].astype(float) + 255) * .5).astype(np.uint8)
+        cv2.ellipse(image, (105, 120), (66, 78), 0, 0, 360, (15, 15, 15), 3)
+        cv2.rectangle(image, (98, 96), (110, 143), (8, 8, 8), -1)
+        line = [[92, 90], [116, 90], [116, 149], [92, 149]]
+        block = quality.identify_regions(image, [TextBlock(
+            xyxy=[92, 90, 116, 149], lines=[line], _detected_font_size=24,
+            text=['' if unreadable else '原文'], translation='中文')])[0]
+        mask = np.zeros(image.shape[:2], np.uint8)
+        mask[96:144, 98:111] = 255
+        draft = quality.prepare_background(image, mask, [block], None)
+        data = image, draft, [block], quality.compose_page(image, draft, [block])
+    block = data[2][0]
+    assert quality._inside_bubble(block, data[0].shape[:2])
+    assert block.manga_review == ('unreadable' if unreadable else None)
+    if not unreadable:
+        block.manga_complex_background = True
+    before = json_dump_nested_obj(data[2])
+    run, _ = session()
+    with patch.object(enhance.EnhanceRequester, 'request_chat_completion',
+                      return_value=response([reply(0) | {'is_dialogue': False}])):
+        draft, output = process(run, data)
+    assert draft is data[1] and output is data[3]
+    assert json_dump_nested_obj(data[2]) == before
+    assert not block.manga_non_dialogue
+
+
+@pytest.mark.parametrize('source', ['…', '……', '!?', ' — -- ♡ ★ \t', ' \t\n'])
+def test_symbols_only_are_skipped_and_never_sent(source):
+    image, draft, blocks, _ = page()
+    blocks[0].text, blocks[0].translation = [source], source
+    normal = quality.compose_page(image, draft, blocks)
+    assert blocks[0].manga_review == 'skipped'
+    blocks[0].manga_complex_background = True
+    blocks[0].manga_line_confidence = [.1]
+    assert 0 not in enhance.suspicious_blocks(blocks)
+    assert np.array_equal(normal[1][:, 120:], image[:, 120:])
+    run, _ = session()
+    with patch.object(enhance, 'encode_chat_image') as encode, \
+            patch.object(enhance.EnhanceRequester, 'request_chat_completion') as request:
+        process(run, (image, draft, blocks, normal))
+    encode.assert_not_called()
+    request.assert_not_called()
+    blocks[0].manga_review = 'untranslated'
+    assert 0 not in enhance.suspicious_blocks(blocks)
+
+
+@pytest.mark.parametrize('vertical', [True, False])
+def test_request_explains_empty_ocr_and_sends_detected_orientation(vertical):
+    data = page(unreadable=True)
+    data[2][0].src_is_vertical = vertical
+    run, _ = session()
+    with patch.object(enhance.EnhanceRequester, 'request_chat_completion',
+                      return_value=response([reply(0)])) as request:
+        process(run, data)
+    args = request.call_args.args[1]
+    prompt = args['messages'][0]['content']
+    assert 'OCR is empty or wrong' in prompt
+    assert 'source_text_correct\nMUST be false' in prompt
+    hint = json.loads(args['messages'][1]['content'][0]['text'])
+    assert hint['ocr_source'] == ''
+    assert hint['orientation'] == ('vertical' if vertical else 'horizontal')
+    assert hint['inside_bubble'] is True
+
+
+@pytest.mark.parametrize('mode', ['unset', 'missing', 'existing', 'unwritable'])
+def test_debug_output_is_opt_in_text_only_and_does_not_change_result(tmp_path, monkeypatch, mode):
+    monkeypatch.delenv('BALLOONTRANS_ENHANCE_DEBUG_DIR', raising=False)
+    directory = tmp_path / 'diagnostics'
+    if mode != 'unset':
+        monkeypatch.setenv('BALLOONTRANS_ENHANCE_DEBUG_DIR', str(directory))
+    if mode in {'existing', 'unwritable'}:
+        directory.mkdir()
+    data = page(unreadable=True)
+    run, _ = session()
+    raw = response([reply(0) | {'is_dialogue': False}])
+    with patch.object(enhance.EnhanceRequester, 'request_chat_completion', return_value=raw), \
+            patch.object(Path, 'open', side_effect=OSError) if mode == 'unwritable' else \
+            nullcontext():
+        _, output = process(run, data)
+    assert output is data[3] and data[2][0].manga_review == 'unreadable'
+    files = list(tmp_path.rglob('*.json'))
+    if mode != 'existing':
+        assert not files
+        if mode == 'missing':
+            assert not directory.exists()
+        return
+    assert len(files) == 1
+    text = files[0].read_text()
+    diagnostic = json.loads(text)
+    record = diagnostic['requests'][0]
+    assert record['raw_reply'] == raw.content
+    assert record['verdicts']['0']['is_dialogue'] is False
+    assert json.loads(record['request_text'][1])['ocr_source'] == ''
+    assert diagnostic['blocks']['0'] == {
+        'review_before': 'unreadable', 'action': 'unchanged', 'review_after': 'unreadable'}
+    assert diagnostic['outcome'] == 'completed'
+    assert all(value not in text for value in ('image_url', 'data:image', 'base64', 'headers', 'api_key'))
+
+
+def test_debug_records_applied_correction_and_each_page(tmp_path, monkeypatch):
+    monkeypatch.setenv('BALLOONTRANS_ENHANCE_DEBUG_DIR', str(tmp_path))
+    run, _ = session()
+    with patch.object(enhance.EnhanceRequester, 'request_chat_completion', return_value=response([
+            reply(0) | {'corrected_text': '修正文', 'source_text_correct': False}])):
+        process(run, page(unreadable=True))
+        process(run, page())
+    diagnostics = [json.loads(file.read_text()) for file in tmp_path.glob('*.json')]
+    assert len(diagnostics) == 2
+    corrected = next(d for d in diagnostics if d['requests'])
+    assert corrected['blocks']['0']['action'] == 'applied'
+    assert corrected['blocks']['0']['changes'] == ['corrected']
+    assert corrected['blocks']['0']['review_after'] is None
+
+
+def test_debug_records_invalid_raw_reply_without_changing_fallback(tmp_path, monkeypatch):
+    monkeypatch.setenv('BALLOONTRANS_ENHANCE_DEBUG_DIR', str(tmp_path))
+    run, _ = session()
+    data = page(unreadable=True)
+    with patch.object(enhance.EnhanceRequester, 'request_chat_completion',
+                      return_value=LLMChatResult(content='invalid json')):
+        _, output = process(run, data)
+    assert output is data[3]
+    diagnostic = json.loads(next(tmp_path.glob('*.json')).read_text())
+    assert diagnostic['outcome'] == 'review failed'
+    assert diagnostic['requests'][0]['raw_reply'] == 'invalid json'
+    assert diagnostic['requests'][0]['verdicts'] == {}
+    assert diagnostic['blocks']['0']['action'] == 'unchanged'
 
 
 def test_residue_invokes_widened_repair_and_illegible_forces_outline_backing():
