@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import math
 import os
 import re
 import threading
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
+from typing import Any, Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 import httpx
 
@@ -357,11 +358,11 @@ class LLMChatRequester:
         super().__init__(*args, **kwargs)
         self.client: Any = None
         self.client_cache_key: Optional[
-            Tuple[str, Optional[str], str]
+            Tuple[str, Optional[str], str, float]
         ] = None
         self.last_request_time = 0.0
         self.request_count_minute = 0
-        self.minute_start_time = time.time()
+        self.minute_start_time = time.monotonic()
         self.stop_event: Optional[threading.Event] = None
         self._codex_sessions: Dict[Tuple[str, str, int], CodexChatSession] = {}
         self._openai_session: Optional[OpenAIResponsesSession] = None
@@ -381,6 +382,8 @@ class LLMChatRequester:
         self.stop_event = stop_event
 
     def _wait(self, seconds: float) -> None:
+        if not math.isfinite(seconds):
+            raise ValueError('LLM wait duration must be finite.')
         if seconds <= 0:
             return
         if self.stop_event is not None:
@@ -398,20 +401,99 @@ class LLMChatRequester:
     def _http_client(self, proxy: str) -> Any:
         import httpx  # type: ignore
 
+        seconds = self._request_timeout()
+        timeout = httpx.Timeout(seconds, connect=min(10.0, seconds))
         if not proxy:
-            return httpx.Client()
+            return httpx.Client(timeout=timeout)
         try:
             mounts = {
                 'http://': httpx.HTTPTransport(proxy=proxy),
                 'https://': httpx.HTTPTransport(proxy=proxy),
             }
-            return httpx.Client(mounts=mounts)
+            return httpx.Client(mounts=mounts, timeout=timeout)
         except Exception as error:
             self.logger.error(
                 f"Failed to initialize proxy '{proxy}': {error}. "
                 'Proceeding without proxy.'
             )
-            return httpx.Client()
+            return httpx.Client(timeout=timeout)
+
+    def _request_timeout(self) -> float:
+        """Use the request timeout as a budget, defaulting to 120 seconds.
+
+        >>> LLMChatRequester()._request_timeout()
+        120.0
+        """
+        try:
+            seconds = float(self.get_param_value('request timeout'))
+        except (AttributeError, AssertionError, KeyError, TypeError, ValueError, OverflowError):
+            return 120.0
+        return seconds if math.isfinite(seconds) and seconds > 0 else 120.0
+
+    def _bounded_request(
+        self,
+        request: Callable[[threading.Event], Any],
+        close: Callable[[], None],
+        stop_event: Optional[threading.Event],
+        deadline: float,
+    ) -> Any:
+        """Bound blocking IO, including trickling streams and custom transports.
+
+        HTTPX timeouts bound individual socket operations, not the whole response.
+        An abandoned operation must never write results back into the translator
+        or close a replacement transport. Transport close also stays off the
+        caller because native IO and session teardown can themselves block.
+
+        >>> LLMChatRequester()._bounded_request(
+        ...     lambda cancel: 'ok', lambda: None, None, time.monotonic() + 1)
+        'ok'
+        """
+        self._check_request_current(stop_event)
+        if time.monotonic() >= deadline:
+            raise TimeoutError('The LLM request exceeded its time limit.')
+        done, cancelled = threading.Event(), threading.Event()
+        result: List[Any] = []
+        errors: List[BaseException] = []
+
+        def run() -> None:
+            try:
+                result.append(request(cancelled))
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                done.set()
+
+        def cleanup() -> None:
+            try:
+                close()
+            except Exception:
+                # Transport diagnostics can contain credentials or proxy URLs.
+                self.logger.warning('Could not close the abandoned LLM transport.')
+
+        threading.Thread(target=run, daemon=True, name='LLM request').start()
+        try:
+            while True:
+                self._check_request_current(stop_event)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError('The LLM request exceeded its time limit.')
+                if done.wait(min(0.05, remaining)):
+                    self._check_request_current(stop_event)
+                    break
+        except BaseException as error:
+            cancelled.set()
+            # Close the captured transport now, even if a peer keeps trickling
+            # bytes forever. No retry may reuse this abandoned client/session.
+            threading.Thread(target=cleanup, daemon=True, name='LLM request cleanup').start()
+            # Existing async transports normally finish cancellation and dispose
+            # their loop within a poll. Preserve that lifecycle when possible,
+            # without allowing broken IO/teardown to delay Stop indefinitely.
+            if isinstance(error, LLMRequestStopped):
+                done.wait(0.2)
+            raise
+        if errors:
+            raise errors[0]
+        return result[0]
 
     @staticmethod
     def _api_key_for_profile(profile: LLMProfile) -> str:
@@ -436,7 +518,8 @@ class LLMChatRequester:
         configured_base_url = str(profile.base_url or '').strip()
         base_url = _openai_sdk_base_url(configured_base_url) or None
         proxy = str(self.get_param_value('proxy') or '')
-        cache_key = (api_key, base_url, proxy)
+        timeout = self._request_timeout()
+        cache_key = (api_key, base_url, proxy, timeout)
         if self.client is not None and self.client_cache_key == cache_key:
             return self.client
 
@@ -453,6 +536,9 @@ class LLMChatRequester:
             api_key=api_key,
             base_url=base_url,
             http_client=self._http_client(proxy),
+            timeout=httpx.Timeout(timeout, connect=min(10.0, timeout)),
+            # Translation owns the finite retry budget; do not multiply it in the SDK.
+            max_retries=0,
         )
         self.client_cache_key = cache_key
         if previous_client is not None:
@@ -460,7 +546,7 @@ class LLMChatRequester:
         return self.client
 
     def _respect_delay(self) -> None:
-        current_time = time.time()
+        current_time = time.monotonic()
         rpm = self.get_param_value('max requests per minute')
         delay = self.get_param_value('delay')
         if rpm > 0:
@@ -476,13 +562,13 @@ class LLMChatRequester:
                     )
                     self._wait(wait_time)
                 self.request_count_minute = 0
-                self.minute_start_time = time.time()
+                self.minute_start_time = time.monotonic()
 
         time_since_last_request = current_time - self.last_request_time
         if time_since_last_request < delay:
             self._wait(delay - time_since_last_request)
 
-        self.last_request_time = time.time()
+        self.last_request_time = time.monotonic()
         self.request_count_minute += 1
 
     def _codex_websocket_enabled(self) -> bool:
@@ -526,10 +612,16 @@ class LLMChatRequester:
                 session = self._codex_sessions[identity] = CodexChatSession(
                     cache_key, proxy, account_generation=identity[2], websocket=websocket)
             self._check_request_current(stop_event)
-            result = request_chat_completion(
-                profile, api_args, stop_event,
-                session.cache_key, proxy, session=session, turn=codex_turn,
-            )
+            try:
+                result = self._bounded_request(
+                    lambda cancel: request_chat_completion(
+                        profile, api_args, cancel, session.cache_key, proxy,
+                        session=session, turn=codex_turn),
+                    session.close, stop_event, time.monotonic() + self._request_timeout(),
+                )
+            except TimeoutError:
+                self._codex_sessions.pop(identity, None)
+                raise
             self._check_request_current(stop_event)
             return result
         if profile.backend != 'openai':
@@ -538,6 +630,7 @@ class LLMChatRequester:
         client = self._initialize_client(profile)
         self._respect_delay()
         self._check_request_current(stop_event)
+        deadline = time.monotonic() + self._request_timeout()
         # Only the direct OpenAI endpoint has a known Responses WS contract.
         # Check the SDK's resolved URL, including OPENAI_BASE_URL overrides.
         from .openai_responses import OpenAIResponsesSession
@@ -568,14 +661,27 @@ class LLMChatRequester:
                     str(self.get_param_value('proxy') or ''), headers)
                 self._openai_session_identity = identity
             self._check_request_current(stop_event)
-            result = session.request_chat(api_args, profile, stop_event)
+            try:
+                result = self._bounded_request(
+                    lambda cancel: session.request_chat(api_args, profile, cancel),
+                    session.close, stop_event, deadline,
+                )
+            except TimeoutError:
+                self._openai_session = None
+                raise
             if result is not None:
                 self._check_request_current(stop_event)
                 return result
         self._check_request_current(stop_event)
         try:
-            completion = client.chat.completions.create(**api_args)
+            completion = self._bounded_request(
+                lambda cancel: client.chat.completions.create(**api_args),
+                lambda: client.close(), stop_event, deadline,
+            )
         except Exception as error:
+            if isinstance(error, (TimeoutError, LLMRequestStopped)):
+                self.client = None
+                self.client_cache_key = None
             self._check_request_current(stop_event)
             if isinstance(error, getattr(openai, 'AuthenticationError')):
                 raise LLMAuthenticationError(profile.id, profile.name) from error

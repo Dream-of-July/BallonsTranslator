@@ -4,9 +4,11 @@ from __future__ import annotations
 import copy
 import math
 import importlib.util
+import os
 import shutil
 import sys
 import threading
+import time
 from pathlib import Path
 
 from qtpy.QtCore import QObject, Signal, Slot, Qt, QTimer
@@ -62,6 +64,10 @@ class Server(QObject):
         self.pages: list[str] = []
         self.failed: set[str] = set()
         self.written: set[str] = set()
+        self.stalled = False
+        self.last_progress = time.monotonic()
+        self.stage_counts: dict[str, int] = {}
+        self.preparing: set[QObject] = set()
         self.revisions: dict[str, int] = {}
         self.pending: tuple | None = None
         self.tests: set[threading.Thread] = set()
@@ -80,11 +86,15 @@ class Server(QObject):
             relay.progress.connect(self.stage_progress)
             self.relays.append(relay)
         self.manager.translate_thread.progress_changed.connect(self.relays[2].stage)
-        for name, worker in (('detector', self.manager.textdetect_thread),
-                             ('ocr', self.manager.ocr_thread),
-                             ('translator', self.manager.translate_thread),
-                             ('inpainter', self.manager.inpaint_thread),
-                             ('packages', self.manager.package_install_thread)):
+        self.preparation_workers = {
+            'detector': self.manager.textdetect_thread,
+            'ocr': self.manager.ocr_thread,
+            'translator': self.manager.translate_thread,
+            'inpainter': self.manager.inpaint_thread,
+            'packages': self.manager.package_install_thread,
+        }
+        for name, worker in self.preparation_workers.items():
+            worker.finished.connect(self.preparation_finished)
             relay = Relay(name, self)
             signal = (worker.package_prepare_progress if name == 'packages'
                       else worker.module_prepare_progress)
@@ -106,6 +116,9 @@ class Server(QObject):
         self.poller.setInterval(20)
         self.poller.timeout.connect(self.settle)
         self.poller.start()
+        self.watchdog = QTimer(self)
+        self.watchdog.setInterval(100)
+        self.watchdog.timeout.connect(self.check_stall)
 
     @property
     def project(self) -> object:
@@ -301,6 +314,15 @@ class Server(QObject):
         if mode == 'continue':
             self.pages = [p for p in self.pages if not self.project.get_page_progress(p)]
         self.active, self.cancelled, self.finishing = True, False, False
+        self.stalled = False
+        self.last_progress = time.monotonic()
+        self.stage_counts.clear()
+        try:
+            seconds = float(os.environ.get('BALLOONTRANS_ENGINE_STALL_SECONDS', '600'))
+        except (ValueError, OverflowError):
+            seconds = 600.0
+        self.stall_seconds = seconds if math.isfinite(seconds) and seconds > 0 else 600.0
+        self.watchdog.start()
         self.failed.clear()
         self.written.clear()
         try:
@@ -312,6 +334,7 @@ class Server(QObject):
                 self.finishing = True
         except Exception:
             self.active = False
+            self.watchdog.stop()
             raise
         return {'started': True}
 
@@ -335,13 +358,49 @@ class Server(QObject):
         if self.active:
             self.finishing = True
 
+    @Slot()
+    def preparation_finished(self) -> None:
+        self.preparing.discard(self.sender())
+
+    @Slot()
+    def check_stall(self) -> None:
+        if not self.active or self.stalled or self.cancelled:
+            return
+        # Pending callbacks cover silent initial imports/model loads, including
+        # the gaps between queued preparation workers. An inference worker alone
+        # must not suppress this watchdog (notably parallel translation).
+        preparing = (self.manager.package_install_thread.isRunning()
+                     or any(worker.isRunning() for worker in self.preparing)
+                     or self.manager._pending_prepare_success is not None
+                     or self.manager._pending_prepare_failure is not None
+                     or self.manager._pending_batch_package_success is not None
+                     or self.manager._pending_batch_package_failure is not None)
+        now = time.monotonic()
+        if preparing:
+            self.last_progress = now
+        elif now - self.last_progress >= self.stall_seconds:
+            self.stalled = True
+            self.failed.update(page for page in self.pages if page not in self.written)
+            self.writer.send(dict(event='error', message='The run stopped because a stage stopped responding.'))
+            self.cancel({})
+            # This is a failed run, rather than a user cancellation. Keep the
+            # usual worker/save drain so a following run cannot race old work.
+            self.cancelled = False
+            self.watchdog.stop()
+
     @Slot(str, int)
     def stage_progress(self, stage: str, done: int) -> None:
         if self.active:
+            if done > self.stage_counts.get(stage, -1):
+                self.stage_counts[stage] = done
+                self.last_progress = time.monotonic()
             self.writer.send(dict(event='stage_progress', stage=stage, done=done, total=len(self.pages)))
 
     @Slot(str, dict)
     def prepare_progress(self, module: str, payload: dict) -> None:
+        self.preparing.add(self.preparation_workers[module])
+        if self.active:
+            self.last_progress = time.monotonic()
         event = payload.get('event', '')
         phase = ('downloading' if event in ('file_progress', 'file_start', 'package_download_progress')
                  else 'installing' if 'package' in event else 'loading')
@@ -368,6 +427,8 @@ class Server(QObject):
         if self.active:
             if page:
                 self.failed.add(page)
+            if self.stalled:
+                return
             payload = dict(event='error', message='Pipeline processing failed.')
             if page:
                 payload['page'] = page
@@ -379,6 +440,7 @@ class Server(QObject):
             return
         self.revisions[page] = self.revisions.get(page, 0) + 1
         if self.active:
+            self.last_progress = time.monotonic()
             self.written.add(page)
             self.writer.send(dict(event='page_done', page=page, revision=self.revisions[page]))
 
@@ -418,6 +480,7 @@ class Server(QObject):
                     self.failed.add(page)
                     self.writer.send(dict(event='error', page=page, message='Page did not produce a result image.'))
             self.active = False
+            self.watchdog.stop()
             self.writer.send(dict(event='run_finished', cancelled=self.cancelled,
                                   failed_pages=[p for p in self.pages if p in self.failed]))
         if self.quitting and not self.active and not self.rendering and not self.exporting and not any(w.isRunning() for w in workers) and not self.tests:
@@ -698,6 +761,7 @@ class Server(QObject):
         for module, callback in self.old_general_errors:
             module.create_error_dialog = callback
         self.poller.stop()
+        self.watchdog.stop()
         self.window.imsave_thread.wait_for_saves(None)
         self.window.deleteLater()
         from qtpy.QtCore import QCoreApplication, QEvent

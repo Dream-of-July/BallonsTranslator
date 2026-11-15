@@ -42,6 +42,72 @@ class LLMTranslatorTest(unittest.TestCase):
     def setUp(self):
         self.translator = LLMTranslator('日本語', '简体中文')
 
+    def test_older_params_get_default_request_timeout(self) -> None:
+        from ballontranslator.modules.lazy_registry import _scan_file
+
+        specs = _scan_file('ballontranslator/modules/translators/trans_llm.py', 'translator')
+        spec = next(spec for spec in specs if spec.key == 'LLMTranslator')
+        self.assertEqual(spec.params['request timeout']['value'], 120.0)
+        self.assertEqual(spec.params['retry timeout']['description'], 'Delay between retries in seconds.')
+        params = copy.deepcopy(self.translator.params)
+        params.pop('request timeout')
+        params['retry timeout']['value'] = 0.01
+        with mock.patch.object(LLMTranslator, 'params', copy.deepcopy(LLMTranslator.params)):
+            translator = LLMTranslator('日本語', '简体中文', **params)
+            self.assertEqual(translator.get_param_value('retry timeout'), 0.01)
+            self.assertEqual(translator.get_param_value('request timeout'), 120.0)
+            self.assertEqual(translator._request_timeout(), 120.0)
+
+    def test_transport_timeout_connection_and_server_retries_are_finite(self) -> None:
+        from openai import APIConnectionError, APITimeoutError
+        profile = default_profile('LM Studio')
+        profile.model, profile.model_options = 'offline-model', ['offline-model']
+        for failure in (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.ConnectError, 503):
+            with self.subTest(failure=failure), \
+                    mock.patch.object(self.translator, 'params', copy.deepcopy(self.translator.params)):
+                self.translator.set_param_value('retry attempts', 3)
+                self.translator.set_param_value('retry timeout', 0.01)
+                requests, clients = [], []
+
+                def respond(request: httpx.Request) -> httpx.Response:
+                    requests.append(request)
+                    if failure == 503:
+                        return httpx.Response(503, json={'error': {'message': 'Unavailable'}})
+                    raise failure('Offline transport failure', request=request)
+
+                def client(proxy: str) -> httpx.Client:
+                    transport = httpx.Client(transport=httpx.MockTransport(respond))
+                    clients.append(transport)
+                    return transport
+
+                with mock.patch.object(self.translator, '_http_client', side_effect=client), \
+                        mock.patch.object(self.translator, '_respect_delay'), \
+                        mock.patch.object(self.translator, '_wait') as wait:
+                    expected = (LLMChatRequestError if failure == 503 else
+                                APITimeoutError if issubclass(failure, httpx.TimeoutException) else
+                                APIConnectionError)
+                    with self.assertRaises(expected):
+                        self.translator._translate(['source'], profile=profile,
+                                                   prompt_spec=self._prompt_spec(profile))
+                self.assertEqual(len(requests), 3)
+                self.assertEqual(wait.call_count, 2)
+                self.assertEqual(wait.call_args_list, [mock.call(0.01)] * 2)
+                for transport in clients:
+                    transport.close()
+                self.translator.client = None
+                self.translator.client_cache_key = None
+
+    def test_nonfinite_retry_count_falls_back_to_finite_attempts(self) -> None:
+        profile = default_profile('LM Studio')
+        with mock.patch.object(self.translator, 'params', copy.deepcopy(self.translator.params)):
+            self.translator.set_param_value('retry attempts', float('inf'), convert_dtype=False)
+            with mock.patch.object(self.translator, '_request_translation', side_effect=TimeoutError('Timed out')) as request, \
+                    mock.patch.object(self.translator, '_wait'):
+                with self.assertRaises(TimeoutError):
+                    self.translator._translate(['source'], profile=profile,
+                                               prompt_spec=self._prompt_spec(profile))
+            self.assertEqual(request.call_count, 5)
+
     def test_gateway_cache_diagnostics_reach_logs_without_changing_requests(self) -> None:
         profile = default_profile('OpenAI')
         profile.base_url = 'https://gateway.example/v1'
