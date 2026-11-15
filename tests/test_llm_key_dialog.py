@@ -414,7 +414,7 @@ class LLMKeyDialogDedupTest(unittest.TestCase):
                     self.assertNotIn('translation_target', info)
                     self.assertIn('Page: page-1', show_error.call_args.args[1])
 
-    def test_output_limit_dialog_stops_parallel_translation(self):
+    def test_output_limit_dialog_fails_only_that_page(self):
         translator = OutputLimitedTranslator()
         thread = module_manager.TranslateThread()
         thread.translator = translator
@@ -431,7 +431,8 @@ class LLMKeyDialogDedupTest(unittest.TestCase):
             success = thread._translate_page(project, 'page-1')
 
         self.assertFalse(success)
-        self.assertTrue(thread.pipeline_stop_event.is_set())
+        # One exhausted response is a page failure; the other pages keep going.
+        self.assertFalse(thread.pipeline_stop_event.is_set())
         self.assertTrue(
             project._image_info['page-1']['finish_code']
             & RunStatus.FIN_TRANSLATE
