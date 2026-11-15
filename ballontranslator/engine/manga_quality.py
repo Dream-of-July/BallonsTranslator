@@ -313,6 +313,8 @@ MANGA_RETRY_CONFIDENCE = .9
 
 
 def source_review(block: TextBlock) -> str | None:
+    if block.manga_keep_original:
+        return 'protected'
     source = block.get_text().strip()
     if not source:
         return 'unreadable'

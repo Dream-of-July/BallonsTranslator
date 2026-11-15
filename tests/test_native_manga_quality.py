@@ -78,6 +78,24 @@ def test_overflow_keeps_original_pixels_and_translation_draft():
     assert block.manga_review == 'overflow'
 
 
+def test_user_protected_block_precedes_unreadable_review_and_can_be_released():
+    from ballontranslator.engine.manga_quality import identify_regions, prepare_background, compose_page
+
+    image, mask, merged = comic_page()
+    block = identify_regions(image, [merged])[0]
+    block.text, block.translation = [''], '中文'
+    draft = prepare_background(image, mask, [block], None)
+    block.manga_keep_original = True
+    cleaned, result, applied = compose_page(image, draft, [block])
+    assert block.manga_review == 'protected'
+    assert np.array_equal(cleaned, image)
+    assert np.array_equal(result, image)
+    assert not np.any(applied)
+    block.manga_keep_original = False
+    compose_page(image, draft, [block])
+    assert block.manga_review == 'unreadable'
+
+
 def test_two_existing_blocks_in_joined_outline_keep_distinct_layout_areas():
     from ballontranslator.engine.manga_quality import identify_regions
     from ballontranslator.utils.textblock import TextBlock

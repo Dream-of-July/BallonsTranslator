@@ -234,6 +234,7 @@ class Server(QObject):
             device = module_runtime.DEFAULT_DEVICE
         ready = self.models_ready()
         return dict(protocol=1, engine_version=APP_VERSION,
+                    capabilities=['keep_original'],
                     device=device,
                     torch_installed=installed, models_ready=ready)
 
@@ -501,6 +502,11 @@ class Server(QObject):
         updated = copy.deepcopy(blocks)
         for edit in ([] if delete else edits):
             self.apply_edit(updated[edit['index']], edit)
+        from .manga_quality import draft_path, save_page
+        draft_file = draft_path(self.project.directory, page)
+        quality_page = any(b.manga_area is not None for b in blocks) and draft_file.is_file()
+        if not delete and any('keep_original' in edit for edit in edits) and not quality_page:
+            raise ProtocolError('bad_request', 'Keep Original requires a manga-quality page with a repair draft. Analyse the page again first.')
         # Select before replacing project data: page changes may save the old scene.
         self.window.save_on_page_changed = False
         try:
@@ -510,15 +516,15 @@ class Server(QObject):
         if delete:
             updated = [blk for i, blk in enumerate(updated) if i not in indexes]
             indexes = []
-        from .manga_quality import draft_path, save_page
-        draft_file = draft_path(self.project.directory, page)
-        if any(b.manga_area is not None for b in blocks) and draft_file.is_file():
+        if quality_page:
             from ballontranslator.utils.io_utils import imread
             draft = imread(str(draft_file))
             if draft is None or draft.ndim != 3 or draft.shape[-1] != 4:
                 raise ProtocolError('internal', 'The page needs to be analysed again.')
             refit = {i for i in indexes if params.get('autofit', False)
                      or blocks[i].manga_review is not None}
+            if not delete:
+                refit.update(edit['index'] for edit in edits if 'keep_original' in edit)
             baseline = self.revisions.get(page, 0)
             previous_blocks = blocks[:]
             self.rendering = True
@@ -558,13 +564,13 @@ class Server(QObject):
     @staticmethod
     def apply_edit(blk: object, edit: dict) -> None:
         allowed = {'index', 'source_text', 'translation', 'rect', 'angle', 'font_family', 'font_size',
-                   'color', 'alignment', 'bold', 'italic'}
+                   'color', 'alignment', 'bold', 'italic', 'keep_original'}
         if set(edit) - allowed:
             raise ValueError('edit')
         for key, value in edit.items():
             if key in ('source_text', 'translation', 'font_family') and not isinstance(value, str):
                 raise ValueError(key)
-            if key in ('bold', 'italic') and type(value) is not bool:
+            if key in ('bold', 'italic', 'keep_original') and type(value) is not bool:
                 raise ValueError(key)
             if key in ('angle', 'font_size'):
                 if type(value) not in (int, float) or not math.isfinite(value) or (key == 'font_size' and value <= 0):
@@ -578,6 +584,9 @@ class Server(QObject):
                 if key == 'color' and any(type(v) is not int or not 0 <= v <= 255 for v in value):
                     raise ValueError(key)
         fmt = blk.fontformat
+        if 'keep_original' in edit:
+            blk.manga_keep_original = edit['keep_original']
+            blk.manga_review = 'protected' if edit['keep_original'] else None
         if 'source_text' in edit:
             blk.text = [edit['source_text']]
             blk.manga_ocr_confidence = None

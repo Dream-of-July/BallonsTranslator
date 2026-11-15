@@ -1,4 +1,5 @@
 from dataclasses import replace
+import time
 import traceback
 from typing import Dict, List, Optional, Sequence, Tuple, Union, TYPE_CHECKING
 
@@ -71,6 +72,7 @@ from .llm_translation_contract import (
 from ballontranslator.modules.exceptions import (
     LLMMemoryCompactionError,
     LLMModelRequiredError,
+    LLMOutputLimitError,
     LLMRequestStopped,
     LLMUserActionRequiredError,
 )
@@ -85,6 +87,7 @@ from ballontranslator.utils.logger import logger as LOGGER
 from ballontranslator.utils.llm_profiles import (
     LLMProfile,
     THINKING_AUTO,
+    THINKING_DISABLED,
     runtime_profile,
 )
 from ballontranslator.utils.proj_imgtrans import (
@@ -1216,17 +1219,38 @@ class LLMTranslator(LLMChatRequester, BaseTranslator):
         codex_turn: Optional['CodexTurnState'] = None,
     ) -> str:
         request_kwargs = {'codex_turn': codex_turn} if codex_turn is not None else {}
+        stop_event = self.stop_event
+        # The recovery belongs to this request, not the normal provider retry
+        # budget. Share its deadline and never mutate the saved/runtime profile.
+        request_kwargs['deadline'] = time.monotonic() + self._request_timeout()
+        request_profile = profile
+        exhausted: Optional[LLMOutputLimitError] = None
         try:
-            result = self.request_chat_completion(
-                profile,
-                self._api_args(
-                    profile,
-                    messages,
-                    expected_translations,
-                    summary_enabled=summary_enabled,
-                ),
-                **request_kwargs,
-            )
+            for _ in range(2):
+                self._check_request_current(stop_event)
+                try:
+                    result = self.request_chat_completion(
+                        request_profile,
+                        self._api_args(
+                            request_profile,
+                            messages,
+                            expected_translations,
+                            summary_enabled=summary_enabled,
+                        ),
+                        **request_kwargs,
+                    )
+                    break
+                except LLMRequestStopped:
+                    raise
+                except Exception as error:
+                    self._check_request_current(stop_event)
+                    if exhausted is not None:
+                        raise exhausted from error
+                    if not isinstance(error, LLMOutputLimitError):
+                        raise
+                    exhausted = error
+                    if THINKING_DISABLED in profile.thinking_level_options:
+                        request_profile = replace(profile, thinking_level=THINKING_DISABLED)
         except LLMChatRequestError as error:
             if is_context_length_error(error.provider_error):
                 raise ContextLengthError(str(error)) from error.provider_error

@@ -584,12 +584,15 @@ class LLMChatRequester:
         api_args: Dict[str, Any],
         *,
         codex_turn: Optional[CodexTurnState] = None,
+        deadline: Optional[float] = None,
     ) -> LLMChatResult:
-        """Perform one request; feature owners decide whether to retry it."""
+        """Perform one request, optionally sharing a deadline across owner retries."""
         # Throttling and client/session setup can overlap a run change. Never
         # adopt the replacement run's token for this request's existing inputs.
         stop_event = self.stop_event
         self._check_request_current(stop_event)
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError('LLM request timed out.')
         if profile.backend == 'codex':
             if self._openai_session is not None:
                 self._openai_session.close()
@@ -617,7 +620,8 @@ class LLMChatRequester:
                     lambda cancel: request_chat_completion(
                         profile, api_args, cancel, session.cache_key, proxy,
                         session=session, turn=codex_turn),
-                    session.close, stop_event, time.monotonic() + self._request_timeout(),
+                    session.close, stop_event,
+                    deadline if deadline is not None else time.monotonic() + self._request_timeout(),
                 )
             except TimeoutError:
                 self._codex_sessions.pop(identity, None)
@@ -630,7 +634,8 @@ class LLMChatRequester:
         client = self._initialize_client(profile)
         self._respect_delay()
         self._check_request_current(stop_event)
-        deadline = time.monotonic() + self._request_timeout()
+        if deadline is None:
+            deadline = time.monotonic() + self._request_timeout()
         # Only the direct OpenAI endpoint has a known Responses WS contract.
         # Check the SDK's resolved URL, including OPENAI_BASE_URL overrides.
         from .openai_responses import OpenAIResponsesSession

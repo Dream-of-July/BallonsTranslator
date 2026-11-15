@@ -1,5 +1,7 @@
 import copy
 import json
+import threading
+import time
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -9,11 +11,16 @@ import numpy as np
 
 from ballontranslator.modules.exceptions import (
     LLMModelRequiredError,
+    LLMApiKeyRequiredError,
+    LLMAuthenticationError,
+    LLMBaseURLRequiredError,
+    LLMOutputLimitError,
+    LLMRequestStopped,
     LLMUserActionRequiredError,
 )
 from ballontranslator.modules.context.errors import ContextLengthError
 from ballontranslator.modules.context.token_usage import format_token_usage
-from ballontranslator.modules.llm_chat import LLMChatRequestError
+from ballontranslator.modules.llm_chat import LLMChatRequestError, LLMChatResult
 from ballontranslator.modules.translators.llm_translation_contract import (
     TranslationPromptSpec,
     InvalidNumTranslations,
@@ -41,6 +48,121 @@ class FakeStatusError(Exception):
 class LLMTranslatorTest(unittest.TestCase):
     def setUp(self):
         self.translator = LLMTranslator('日本語', '简体中文')
+
+    def test_exhausted_translation_retries_once_without_persisting_thinking(self) -> None:
+        profile = default_profile('DeepSeek')
+        profile.api_key = 'offline-test-key'
+        profile.model, profile.model_options = 'deepseek-chat', ['deepseek-chat']
+        profile.thinking_level = 'Auto'
+        before = copy.deepcopy(profile)
+        requests = []
+
+        def respond(request: httpx.Request) -> httpx.Response:
+            requests.append(json.loads(request.content))
+            exhausted = len(requests) == 1
+            return httpx.Response(200, json={'choices': [{
+                'index': 0, 'finish_reason': 'length' if exhausted else 'stop',
+                'message': {'role': 'assistant', 'content': '' if exhausted else '{"1":"target"}'},
+            }]})
+
+        with httpx.Client(transport=httpx.MockTransport(respond)) as client, \
+                mock.patch.object(self.translator, '_http_client', return_value=client), \
+                mock.patch.object(self.translator, '_respect_delay'), \
+                mock.patch.object(self.translator, '_wait') as wait:
+            for _ in range(2):
+                self.assertEqual(self.translator._translate(['source'], profile=profile,
+                    prompt_spec=self._prompt_spec(profile)), ['target'])
+        self.assertEqual(len(requests), 3)
+        self.assertNotIn('thinking', requests[0])
+        self.assertEqual(requests[1]['thinking'], {'type': 'disabled'})
+        self.assertNotIn('thinking', requests[2])
+        self.assertEqual(profile, before)
+        wait.assert_not_called()
+
+    def test_second_exhaustion_raises_original_and_other_setup_errors_do_not_retry(self) -> None:
+        profile = default_profile('DeepSeek')
+        original = LLMOutputLimitError(profile.id, profile.name, profile.max_tokens, 'Auto')
+        second = LLMOutputLimitError(profile.id, profile.name, profile.max_tokens, 'Disabled')
+        with mock.patch.object(self.translator, 'request_chat_completion',
+                side_effect=[original, second]) as request:
+            with self.assertRaises(LLMOutputLimitError) as caught:
+                self.translator._translate(['source'], profile=profile,
+                    prompt_spec=self._prompt_spec(profile))
+        self.assertIs(caught.exception, original)
+        self.assertEqual(request.call_count, 2)
+        first, retry = request.call_args_list
+        self.assertEqual(first.kwargs['deadline'], retry.kwargs['deadline'])
+        self.assertEqual(retry.args[1]['extra_body']['thinking'], {'type': 'disabled'})
+        for error_type in (LLMApiKeyRequiredError, LLMModelRequiredError,
+                           LLMBaseURLRequiredError, LLMAuthenticationError):
+            error = error_type(profile.id, profile.name)
+            with self.subTest(error=error_type), \
+                    mock.patch.object(self.translator, 'request_chat_completion', side_effect=error) as request:
+                with self.assertRaises(error_type):
+                    self.translator._translate(['source'], profile=profile,
+                        prompt_spec=self._prompt_spec(profile))
+                self.assertEqual(request.call_count, 1)
+
+    def test_stop_during_exhausted_retry_is_honoured(self) -> None:
+        profile = default_profile('DeepSeek')
+        profile.api_key = 'offline-test-key'
+        stop = threading.Event()
+        self.translator.set_stop_event(stop)
+        requests = []
+
+        def respond(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            if len(requests) == 2:
+                stop.set()
+            return httpx.Response(200, json={'choices': [{
+                'index': 0, 'finish_reason': 'length',
+                'message': {'role': 'assistant', 'content': ''},
+            }]})
+
+        with httpx.Client(transport=httpx.MockTransport(respond)) as client, \
+                mock.patch.object(self.translator, '_http_client', return_value=client), \
+                mock.patch.object(self.translator, '_respect_delay'):
+            with self.assertRaises(LLMRequestStopped):
+                self.translator._translate(['source'], profile=profile,
+                    prompt_spec=self._prompt_spec(profile))
+        self.assertEqual(len(requests), 2)
+
+    def test_exhausted_retry_keeps_deadline_and_unsupported_backend_arguments(self) -> None:
+        profile = default_codex_profile()
+        profile.model = 'offline-model'
+        profile.thinking_level_options = ['Auto', 'high']
+        error = LLMOutputLimitError(profile.id, profile.name, profile.max_tokens, 'Auto')
+        received = []
+
+        def request(request_profile, args, **kwargs):
+            self.assertIs(request_profile, profile)
+            received.append((args, kwargs['deadline']))
+            if len(received) == 1:
+                raise error
+            return LLMChatResult(content='{"translations":[{"id":1,"translation":"target"}]}')
+
+        with mock.patch.object(self.translator, 'request_chat_completion', side_effect=request):
+            self.assertEqual(self.translator._translate(['source'], profile=profile,
+                prompt_spec=self._prompt_spec(profile)), ['target'])
+        self.assertEqual(received[0], received[1])
+
+        profile = default_profile('DeepSeek')
+        received.clear()
+        def expire(request_profile, args, **kwargs):
+            received.append(kwargs['deadline'])
+            if len(received) == 1:
+                time.sleep(.02)
+                raise error
+            self.assertLess(kwargs['deadline'], time.monotonic())
+            raise TimeoutError('Request deadline expired')
+
+        with mock.patch.object(self.translator, '_request_timeout', return_value=.01), \
+                mock.patch.object(self.translator, 'request_chat_completion', side_effect=expire):
+            with self.assertRaises(LLMOutputLimitError) as caught:
+                self.translator._translate(['source'], profile=profile,
+                    prompt_spec=self._prompt_spec(profile))
+        self.assertIs(caught.exception, error)
+        self.assertEqual(received[0], received[1])
 
     def test_older_params_get_default_request_timeout(self) -> None:
         from ballontranslator.modules.lazy_registry import _scan_file
