@@ -1,5 +1,7 @@
+import json
 import threading
 import unittest
+from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
 from unittest import mock
 
@@ -7,16 +9,246 @@ import httpx
 
 from ballontranslator.modules.exceptions import (
     LLMAuthenticationError,
+    LLMApiKeyRequiredError,
     LLMOutputLimitError,
     LLMRequestStopped,
 )
 from ballontranslator.modules.llm_chat import (
     LLMChatRequester,
     LLMChatRequestError,
+    LLMConnectionError,
+    list_profile_models,
+    check_profile_connection,
     openai_chat_completion_args,
     openai_json_response_format,
 )
-from ballontranslator.utils.llm_profiles import default_profile
+from ballontranslator.utils.llm_profiles import LLMProfile, PROVIDER_DEFAULTS, default_profile
+from ballontranslator.utils.secret_store import SecretStore
+
+
+class ProfileConnectionTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.profile = LLMProfile(
+            id='custom-test', base_url='https://provider.test/v1',
+            api_key='mock-credential-only', model='test-model',
+        )
+        # Capture the real constructor before narrowly patching the client boundary.
+        self.client_type = httpx.Client
+
+    def test_model_listing_accepts_all_supported_shapes_and_deduplicates(self) -> None:
+        for body in (
+            {'data': [{'id': 'one'}, {'id': 'two'}, {'id': 'one'}, {'id': ''}, {'id': 3}, None]},
+            ['one', {'id': 'two'}, 'one', ' ', None, {'id': False}],
+            {'models': [{'name': 'one'}, {'id': 'two'}, {'name': 'one'}, {'name': ''}, 9]},
+        ):
+            with self.subTest(body=body):
+                client = self.client_type(transport=httpx.MockTransport(
+                    lambda request: httpx.Response(200, json=body)
+                ))
+                with mock.patch('httpx.Client', return_value=client):
+                    self.assertEqual(list_profile_models(self.profile), ['one', 'two'])
+                self.assertTrue(client.is_closed)
+
+    def test_listing_normalizes_urls_and_passes_auth_proxy_and_timeout(self) -> None:
+        for base in ('https://provider.test/v1/', 'https://provider.test/v1/chat/completions/', ''):
+            with self.subTest(base=base):
+                self.profile.base_url = base
+                self.profile.api_key = SecretStore().store(self.profile.id, 'mock-credential-only')
+                requests = []
+
+                def respond(request: httpx.Request) -> httpx.Response:
+                    requests.append(request)
+                    return httpx.Response(200, json={'data': []})
+
+                client = self.client_type(transport=httpx.MockTransport(respond))
+                with mock.patch('httpx.Client', return_value=client) as factory:
+                    self.assertEqual(list_profile_models(self.profile, proxy='http://proxy.test:8080', timeout=2.5), [])
+                factory.assert_called_once_with(proxy='http://proxy.test:8080', timeout=2.5)
+                expected_base = 'https://provider.test/v1' if base else PROVIDER_DEFAULTS['OpenAI']['base_url']
+                self.assertEqual(str(requests[0].url), expected_base + '/models')
+                self.assertEqual(requests[0].headers['Authorization'], 'Bearer mock-credential-only')
+                self.assertTrue(client.is_closed)
+
+    def test_local_provider_sends_no_authorization_header(self) -> None:
+        self.profile.require_api_key = False
+        self.profile.api_key = ''
+
+        def respond(request: httpx.Request) -> httpx.Response:
+            self.assertNotIn('Authorization', request.headers)
+            return httpx.Response(200, json=[])
+
+        client = self.client_type(transport=httpx.MockTransport(respond))
+        with mock.patch('httpx.Client', return_value=client):
+            self.assertEqual(list_profile_models(self.profile), [])
+        self.assertTrue(client.is_closed)
+
+    def test_missing_key_raises_for_listing_and_returns_auth_for_connection_test(self) -> None:
+        self.profile.api_key = ''
+        with mock.patch('httpx.Client') as factory:
+            with self.assertRaises(LLMApiKeyRequiredError):
+                list_profile_models(self.profile)
+            result = check_profile_connection(self.profile)
+        factory.assert_not_called()
+        self.assertFalse(result.ok)
+        self.assertEqual(result.kind, 'auth')
+        self.assertIn('missing', result.message.lower())
+        self.assertEqual(result.models, [])
+
+    def test_status_errors_are_classified_and_never_include_credentials(self) -> None:
+        for status, kind in ((401, 'auth'), (403, 'auth'), (404, 'not_found'),
+                             (429, 'rate_limited'), (500, 'server'), (503, 'server'),
+                             (400, 'invalid_response'), (302, 'invalid_response')):
+            with self.subTest(status=status):
+                client = self.client_type(transport=httpx.MockTransport(
+                    lambda request: httpx.Response(status, text='Authorization: Bearer mock-credential-only')
+                ))
+                with mock.patch('httpx.Client', return_value=client):
+                    with self.assertRaises(LLMConnectionError) as caught:
+                        list_profile_models(self.profile)
+                self.assertEqual(caught.exception.kind, kind)
+                self.assertIn(str(status), str(caught.exception))
+                self.assertNotIn('mock-credential-only', str(caught.exception))
+                self.assertNotIn('Authorization', str(caught.exception))
+                self.assertTrue(client.is_closed)
+
+    def test_transport_errors_are_classified_and_sanitized(self) -> None:
+        for error_type, kind in ((httpx.ConnectError, 'network'), (httpx.ProxyError, 'network'),
+                                 (httpx.ReadTimeout, 'timeout'), (httpx.ConnectTimeout, 'timeout')):
+            with self.subTest(error_type=error_type):
+                def respond(request: httpx.Request) -> httpx.Response:
+                    raise error_type('Authorization: Bearer mock-credential-only', request=request)
+
+                client = self.client_type(transport=httpx.MockTransport(respond))
+                with mock.patch('httpx.Client', return_value=client):
+                    with self.assertRaises(LLMConnectionError) as caught:
+                        list_profile_models(self.profile)
+                self.assertEqual(caught.exception.kind, kind)
+                self.assertNotIn('mock-credential-only', str(caught.exception))
+                self.assertNotIn('Authorization', str(caught.exception))
+                self.assertTrue(client.is_closed)
+
+    def test_invalid_model_listing_is_reported_without_echoing_body(self) -> None:
+        for body in ('not-json mock-credential-only', '{"error": "mock-credential-only"}',
+                     '{"data": null}', '{"models": {}}', 'null'):
+            with self.subTest(body=body):
+                client = self.client_type(transport=httpx.MockTransport(
+                    lambda request: httpx.Response(200, text=body)
+                ))
+                with mock.patch('httpx.Client', return_value=client):
+                    with self.assertRaises(LLMConnectionError) as caught:
+                        list_profile_models(self.profile)
+                self.assertEqual(caught.exception.kind, 'invalid_response')
+                self.assertIn('200', str(caught.exception))
+                self.assertNotIn('mock-credential-only', str(caught.exception))
+                self.assertTrue(client.is_closed)
+
+    def test_connection_succeeds_via_listing_and_returns_a_frozen_result(self) -> None:
+        client = self.client_type(transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, json={'data': [{'id': 'one'}]})
+        ))
+        with mock.patch('httpx.Client', return_value=client) as factory:
+            result = check_profile_connection(self.profile)
+        self.assertTrue(result.ok)
+        self.assertEqual(result.kind, 'ok')
+        self.assertEqual(result.models, ['one'])
+        self.assertTrue(result.message)
+        factory.assert_called_once()
+        with self.assertRaises(FrozenInstanceError):
+            result.ok = False
+
+    def test_connection_falls_back_to_one_minimal_chat_only_for_unavailable_listing(self) -> None:
+        for status, body in ((404, ''), (200, 'not-json')):
+            with self.subTest(status=status):
+                requests = []
+                clients = []
+
+                def respond(request: httpx.Request) -> httpx.Response:
+                    requests.append(request)
+                    if request.method == 'GET':
+                        return httpx.Response(status, text=body)
+                    return httpx.Response(204)
+
+                def create_client(**kwargs: object) -> httpx.Client:
+                    client = self.client_type(transport=httpx.MockTransport(respond))
+                    clients.append(client)
+                    return client
+
+                self.profile.base_url = 'https://provider.test/v1/chat/completions/'
+                with mock.patch('httpx.Client', side_effect=create_client) as factory:
+                    result = check_profile_connection(self.profile, proxy='http://proxy.test:8080', timeout=3.0)
+                self.assertTrue(result.ok)
+                self.assertEqual(result.kind, 'ok')
+                self.assertEqual(result.models, [])
+                self.assertEqual([request.method for request in requests], ['GET', 'POST'])
+                self.assertEqual(str(requests[1].url), 'https://provider.test/v1/chat/completions')
+                payload = json.loads(requests[1].content)
+                self.assertEqual(payload['model'], self.profile.model)
+                self.assertEqual(payload['max_tokens'], 1)
+                self.assertEqual(len(payload['messages']), 1)
+                self.assertEqual(payload['messages'][0]['role'], 'user')
+                self.assertTrue(payload['messages'][0]['content'])
+                self.assertEqual(requests[1].headers['Authorization'], 'Bearer mock-credential-only')
+                self.assertEqual(factory.call_args_list, [mock.call(proxy='http://proxy.test:8080', timeout=3.0)] * 2)
+                self.assertTrue(all(client.is_closed for client in clients))
+
+    def test_fallback_is_skipped_without_a_model_or_after_provider_failure(self) -> None:
+        for status, body, model, expected_kind in (
+            (404, '', '', 'not_found'), (200, 'garbage', '  ', 'invalid_response'),
+            (429, '', 'test-model', 'rate_limited'), (500, '', 'test-model', 'server'),
+        ):
+            with self.subTest(status=status, model=model):
+                self.profile.model = model
+                requests = []
+
+                def respond(request: httpx.Request) -> httpx.Response:
+                    requests.append(request)
+                    return httpx.Response(status, text=body)
+
+                client = self.client_type(transport=httpx.MockTransport(respond))
+                with mock.patch('httpx.Client', return_value=client):
+                    result = check_profile_connection(self.profile)
+                self.assertFalse(result.ok)
+                self.assertEqual(result.kind, expected_kind)
+                self.assertEqual(result.models, [])
+                self.assertEqual([request.method for request in requests], ['GET'])
+                if not model.strip():
+                    self.assertIn('manually', result.message)
+                    self.assertIn('model', result.message)
+                self.assertTrue(client.is_closed)
+
+    def test_connection_reports_fallback_and_network_failures(self) -> None:
+        for fallback in (False, True):
+            for failure in ('auth', 'network', 'timeout'):
+                with self.subTest(fallback=fallback, failure=failure):
+                    def respond(request: httpx.Request) -> httpx.Response:
+                        if fallback and request.method == 'GET':
+                            return httpx.Response(404)
+                        if failure == 'auth':
+                            return httpx.Response(401, text='mock-credential-only')
+                        error_type = httpx.ConnectError if failure == 'network' else httpx.ReadTimeout
+                        raise error_type('mock-credential-only', request=request)
+
+                    clients = []
+
+                    def create_client(**kwargs: object) -> httpx.Client:
+                        client = self.client_type(transport=httpx.MockTransport(respond))
+                        clients.append(client)
+                        return client
+
+                    with mock.patch('httpx.Client', side_effect=create_client):
+                        result = check_profile_connection(self.profile)
+                    self.assertFalse(result.ok)
+                    self.assertEqual(result.kind, failure)
+                    self.assertNotIn('mock-credential-only', result.message)
+                    self.assertEqual(result.models, [])
+                    self.assertTrue(all(client.is_closed for client in clients))
+
+    def test_invalid_proxy_setup_is_a_safe_network_error(self) -> None:
+        with mock.patch('httpx.Client', side_effect=ValueError('mock-credential-only')):
+            result = check_profile_connection(self.profile, proxy='invalid-proxy')
+        self.assertFalse(result.ok)
+        self.assertEqual(result.kind, 'network')
+        self.assertNotIn('mock-credential-only', result.message)
 
 
 class FakeAuthError(Exception):

@@ -1,3 +1,4 @@
+import copy
 import json
 import tempfile
 import unittest
@@ -9,6 +10,7 @@ from ballontranslator.utils.llm_profiles import (
     DEFAULT_OCR_PROMPT,
     DEFAULT_TRANSLATION_PROMPT,
     LLMProfile,
+    EXTRA_PROVIDER_TEMPLATES,
     PROVIDER_DEFAULTS,
     THINKING_AUTO,
     THINKING_DISABLED,
@@ -19,6 +21,9 @@ from ballontranslator.utils.llm_profiles import (
     profile_by_id,
     load_profiles,
     profile_to_dict,
+    profile_from_config,
+    profile_from_template,
+    provider_template_names,
     profile_to_export_dict,
     profiles_from_json,
     restore_builtin_profiles,
@@ -29,6 +34,99 @@ from ballontranslator.utils.llm_profiles import (
     split_image_model_selection,
 )
 from ballontranslator.utils.secret_store import SecretStore, is_portable_secret
+
+
+class ProviderTemplateTest(unittest.TestCase):
+    def test_template_order_preserves_the_six_builtin_providers(self) -> None:
+        builtins = ['DeepSeek', 'OpenAI', 'Gemini', 'OpenRouter', 'LM Studio', 'Ollama']
+        extras = ['SiliconFlow', 'Anthropic', 'Alibaba Bailian', 'Moonshot',
+                  'Zhipu', 'Volcengine Ark', 'Groq', 'xAI']
+        self.assertEqual(list(PROVIDER_DEFAULTS), builtins)
+        self.assertEqual(list(EXTRA_PROVIDER_TEMPLATES), extras)
+        self.assertEqual(provider_template_names(), builtins + extras)
+        self.assertEqual([profile.name for profile in default_profiles()], builtins)
+        self.assertEqual([profile.id for profile in default_profiles()],
+                         ['deepseek', 'openai', 'google', 'openrouter', 'lmstudio', 'ollama'])
+
+    def test_every_template_creates_an_independent_custom_profile(self) -> None:
+        before = copy.deepcopy(PROVIDER_DEFAULTS)
+        builtin_profiles = [profile_to_dict(profile) for profile in default_profiles()]
+        builtin_ids = {profile['id'] for profile in builtin_profiles} | {'codex'}
+        seen_ids = set()
+        for name in provider_template_names():
+            defaults = PROVIDER_DEFAULTS.get(name, EXTRA_PROVIDER_TEMPLATES.get(name))
+            for _ in range(2):
+                with self.subTest(name=name):
+                    profile = profile_from_template(name)
+                    self.assertIsInstance(profile, LLMProfile)
+                    self.assertFalse(profile.built_in)
+                    self.assertEqual(profile.name, name)
+                    self.assertEqual(profile.api_key, '')
+                    self.assertRegex(profile.id, r'^custom-[0-9a-f]{10}$')
+                    self.assertNotIn(profile.id, builtin_ids | seen_ids)
+                    seen_ids.add(profile.id)
+                    self.assertEqual(profile.base_url, defaults['base_url'])
+                    self.assertEqual(profile.model, defaults['model'])
+                    for key, value in defaults.items():
+                        if key != 'id':
+                            self.assertEqual(getattr(profile, key), value)
+                    profile.model_options.append('user-added-model')
+        self.assertEqual(PROVIDER_DEFAULTS, before)
+        self.assertEqual([profile_to_dict(profile) for profile in default_profiles()], builtin_profiles)
+        for defaults in EXTRA_PROVIDER_TEMPLATES.values():
+            self.assertNotIn('id', defaults)
+            self.assertNotIn('user-added-model', defaults['model_options'])
+
+    def test_extra_templates_have_the_dispatched_defaults(self) -> None:
+        expected = [
+            ('SiliconFlow', 'https://api.siliconflow.cn/v1', 'deepseek-ai/DeepSeek-V3.2',
+             ['deepseek-ai/DeepSeek-V3.2', 'Qwen/Qwen3.6-27B', 'Pro/moonshotai/Kimi-K2.6', 'Pro/zai-org/GLM-5.1']),
+            ('Anthropic', 'https://api.anthropic.com/v1/', 'claude-sonnet-5-5',
+             ['claude-fable-5-2', 'claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-5-5']),
+            ('Alibaba Bailian', 'https://dashscope.aliyuncs.com/compatible-mode/v1', 'qwen-plus',
+             ['qwen-plus', 'qwen-flash', 'qwen3-max', 'qwen3.5-plus']),
+            ('Moonshot', 'https://api.moonshot.cn/v1', 'kimi-k3', ['kimi-k3', 'kimi-k3.1-pro']),
+            ('Zhipu', 'https://open.bigmodel.cn/api/paas/v4', '', []),
+            ('Volcengine Ark', 'https://ark.cn-beijing.volces.com/api/v3', '', []),
+            ('Groq', 'https://api.groq.com/openai/v1', 'openai/gpt-oss-120b',
+             ['openai/gpt-oss-120b', 'openai/gpt-oss-20b', 'llama-3.3-70b-versatile', 'llama-3.1-8b-instant']),
+            ('xAI', 'https://api.x.ai/v1', 'grok-4.7', ['grok-4.7', 'grok-4.6', 'grok-4.5']),
+        ]
+        for name, base_url, model, options in expected:
+            with self.subTest(name=name):
+                profile = profile_from_template(name)
+                self.assertEqual(profile.base_url, base_url)
+                self.assertTrue(profile.require_api_key)
+                self.assertEqual(profile.model, model)
+                self.assertEqual(profile.model_options, options)
+                vision = name in ('Anthropic', 'Moonshot')
+                self.assertEqual(profile.support_vision, vision)
+                self.assertEqual(profile.vision_model, model if vision else '')
+                self.assertEqual(profile.vision_model_options, options if vision else [])
+                self.assertEqual(profile.vision_detail_level, 'auto' if vision else 'None')
+
+    def test_template_construction_runs_profile_normalization(self) -> None:
+        with patch.dict(EXTRA_PROVIDER_TEMPLATES['Moonshot'], vision_model_options=[' kimi-k3 ', 'kimi-k3']):
+            with self.assertLogs('BallonTranslator', level='WARNING'):
+                profile = profile_from_template('Moonshot')
+        self.assertEqual(profile.vision_model_options, ['kimi-k3'])
+
+    def test_unknown_provider_and_codex_are_not_templates(self) -> None:
+        for name in ('unknown-provider', 'Codex'):
+            with self.subTest(name=name), self.assertRaisesRegex((KeyError, ValueError), 'Unknown provider template'):
+                profile_from_template(name)
+
+    def test_empty_model_templates_roundtrip_without_inventing_a_model(self) -> None:
+        for name in ('Zhipu', 'Volcengine Ark'):
+            with self.subTest(name=name):
+                profile = profile_from_template(name)
+                saved = profile_to_dict(profile)
+                restored = profile_from_config(saved)
+                for loaded in (restored, load_profiles([saved])[0], load_profiles([restored])[0]):
+                    self.assertEqual(loaded.id, profile.id)
+                    self.assertEqual(loaded.model, '')
+                    self.assertEqual(loaded.model_options, [])
+                    self.assertEqual(profile_to_dict(loaded), saved)
 
 
 class CodexProfileConfigTest(unittest.TestCase):
