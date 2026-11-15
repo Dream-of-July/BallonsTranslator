@@ -83,7 +83,7 @@ class EngineTests(unittest.TestCase):
     def test_hello_page_fonts(self):
         hello = self.call('hello')['result']
         self.assertEqual(hello['protocol'], 1)
-        self.assertEqual(hello['capabilities'], ['keep_original'])
+        self.assertEqual(hello['capabilities'], ['keep_original', 'vision_probe'])
         self.assertIn(hello['device'], ('cpu', 'mps', 'cuda', None))
         page = self.call('get_page', {'name': '001.png'})['result']
         self.assertEqual((page['width'], page['height']), (480, 320))
@@ -284,6 +284,196 @@ class EngineTests(unittest.TestCase):
         for what, expected in (('source_txt', 'source'), ('translation_txt', 'Hello')):
             result = self.call('export', dict(destination=str(self.directory/'export'), what=what))['result']
             self.assertIn(expected, Path(result['files'][0]).read_text())
+
+    def vision_profile(self):
+        from ballontranslator.utils import config, llm_profiles
+
+        profile = llm_profiles.profile_from_template('DeepSeek')
+        self.enterContext(patch.object(config.pcfg.module, 'llm_profiles', [profile]))
+        self.enterContext(patch.object(llm_profiles, 'resolve_api_key', return_value=''))
+        return profile
+
+    def assert_saved_vision(self, profile, vision):
+        from ballontranslator.utils import config, shared, llm_profiles
+
+        # Bootstrap redirects this path to a fresh temporary config, never user data.
+        saved = config.ProgramConfig.load(shared.CONFIG_PATH)
+        loaded = llm_profiles.profile_by_id(saved.module.llm_profiles, profile.id)
+        self.assertIs(loaded.vision_probe_result, vision == 'yes')
+        self.assertIs(loaded.support_vision, vision == 'yes')
+        self.assertEqual(self.server.public_profile(loaded)['vision'], vision)
+
+    def test_vision_probe_correct_digits_persist_and_use_one_image_request(self):
+        import base64
+        import threading
+        import cv2
+        import numpy as np
+        from unittest.mock import Mock
+        from ballontranslator.utils import shared
+
+        profile = self.vision_profile()
+        profile.vision_model = 'offline-vision'
+        before_thinking = profile.thinking_level
+        before_local = shared.ENGINE_IMAGES_LOCAL
+        main_thread = threading.get_ident()
+
+        def respond(candidate, path, *, proxy, timeout, payload):
+            self.assertNotEqual(threading.get_ident(), main_thread)
+            self.assertEqual(path, 'chat/completions')
+            self.assertEqual(timeout, 15.0)
+            self.assertEqual(payload['model'], 'offline-vision')
+            self.assertEqual(payload['thinking'], {'type': 'disabled'})
+            self.assertNotIn('extra_body', payload)
+            self.assertEqual(candidate.thinking_level, 'Disabled')
+            self.assertNotIn('0042', json.dumps(payload['messages'][0]))
+            text, image = payload['messages'][1]['content']
+            self.assertNotIn('0042', text['text'])
+            self.assertEqual(image['type'], 'image_url')
+            encoded = image['image_url']['url'].split(',', 1)[1]
+            pixels = cv2.imdecode(np.frombuffer(base64.b64decode(encoded), np.uint8), cv2.IMREAD_COLOR)
+            self.assertEqual(pixels.shape, (96, 256, 3))
+            self.assertLess(int(pixels.min()), 30)
+            return Mock(json=lambda: {'choices': [{'message': {'content': '0042'}}]})
+
+        with patch('ballontranslator.engine.vision_probe.secrets.randbelow', return_value=42), \
+                patch('ballontranslator.engine.vision_probe._profile_connection_request', side_effect=respond) as request:
+            self.assertEqual(self.call('probe_vision', dict(profile_id=profile.id))['result'], {'vision': 'yes'})
+            request.assert_called_once()
+        self.assertTrue(profile.support_vision)
+        self.assertEqual(self.server.public_profile(profile)['vision'], 'yes')
+        self.assert_saved_vision(profile, 'yes')
+        self.assertEqual(profile.thinking_level, before_thinking)
+        self.assertEqual(shared.ENGINE_IMAGES_LOCAL, before_local)
+
+    def test_vision_probe_image_rejection_persists_no(self):
+        from ballontranslator.modules.llm_chat import LLMConnectionError
+
+        profile = self.vision_profile()
+        with patch('ballontranslator.engine.vision_probe._profile_connection_request',
+                   side_effect=LLMConnectionError('invalid_response', 'HTTP 400: Image unsupported.')) as request:
+            self.assertEqual(self.call('probe_vision', dict(profile_id=profile.id))['result'], {'vision': 'no'})
+            request.assert_called_once()
+        self.assertFalse(profile.support_vision)
+        self.assert_saved_vision(profile, 'no')
+
+    def test_vision_probe_wrong_or_empty_answer_and_model_fallback(self):
+        from unittest.mock import Mock
+
+        profile = self.vision_profile()
+        profile.vision_model = ''
+        profile.thinking_level_options = ['Auto']
+        for content in ('9999', '', None):
+            with self.subTest(content=content), \
+                    patch('ballontranslator.engine.vision_probe.secrets.randbelow', return_value=42), \
+                    patch('ballontranslator.engine.vision_probe._profile_connection_request',
+                          return_value=Mock(json=lambda: {'choices': [{'message': {'content': content}}]})) as request:
+                self.assertEqual(self.call('probe_vision', dict(profile_id=profile.id))['result'], {'vision': 'no'})
+                payload = request.call_args.kwargs['payload']
+                self.assertEqual(payload['model'], profile.model)
+                self.assertNotIn('thinking', payload)
+        self.assert_saved_vision(profile, 'no')
+
+    def test_vision_probe_connection_errors_preserve_stored_state(self):
+        from ballontranslator.modules.llm_chat import LLMConnectionError
+        from ballontranslator.modules.exceptions import LLMApiKeyRequiredError
+
+        profile = self.vision_profile()
+        failures = [(kind, LLMConnectionError(kind, 'unsafe-provider-detail'))
+                    for kind in ('auth', 'timeout', 'network', 'server', 'rate_limited')]
+        failures.append(('auth', LLMApiKeyRequiredError(profile.id)))
+        for measured in (None, True, False):
+            profile.vision_probe_result = measured
+            profile.support_vision = measured is not False
+            for kind, failure in failures:
+                before = copy.deepcopy(profile)
+                with self.subTest(measured=measured, kind=kind), \
+                        patch('ballontranslator.engine.vision_probe._profile_connection_request', side_effect=failure), \
+                        patch.object(self.server, 'persist') as persist:
+                    result = self.call('probe_vision', dict(profile_id=profile.id))['result']
+                    self.assertEqual(result, dict(ok=False, message='Connection failed.', kind=kind, models=[]))
+                    persist.assert_not_called()
+                    self.assertEqual(profile, before)
+        self.assertNotIn('unsafe-provider-detail', self.sink.getvalue())
+
+    def test_vision_template_and_legacy_profiles_are_unknown(self):
+        from ballontranslator.utils import llm_profiles
+        from ballontranslator.utils.logger import logger
+
+        profile = self.vision_profile()
+        self.assertTrue(profile.support_vision)
+        self.assertEqual(self.server.public_profile(profile)['vision'], 'unknown')
+        legacy = profile.to_dict()
+        legacy.pop('vision_probe_result')
+        with patch.object(logger, 'warning') as warning:
+            loaded = llm_profiles.profile_by_id(llm_profiles.load_profiles([legacy]), profile.id)
+            warning.assert_not_called()
+        self.assertIsNone(loaded.vision_probe_result)
+        self.assertEqual(self.server.public_profile(loaded)['vision'], 'unknown')
+
+    def test_vision_update_model_or_endpoint_resets_measurement(self):
+        from ballontranslator.utils import config, shared, llm_profiles
+
+        profile = self.vision_profile()
+        for key, value in (('model', 'different-model'), ('base_url', 'https://offline.test/v1')):
+            profile.vision_probe_result = True
+            with self.subTest(key=key):
+                unchanged = self.call('update_profile', dict(id=profile.id, **{key: getattr(profile, key)}))
+                self.assertEqual(unchanged['result']['vision'], 'yes')
+                changed = self.call('update_profile', dict(id=profile.id, **{key: value}))
+                self.assertEqual(changed['result']['vision'], 'unknown')
+                saved = config.ProgramConfig.load(shared.CONFIG_PATH)
+                self.assertIsNone(llm_profiles.profile_by_id(saved.module.llm_profiles, profile.id).vision_probe_result)
+
+    def test_vision_probe_pending_profile_edit_discards_stale_measurement(self):
+        import threading
+        from unittest.mock import Mock
+
+        profile = self.vision_profile()
+        entered, release = threading.Event(), threading.Event()
+
+        def respond(*args, **kwargs):
+            entered.set()
+            release.wait(5)
+            return Mock(json=lambda: {'choices': [{'message': {'content': '0042'}}]})
+
+        with patch('ballontranslator.engine.vision_probe.secrets.randbelow', return_value=42), \
+                patch('ballontranslator.engine.vision_probe._profile_connection_request', side_effect=respond):
+            self.server.dispatch(dict(id=9002, method='probe_vision', params=dict(profile_id=profile.id)))
+            try:
+                self.assertTrue(entered.wait(2))
+                result = self.call('update_profile', dict(id=profile.id, model='replacement-model'))
+                self.assertEqual(result['result']['vision'], 'unknown')
+            finally:
+                release.set()
+            deadline = time.monotonic() + 3
+            while self.server.tests and time.monotonic() < deadline:
+                self.app.processEvents()
+                time.sleep(.005)
+            self.assertFalse(self.server.tests)
+        message = next(m for m in self.messages() if m.get('id') == 9002)
+        self.assertEqual(message['error']['code'], 'busy')
+        self.assertIsNone(profile.vision_probe_result)
+
+    def test_vision_probe_rejects_invalid_parameters(self):
+        profile = self.vision_profile()
+        for params, code in ((dict(id=profile.id), 'bad_request'),
+                             (dict(profile_id=42), 'bad_request'),
+                             (dict(profile_id='missing-profile'), 'not_found')):
+            with self.subTest(params=params):
+                self.assertEqual(self.call('probe_vision', params)['error']['code'], code)
+
+    def test_vision_probe_save_failure_restores_previous_state(self):
+        from unittest.mock import Mock
+
+        profile = self.vision_profile()
+        before = copy.deepcopy(profile)
+        with patch('ballontranslator.engine.vision_probe._profile_connection_request',
+                   return_value=Mock(json=lambda: {'choices': []})), \
+                patch.object(self.server, 'persist', side_effect=OSError('unsafe-save-detail')):
+            result = self.call('probe_vision', dict(profile_id=profile.id))
+        self.assertEqual(result['error']['code'], 'internal')
+        self.assertEqual(profile, before)
+        self.assertNotIn('unsafe-save-detail', self.sink.getvalue())
 
     def test_bad_requests_and_busy(self):
         self.assertEqual(self.call('unknown')['error']['code'], 'bad_request')

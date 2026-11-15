@@ -45,11 +45,12 @@ class Server(QObject):
     eof = Signal()
     failure = Signal(object)
     tested = Signal(object)
+    probed = Signal(object)
     exported = Signal(object)
     METHODS = ('hello', 'open_project', 'get_page', 'run', 'cancel', 'update_blocks',
                'delete_blocks', 'list_fonts', 'get_settings', 'set_settings',
                'create_profile', 'update_profile', 'delete_profile', 'test_profile',
-               'export', 'shutdown')
+               'probe_vision', 'export', 'shutdown')
 
     def __init__(self, app: QObject, window: QObject, writer: Writer) -> None:
         super().__init__()
@@ -75,6 +76,7 @@ class Server(QObject):
         self.eof.connect(self.quit, Qt.ConnectionType.QueuedConnection)
         self.failure.connect(self.on_failure, Qt.ConnectionType.QueuedConnection)
         self.tested.connect(self.on_tested, Qt.ConnectionType.QueuedConnection)
+        self.probed.connect(self.on_probed, Qt.ConnectionType.QueuedConnection)
         self.exported.connect(self.on_exported, Qt.ConnectionType.QueuedConnection)
         self.manager.imgtrans_pipeline_finished.connect(self.pipeline_finished)
         window.imsave_thread.img_writed.connect(self.image_written)
@@ -159,7 +161,8 @@ class Server(QObject):
                 'update_blocks': {'page', 'edits', 'autofit'}, 'delete_blocks': {'page', 'indexes'},
                 'set_settings': {'source_language', 'target_language', 'translator', 'output'},
                 'create_profile': {'template'}, 'update_profile': {'id', 'name', 'base_url', 'model', 'api_key'},
-                'delete_profile': {'id'}, 'test_profile': {'id'}, 'export': {'destination', 'what'},
+                'delete_profile': {'id'}, 'test_profile': {'id'}, 'probe_vision': {'profile_id'},
+                'export': {'destination', 'what'},
             }.get(method, set())
             if set(params) - allowed:
                 raise ProtocolError('bad_request', 'Unknown parameter.')
@@ -168,6 +171,9 @@ class Server(QObject):
                 return
             if method == 'test_profile':
                 self.test_profile(request_id, params)
+                return
+            if method == 'probe_vision':
+                self.probe_vision(request_id, params)
                 return
             if method == 'export':
                 self.export(request_id, params)
@@ -234,7 +240,7 @@ class Server(QObject):
             device = module_runtime.DEFAULT_DEVICE
         ready = self.models_ready()
         return dict(protocol=1, engine_version=APP_VERSION,
-                    capabilities=['keep_original'],
+                    capabilities=['keep_original', 'vision_probe'],
                     device=device,
                     torch_installed=installed, models_ready=ready)
 
@@ -284,7 +290,9 @@ class Server(QObject):
     def public_profile(profile: object) -> dict:
         return {**{key: getattr(profile, key) for key in
                    ('id', 'name', 'base_url', 'model', 'model_options', 'require_api_key')},
-                'has_api_key': bool(llm_profiles.resolve_api_key(profile))}
+                'has_api_key': bool(llm_profiles.resolve_api_key(profile)),
+                'vision': ('yes' if profile.vision_probe_result is True else
+                           'no' if profile.vision_probe_result is False else 'unknown')}
 
     def preflight(self) -> None:
         cfg = config.pcfg.module
@@ -675,6 +683,8 @@ class Server(QObject):
         for key in ('name', 'base_url', 'model', 'api_key'):
             if key in params:
                 self.string(params, key)
+        if any(key in params and params[key] != getattr(profile, key) for key in ('base_url', 'model')):
+            profile.vision_probe_result = None
         for key in ('name', 'base_url', 'model'):
             if key in params:
                 setattr(profile, key, params[key])
@@ -715,6 +725,54 @@ class Server(QObject):
         worker, request_id, payload = result
         self.tests.discard(worker)
         self.writer.send({'id': request_id, 'result': payload})
+
+    def probe_vision(self, request_id: object, params: dict) -> None:
+        profile = copy.deepcopy(self.profile(self.string(params, 'profile_id')))
+        proxy = config.pcfg.module.translator_params.get('LLMTranslator', {}).get('proxy', '')
+        if isinstance(proxy, dict):
+            proxy = proxy.get('value', '')
+        worker = threading.Thread(target=self.check_vision, args=(request_id, profile, proxy), daemon=True)
+        self.tests.add(worker)
+        worker.start()
+
+    def check_vision(self, request_id: object, profile: llm_profiles.LLMProfile, proxy: str) -> None:
+        try:
+            from .vision_probe import probe_profile_vision
+            from ballontranslator.modules.llm_chat import LLMConnectionError
+            from ballontranslator.modules.exceptions import LLMApiKeyRequiredError
+            try:
+                payload = dict(vision=probe_profile_vision(profile, proxy=proxy))
+            except LLMApiKeyRequiredError:
+                payload = dict(ok=False, message='Connection failed.', kind='auth', models=[])
+            except LLMConnectionError as error:
+                payload = dict(ok=False, message='Connection failed.', kind=error.kind, models=[])
+        except Exception:
+            payload = dict(ok=False, message='Connection failed.', kind='internal', models=[])
+        self.probed.emit((threading.current_thread(), request_id, profile, payload))
+
+    @Slot(object)
+    def on_probed(self, result: tuple) -> None:
+        worker, request_id, snapshot, payload = result
+        self.tests.discard(worker)
+        try:
+            if 'vision' in payload:
+                profile = self.profile(snapshot.id)
+                # A settings edit while the request was pending invalidates its result.
+                if any(getattr(profile, key) != getattr(snapshot, key)
+                       for key in ('base_url', 'model', 'vision_model')):
+                    raise ProtocolError('busy', 'Profile changed during the vision probe. Try again.')
+                previous = profile.vision_probe_result, profile.support_vision
+                profile.vision_probe_result = profile.support_vision = payload['vision'] == 'yes'
+                try:
+                    self.persist()
+                except Exception:
+                    profile.vision_probe_result, profile.support_vision = previous
+                    raise
+            self.writer.send({'id': request_id, 'result': payload})
+        except ProtocolError as error:
+            self.error(request_id, error)
+        except Exception:
+            self.error(request_id, ProtocolError('internal', 'Settings could not be saved.'))
 
     def export(self, request_id: object, params: dict) -> None:
         self.idle()
