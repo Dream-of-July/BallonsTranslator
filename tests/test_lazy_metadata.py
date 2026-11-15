@@ -113,6 +113,18 @@ class DemoDetector:
         warnings = validate_lazy_module_specs(specs)
         self.assertEqual(warnings, [])
 
+    def test_mit48px_confidence_params_are_lazy_and_ctc_is_unchanged(self):
+        specs = _scan_file('ballontranslator/modules/ocr/ocr_mit.py', 'ocr')
+        mit = next(spec for spec in specs if spec.key == 'mit48px')
+        ctc = next(spec for spec in specs if spec.key == 'mit48px_ctc')
+        self.assertEqual(mit.params['confidence mode'], {
+            'type': 'selector', 'options': ['joint', 'normalized'], 'value': 'joint',
+        })
+        self.assertEqual(mit.params['min confidence'], .2)
+        self.assertNotIn('confidence mode', ctc.params)
+        self.assertNotIn('min confidence', ctc.params)
+        self.assertEqual(validate_lazy_module_specs(specs), [])
+
     def test_current_lazy_registry_metadata_is_complete(self):
         from ballontranslator.modules import GET_VALID_TEXTDETECTORS, INPAINTERS, OCR, TEXTDETECTORS, TRANSLATORS
 

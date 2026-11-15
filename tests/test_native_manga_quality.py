@@ -178,3 +178,78 @@ def test_local_font_match_uses_original_glyphs_and_preserves_a_manual_edit(famil
     compose_page(image, draft, [block], refit={0})
     assert block.font_family == 'Hiragino Sans GB'
     assert block.fontformat.font_weight == 400
+
+
+def test_confidence_fields_default_and_project_json_round_trip(tmp_path):
+    import json
+    from ballontranslator.utils.proj_imgtrans import ProjImgTrans, TextBlkEncoder
+    from ballontranslator.utils.textblock import TextBlock
+
+    cv2.imwrite(str(tmp_path / 'page.png'), np.full((48, 48, 3), 255, np.uint8))
+    project = ProjImgTrans(str(tmp_path))
+    legacy = {'xyxy': [0, 0, 40, 40], 'text': ['source'], 'manga_ocr_confidence': .1}
+    current = dict(legacy, manga_line_confidence=[.85, .1], manga_line_text=['source', ''],
+                   manga_partial=True)
+    project.load_from_dict({'pages': {'page.png': [legacy, current]}})
+    old, new = project.pages['page.png']
+    assert old.manga_line_confidence == []
+    assert old.manga_line_text == []
+    assert old.manga_partial is False
+    assert old.manga_ocr_confidence == .1
+    old.manga_line_confidence.append(.9)
+    assert TextBlock().manga_line_confidence == []
+    payload = json.loads(json.dumps(project.to_dict(), cls=TextBlkEncoder))
+    project.load_from_dict(payload)
+    loaded = project.pages['page.png'][1]
+    assert loaded.manga_line_confidence == new.manga_line_confidence
+    assert loaded.manga_line_text == new.manga_line_text
+    assert loaded.manga_partial is True
+
+
+def test_retry_merges_better_lines_without_losing_good_readings():
+    from ballontranslator.engine.manga_quality import retry_uncertain_ocr, source_review
+    from ballontranslator.utils.textblock import TextBlock
+
+    lines = [[[10, 10], [20, 10], [20, 40], [10, 40]],
+             [[30, 10], [40, 10], [40, 40], [30, 40]],
+             [[50, 10], [60, 10], [60, 40], [50, 40]]]
+    block = TextBlock(xyxy=[10, 10, 60, 40], lines=lines, manga_area=lines[0],
+                      text='甲丙', manga_line_text=['甲', '', '丙'],
+                      manga_line_confidence=[.95, .4, .75], manga_partial=True)
+
+    class RetryOCR:
+        def run_ocr(self, image, blocks):
+            retried = blocks[0]
+            assert retried.manga_line_confidence == []
+            retried.manga_line_confidence = [.8, .85, .72]
+            retried.manga_line_text = ['wrong', '乙', 'worse']
+            retried.text = 'wrong乙worse'
+            return blocks
+
+    retry_uncertain_ocr(np.full((100, 100, 3), 255, np.uint8), [block], RetryOCR())
+    assert block.text == ['甲', '乙', '丙']
+    assert block.manga_line_confidence == [.95, .85, .75]
+    assert block.manga_partial is False
+    assert block.lines == lines
+    assert source_review(block) is None
+
+
+def test_retry_does_not_replace_an_accepted_line_with_empty_or_worse_text():
+    from ballontranslator.engine.manga_quality import retry_uncertain_ocr
+    from ballontranslator.utils.textblock import TextBlock
+
+    line = [[10, 10], [20, 10], [20, 40], [10, 40]]
+    block = TextBlock(lines=[line, line], manga_area=line, text=['甲'],
+                      manga_line_text=['甲', ''], manga_line_confidence=[.8, .1], manga_partial=True)
+
+    class RetryOCR:
+        def run_ocr(self, image, blocks):
+            retried = blocks[0]
+            retried.manga_line_confidence = [.99, .2]
+            retried.manga_line_text = ['', '']
+            return blocks
+
+    retry_uncertain_ocr(np.full((60, 60, 3), 255, np.uint8), [block], RetryOCR())
+    assert block.text == ['甲']
+    assert block.manga_line_confidence == [.8, .1]
+    assert block.manga_partial is True

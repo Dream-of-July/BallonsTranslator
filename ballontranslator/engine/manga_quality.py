@@ -308,13 +308,18 @@ def _unframed_white_ink(
     return bounds, ink | (halo & ~stroke), backing
 
 
+MANGA_LINE_MIN_CONFIDENCE = .75
+MANGA_RETRY_CONFIDENCE = .9
+
+
 def source_review(block: TextBlock) -> str | None:
     source = block.get_text().strip()
     if not source:
         return 'unreadable'
     if re.fullmatch(r'[@＠][a-zA-Z0-9_.-]{2,}', source):
         return 'protected'
-    if block.manga_ocr_confidence is not None and block.manga_ocr_confidence < .25:
+    if block.manga_line_confidence and not any(
+            value >= MANGA_LINE_MIN_CONFIDENCE for value in block.manga_line_confidence):
         return 'unreadable'
     return None
 
@@ -383,12 +388,19 @@ def prepare_background(
 
 
 def retry_uncertain_ocr(image: np.ndarray, blocks: list[TextBlock], ocr: object) -> None:
+    """Recheck uncertain crops and merge only improved individual readings.
+
+    The parallel text list retains empty slots for rejected lines even when
+    OCRBase joins or postprocesses the public block.text value.
+    """
     candidates = []
     original = []
     height, width = image.shape[:2]
     for block in blocks:
-        confidence = block.manga_ocr_confidence
-        if confidence is None or confidence >= .57 or not block.lines:
+        confidence = block.manga_line_confidence
+        if (not confidence or min(confidence) >= MANGA_RETRY_CONFIDENCE
+                or len(confidence) != len(block.lines)
+                or len(block.manga_line_text) != len(confidence)):
             continue
         lines = np.asarray(block.lines, dtype=np.float32)
         center = lines.mean(axis=1, keepdims=True)
@@ -397,19 +409,34 @@ def retry_uncertain_ocr(image: np.ndarray, blocks: list[TextBlock], ocr: object)
         retried = copy.deepcopy(block)
         retried.lines = padded.tolist()
         retried.text = []
-        retried.manga_ocr_confidence = None
+        retried.manga_line_confidence = []
+        retried.manga_line_text = []
+        retried.manga_partial = False
         candidates.append(retried)
         original.append(block)
     if not candidates:
         return
     for block, retried in zip(original, ocr.run_ocr(image, candidates)):
-        old = block.get_text().strip()
-        new = retried.get_text().strip()
-        confidence = retried.manga_ocr_confidence or 0
-        if new and (not old or len(new) >= len(old) * .8 and confidence > block.manga_ocr_confidence + .04):
-            block.text = retried.text
-            block.manga_ocr_confidence = confidence
-            block.fontformat.frgb = retried.fontformat.frgb
+        changed = False
+        for i, (confidence, text) in enumerate(zip(retried.manga_line_confidence, retried.manga_line_text)):
+            if i >= len(block.manga_line_confidence):
+                break
+            if (text.strip() and confidence >= MANGA_LINE_MIN_CONFIDENCE
+                    and confidence > block.manga_line_confidence[i]):
+                block.manga_line_text[i] = text
+                block.manga_line_confidence[i] = confidence
+                changed = True
+        if changed:
+            from ballontranslator.modules.ocr.base import postprocess_ocr_text
+            from ballontranslator.utils.config import pcfg
+
+            block.text = [text for text in block.manga_line_text if text]
+            source = block.get_text()
+            processed = postprocess_ocr_text(source, pcfg.ocr_sublist, pcfg.module.ocr_text_postprocess)
+            if source != processed:
+                block.text = processed
+            block.manga_partial = any(value < MANGA_LINE_MIN_CONFIDENCE
+                                      for value in block.manga_line_confidence)
 
 
 def _glyph_silhouette(block: TextBlock) -> tuple[np.ndarray, int, int] | None:

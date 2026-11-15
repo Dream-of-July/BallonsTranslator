@@ -72,7 +72,15 @@ class OCRMIT48px(MITModels):
 
     dependencies = MIT_DEPENDENCIES
 
-    params = deepcopy(mit_params)
+    params = {
+        **deepcopy(mit_params),
+        'confidence mode': {
+            'type': 'selector',
+            'options': ['joint', 'normalized'],
+            'value': 'joint',
+        },
+        'min confidence': 0.2,
+    }
     download_file_list = [{
         'url': 'https://huggingface.co/dreMaz/mit_models/resolve/main/ocr48px.zip',
         'save_files': [OCR48PXMODEL_PATH, 'data/alphabet-all-v7.txt'],
@@ -84,3 +92,11 @@ class OCRMIT48px(MITModels):
 
     def _load_model(self):
         self.model = Model48pxOCR(OCR48PXMODEL_PATH, self.device)
+
+    def _ocr_blk_list(self, img: np.ndarray, blk_list: List[TextBlock],
+                      split_textblk: bool = False, seg_func=None, *args, **kwargs) -> None:
+        regions, indices = collect_textblock_regions(
+            img, blk_list, self.model.text_height, self.model.maxwidth, split_textblk, seg_func)
+        self.model(blk_list, regions, indices, chunk_size=self.chunk_size,
+                   confidence_mode=self.get_param_value('confidence mode'),
+                   min_confidence=self.get_param_value('min confidence'))

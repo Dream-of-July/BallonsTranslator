@@ -128,6 +128,9 @@ class TextBlock:
     manga_area: Optional[List] = None
     manga_review: Optional[str] = None
     manga_ocr_confidence: Optional[float] = None
+    manga_line_confidence: List[float] = field(default_factory=list)
+    manga_line_text: List[str] = field(default_factory=list)
+    manga_partial: bool = False
 
     region_mask: np.ndarray = None
     region_inpaint_dict: Dict = None
