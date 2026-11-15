@@ -88,6 +88,97 @@ def _plain_area(block: TextBlock, width: int, height: int) -> list[list[int]]:
     return [[int(x1), int(y1)], [int(x2), int(y1)], [int(x2), int(y2)], [int(x1), int(y2)]]
 
 
+def _inside_bubble(block: TextBlock, shape: tuple[int, int]) -> bool:
+    return bool(block.manga_area) and block.manga_area != _plain_area(block, shape[1], shape[0])
+
+
+def _grow(mask: np.ndarray, radius: int) -> np.ndarray:
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * radius + 1,) * 2)
+    return cv2.dilate(mask.astype(np.uint8), kernel) != 0
+
+
+def _erase_radius(block: TextBlock, bounds: tuple[int, int, int, int]) -> int:
+    size = block._detected_font_size
+    if size <= 0:
+        x1, y1, x2, y2 = bounds
+        size = max(8., min(x2 - x1, y2 - y1) / 2)
+    return max(1, round(size * .12))
+
+
+def _background_model(crop: np.ndarray, samples: np.ndarray) -> tuple[np.ndarray, float]:
+    """Fit a quadratic RGB trend without treating a gradient as texture.
+
+    >>> crop = np.full((12, 12, 3), 80, np.uint8)
+    >>> model, spread = _background_model(crop, np.ones((12, 12), bool))
+    >>> np.allclose(model, crop) and spread < 1
+    True
+    """
+    h, w = samples.shape
+    y, x = np.mgrid[-1:1:complex(h), -1:1:complex(w)].astype(np.float32)
+    design = np.stack((np.ones_like(x), x, y, x * x, x * y, y * y), axis=2)
+    rows = design[samples]
+    values = crop[samples].astype(np.float32)
+    if len(rows) < 24:
+        return np.zeros_like(crop, dtype=np.float32), float('inf')
+    # Bound fitting cost on large bubbles; evaluate the surface only once.
+    stride = max(1, math.ceil(len(rows) / 4096))
+    rows, values = rows[::stride], values[::stride]
+    coefficients = np.linalg.lstsq(rows, values, rcond=None)[0]
+    for _ in range(2):
+        errors = np.max(np.abs(values - rows @ coefficients), axis=1)
+        keep = errors <= max(4., float(np.percentile(errors, 85)))
+        coefficients = np.linalg.lstsq(rows[keep], values[keep], rcond=None)[0]
+    model = np.clip(design @ coefficients, 0, 255)
+    spread = float(np.percentile(np.max(np.abs(values - rows @ coefficients), axis=1), 90))
+    return model, spread
+
+
+def _nonwhite_bubble(image: np.ndarray, block: TextBlock) -> list[list[int]] | None:
+    """Find a closed, smooth interior on a text-seeded crop, never the page."""
+    if not block.lines:
+        return None
+    height, width = image.shape[:2]
+    points = np.asarray(block.lines, np.int32).reshape(-1, 2)
+    tx1, ty1, tx2, ty2 = _bounds(points)
+    padding = max(tx2 - tx1, ty2 - ty1, 24)
+    bounds = (max(0, tx1 - padding), max(0, ty1 - padding),
+              min(width, tx2 + padding), min(height, ty2 + padding))
+    x1, y1, x2, y2 = bounds
+    crop = image[y1:y2, x1:x2, :3]
+    blurred = cv2.GaussianBlur(crop.astype(np.float32), (0, 0), 1.2)
+    dx = cv2.Sobel(blurred, cv2.CV_32F, 1, 0) / 4
+    dy = cv2.Sobel(blurred, cv2.CV_32F, 0, 1) / 4
+    barrier = (np.max(np.hypot(dx, dy), axis=2) > 12).astype(np.uint8)
+    barrier = cv2.morphologyEx(barrier, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+    _, labels = cv2.connectedComponents(1 - barrier, connectivity=4)
+    support = _line_support(block, bounds) != 0
+    candidates, counts = np.unique(labels[support], return_counts=True)
+    # A real enclosing interior dominates these seeds. Bound work on noisy art
+    # with thousands of tiny components instead of contouring all of them.
+    for label in candidates[np.argsort(-counts)][:16]:
+        if label == 0:
+            continue
+        interior = labels == label
+        if any(np.any(edge) for edge in (interior[0], interior[-1], interior[:, 0], interior[:, -1])):
+            continue
+        contours, _ = cv2.findContours(interior.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contour = max(contours, key=cv2.contourArea)
+        contour = cv2.approxPolyDP(contour, 1.3, True).reshape(-1, 2) + (x1, y1)
+        area = cv2.contourArea(contour)
+        text_area = max(1, (tx2 - tx1) * (ty2 - ty1))
+        _, _, bw, bh = cv2.boundingRect(contour)
+        if not (1.25 * text_area < area < min(30 * text_area, height * width * .35)):
+            continue
+        if bw > width * .85 or bh > height * .85 or len(contour) < 3:
+            continue
+        if any(cv2.pointPolygonTest(contour, tuple(map(float, point)), False) < 0 for point in points):
+            continue
+        _, spread = _background_model(crop, interior & ~support)
+        if spread <= 12:
+            return contour.tolist()
+    return None
+
+
 def _divide_shared_shapes(groups: dict[int, list[TextBlock]], contours: list[np.ndarray]) -> None:
     # A joined outline can still contain multiple CTD blocks (two speaking
     # lobes or a stepped caption). Allocate its room to the source anchors.
@@ -169,6 +260,10 @@ def identify_regions(image: np.ndarray, blocks: list[TextBlock]) -> list[TextBlo
             item.manga_area = contours[label - 1].tolist() if label else _plain_area(item, labels.shape[1], labels.shape[0])
             if label:
                 owners.setdefault(label, []).append(item)
+            else:
+                bubble = _nonwhite_bubble(image, item)
+                if bubble is not None:
+                    item.manga_area = bubble
             result.append(item)
     _divide_shared_shapes(owners, contours)
     return result
@@ -266,6 +361,9 @@ def _region_ink(
     x1, y1, x2, y2 = bounds
     area = _area_mask(points, bounds, inset=1)
     support = area if inside_bubble else _line_support(block, bounds)
+    if not inside_bubble and block.manga_complex_background:
+        # The completed halo may extend beyond CTD's original line support.
+        support = _grow(support, _erase_radius(block, bounds) * 5).astype(np.uint8) * 255
     ink = cv2.bitwise_and(area, cv2.bitwise_and(support, mask[y1:y2, x1:x2]))
     return bounds, ink != 0
 
@@ -329,6 +427,98 @@ def source_review(block: TextBlock) -> str | None:
     return None
 
 
+def _complete_complex_ink(
+    block: TextBlock, crop: np.ndarray, seed: np.ndarray, area: np.ndarray,
+    bounds: tuple[int, int, int, int], radius: int,
+) -> np.ndarray:
+    support = (_grow(_line_support(block, bounds), radius * 2) & area
+               & _grow(seed, radius * 5))
+    # OCR colours are RGB, as are engine images. Include measured extremes:
+    # default/missing OCR colours must not hide a coloured fill or halo.
+    colours = [np.asarray(block.fg_colors), np.asarray(block.bg_colors)]
+    if seed.any():
+        colours.append(np.median(crop[seed], axis=0))
+    pixels = crop[support]
+    if len(pixels):
+        luminance = pixels.mean(axis=1)
+        ordered = np.sort(luminance)
+        for percentile in (5, 95):
+            # Use an observed luminance so quantisation/gaps cannot leave an
+            # empty colour cluster at an interpolated percentile.
+            target = ordered[round((len(luminance) - 1) * percentile / 100)]
+            colours.append(np.median(pixels[np.abs(luminance - target) <= 8], axis=0))
+    matches = seed.copy()
+    pixels_float = crop.astype(np.float32)
+    for colour in colours:
+        if colour.shape == (3,) and np.isfinite(colour).all():
+            matches |= np.max(np.abs(pixels_float - colour), axis=2) <= 36
+    matches &= support
+    count, labels = cv2.connectedComponents(matches.astype(np.uint8), connectivity=8)
+    selected = np.zeros(count, bool)
+    selected[np.unique(labels[seed])] = True
+    selected[0] = False
+    return _grow(selected[labels] | seed, radius) & area
+
+
+def _residue_found(
+    repaired: np.ndarray, ink: np.ndarray, area: np.ndarray, radius: int,
+    model: np.ndarray, spread: float, ring: np.ndarray,
+) -> bool:
+    zone = _grow(ink, radius) & area
+    if not zone.any() or not ring.any() or not math.isfinite(spread):
+        return True
+    residual = np.max(np.abs(repaired.astype(np.float32) - model), axis=2)
+    grey = cv2.cvtColor(repaired.astype(np.float32), cv2.COLOR_RGB2GRAY)
+    energy = np.hypot(cv2.Sobel(grey, cv2.CV_32F, 1, 0), cv2.Sobel(grey, cv2.CV_32F, 0, 1)) / 4
+    outliers = residual > max(18., 2.5 * spread + 8)
+    edges = energy > max(20., float(np.percentile(energy[ring], 99)) * 1.8 + 8)
+    return np.count_nonzero((outliers | edges) & zone) > max(3, np.count_nonzero(zone) * .015)
+
+
+def _repair_complex(
+    original: np.ndarray, block: TextBlock, bounds: tuple[int, int, int, int],
+    seed: np.ndarray, area: np.ndarray, inpainter: object,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Try a crop twice; publish nothing when the second repair still has ink."""
+    from ballontranslator.modules.inpaint.base import enlarge_window
+
+    x1, y1, x2, y2 = bounds
+    crop = original[y1:y2, x1:x2]
+    radius = _erase_radius(block, bounds)
+    ink = _complete_complex_ink(block, crop, seed, area, bounds, radius)
+    for attempt in range(2):
+        if attempt:
+            block.manga_residue_retried = True
+            ink = _grow(ink, radius * 2) & area
+        zone = _grow(ink, radius) & area
+        ring = _grow(zone, max(3, radius * 4)) & area & ~zone
+        model, spread = _background_model(crop, ring)
+        repaired = crop.copy()
+        if spread <= 10:
+            repaired[ink] = np.rint(model[ink]).astype(np.uint8)
+        else:
+            left, top, right, bottom = enlarge_window(bounds, original.shape[1], original.shape[0], ratio=1.7)
+            crop_mask = np.zeros((bottom - top, right - left), np.uint8)
+            crop_mask[y1 - top:y2 - top, x1 - left:x2 - left][ink] = 255
+            context = original[top:bottom, left:right].copy()
+            if inpainter is None:
+                result = cv2.inpaint(context, crop_mask, 3, cv2.INPAINT_TELEA)
+            else:
+                if not inpainter.all_model_loaded():
+                    inpainter.load_model()
+                result = inpainter.memory_safe_inpaint(context, crop_mask)
+            repaired[ink] = result[y1 - top:y2 - top, x1 - left:x2 - left][ink]
+        # On very busy art the ring's spread can hide even strong text from a
+        # statistical threshold. An unchanged, contrasting source is no repair.
+        seed_error = np.max(np.abs(crop[seed].astype(np.float32) - model[seed]), axis=1)
+        unchanged = (np.array_equal(repaired[seed], crop[seed])
+                     and np.count_nonzero(seed_error > max(12., spread * .5)) >= 3)
+        if not _residue_found(repaired, ink, area, radius, model, spread, ring) and not unchanged:
+            return repaired, ink
+    block.manga_erase_failed = True
+    return crop, np.zeros_like(ink)
+
+
 def prepare_background(
     image: np.ndarray, mask: np.ndarray, blocks: list[TextBlock], inpainter: object,
 ) -> np.ndarray:
@@ -336,20 +526,33 @@ def prepare_background(
     original = image[..., :3]
     filled = original.copy()
     allowed = np.zeros(mask.shape, np.uint8)
-    complex_ink = np.zeros_like(allowed)
-    complex_bounds = []
     protected = np.zeros_like(allowed)
+    claims = np.zeros(mask.shape, np.int32)
+    regions = []
     for block in blocks:
+        block.manga_complex_background = False
+        block.manga_residue_retried = False
+        block.manga_erase_failed = False
         region = _region_ink(block, mask)
+        guard = None
+        if region is not None:
+            (x1, y1, x2, y2), ink = region
+            guard = _grow(ink, _erase_radius(block, region[0]) * 2)
+            claims[y1:y2, x1:x2] += guard
+        regions.append((region, guard))
+        if source_review(block) == 'protected':
+            points = _polygon(block, mask.shape)
+            if points is not None:
+                cv2.fillPoly(protected, [points], 255)
+    for block, (region, guard) in zip(blocks, regions):
         if region is None:
             continue
         (x1, y1, x2, y2), ink = region
         if not ink.any():
             continue
         if source_review(block) == 'protected':
-            protected[y1:y2, x1:x2][ink] = 255
             continue
-        inside_bubble = block.manga_area != _plain_area(block, mask.shape[1], mask.shape[0])
+        inside_bubble = _inside_bubble(block, mask.shape)
         if not inside_bubble:
             white = _unframed_white_ink(block, original, mask)
             if white is not None:
@@ -375,32 +578,17 @@ def prepare_background(
             ink = (cv2.dilate(stroke.astype(np.uint8), np.ones((3, 3), np.uint8)) != 0) & interior
             filled[y1:y2, x1:x2][ink] = base.astype(np.uint8)
         else:
-            complex_ink[y1:y2, x1:x2][ink] = 255
-            complex_bounds.append((x1, y1, x2, y2))
-        allowed[y1:y2, x1:x2][ink] = 255
-    complex_ink[protected != 0] = 0
-    allowed[protected != 0] = 0
-    if complex_bounds and np.any(complex_ink):
-        # Share the legacy crop geometry, but commit only this block's ink.
-        # Sequential crops bound model memory and retain full-resolution detail.
-        from ballontranslator.modules.inpaint.base import enlarge_window
-
-        if inpainter is not None and not inpainter.all_model_loaded():
-            inpainter.load_model()
-        for bounds in complex_bounds:
-            x1, y1, x2, y2 = bounds
-            local = complex_ink[y1:y2, x1:x2]
-            if not local.any():
+            block.manga_complex_background = True
+            # Exclude other owners before segmentation, dilation and sampling.
+            area = (_area_mask(points, (x1, y1, x2, y2), inset=1) != 0)
+            area &= (protected[y1:y2, x1:x2] == 0) & (claims[y1:y2, x1:x2] <= guard)
+            ink &= area
+            if not ink.any():
                 continue
-            left, top, right, bottom = enlarge_window(bounds, mask.shape[1], mask.shape[0], ratio=1.7)
-            crop_mask = np.zeros((bottom - top, right - left), np.uint8)
-            crop_mask[y1 - top:y2 - top, x1 - left:x2 - left] = local
-            crop = original[top:bottom, left:right].copy()
-            repaired = (cv2.inpaint(crop, crop_mask, 3, cv2.INPAINT_TELEA)
-                        if inpainter is None else inpainter.memory_safe_inpaint(crop, crop_mask))
-            selected = crop_mask != 0
-            filled[top:bottom, left:right][selected] = repaired[selected]
-            complex_ink[y1:y2, x1:x2] = 0
+            repaired, ink = _repair_complex(original, block, (x1, y1, x2, y2), ink, area, inpainter)
+            filled[y1:y2, x1:x2][ink] = repaired[ink]
+        allowed[y1:y2, x1:x2][ink] = 255
+    allowed[protected != 0] = 0
     filled[allowed == 0] = original[allowed == 0]
     return np.dstack((filled, allowed))
 
@@ -723,12 +911,16 @@ def compose_page(
             continue
         left, top, right, bottom = _bounds(points)
         rectangular = cv2.contourArea(points) / max(1, (right - left - 1) * (bottom - top - 1)) >= .92
-        kinds.append(not rectangular and block.manga_area != _plain_area(block, valid.shape[1], valid.shape[0]))
+        kinds.append(not rectangular and _inside_bubble(block, valid.shape))
     fonts = FontMatcher().page_choices(image, valid, blocks, kinds) if refit is None else {}
     for index, block in enumerate(blocks):
         block.manga_review = source_review(block)
         points = _polygon(block, valid.shape)
-        inside_bubble = block.manga_area != _plain_area(block, valid.shape[1], valid.shape[0])
+        inside_bubble = _inside_bubble(block, valid.shape)
+        if block.manga_review == 'unreadable' and not inside_bubble:
+            block.manga_review = 'skipped'
+        if block.manga_review is None and block.manga_erase_failed:
+            block.manga_review = 'geometry'
         region = _region_ink(block, valid, inside_bubble=inside_bubble)
         if not inside_bubble:
             white = _unframed_white_ink(block, image, valid)

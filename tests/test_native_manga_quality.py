@@ -224,6 +224,9 @@ def test_confidence_fields_default_and_project_json_round_trip(tmp_path):
     assert old.manga_line_text == []
     assert old.manga_partial is False
     assert old.manga_ocr_confidence == .1
+    assert old.manga_complex_background is False
+    assert old.manga_residue_retried is False
+    assert old.manga_erase_failed is False
     old.manga_line_confidence.append(.9)
     assert TextBlock().manga_line_confidence == []
     payload = json.loads(json.dumps(project.to_dict(), cls=TextBlkEncoder))
@@ -513,12 +516,14 @@ def test_complex_background_uses_sequential_crops_and_commits_only_accepted_bloc
 
     y, x = np.indices((280, 360))
     image = np.stack(((x + y) % 140, (2 * x + y) % 140, (x + 2 * y) % 140), axis=2).astype(np.uint8)
+    background = image.copy()
     mask = np.zeros(image.shape[:2], np.uint8)
     blocks = [box_block((25, 35, 110, 120), '天地', size=16),
               box_block((220, 140, 305, 225), '天地玄黃宇宙洪荒' * 60, size=16)]
     for block in blocks:
         x1, y1, x2, y2 = block.xyxy
         mask[y1 + 10:y2 - 10, x1 + 20:x1 + 30] = 255
+    image[mask != 0] = 0
     calls = []
 
     class CropInpainter:
@@ -526,9 +531,13 @@ def test_complex_background_uses_sequential_crops_and_commits_only_accepted_bloc
             return True
 
         def memory_safe_inpaint(self, crop, ink):
+            left, top, right, bottom = crops[len(calls)]
             calls.append(crop.shape[:2])
-            # Deliberately change the whole crop: only validated ink may commit.
-            return np.full_like(crop, 230)
+            # Repair ink correctly, but deliberately corrupt the context:
+            # the new residue check must pass without publishing that context.
+            repaired = np.full_like(crop, 230)
+            repaired[ink != 0] = background[top:bottom, left:right][ink != 0]
+            return repaired
 
     crops = []
     for block in blocks:
@@ -575,3 +584,148 @@ def test_protected_complex_ink_does_not_load_or_call_inpainter():
     draft = prepare_background(image, mask, [target, protected], UnusedInpainter())
     assert not draft[..., 3].any()
     assert np.array_equal(draft[..., :3], image)
+
+
+def test_second_tier_finds_translucent_bubble_but_rejects_busy_art():
+    from ballontranslator.engine.manga_quality import identify_regions, _inside_bubble
+    from ballontranslator.utils.textblock import TextBlock
+
+    y, x = np.indices((240, 320))
+    art = np.stack((35 + x * .2, 55 + y * .15, 70 + x * .1), axis=2).astype(np.uint8)
+    image = art.copy()
+    bubble = np.zeros(image.shape[:2], np.uint8)
+    cv2.ellipse(bubble, (105, 120), (66, 78), 0, 0, 360, 255, -1)
+    image[bubble != 0] = ((art[bubble != 0].astype(float) + 255) * .5).astype(np.uint8)
+    cv2.ellipse(image, (105, 120), (66, 78), 0, 0, 360, (15, 15, 15), 3)
+    cv2.rectangle(image, (98, 96), (110, 143), (8, 8, 8), -1)
+    line = [[92, 90], [116, 90], [116, 149], [92, 149]]
+    block = TextBlock(xyxy=[92, 90, 116, 149], lines=[line], _detected_font_size=24)
+    found = identify_regions(image, [block])[0]
+    assert _inside_bubble(found, image.shape[:2])
+    contour = np.asarray(found.manga_area, np.int32)
+    assert all(cv2.pointPolygonTest(contour, tuple(map(float, p)), False) >= 0 for p in line)
+    assert cv2.pointPolygonTest(contour, (55., 120.), False) >= 0
+
+    busy = np.random.default_rng(7).integers(20, 190, image.shape, dtype=np.uint8)
+    direct = TextBlock(xyxy=block.xyxy, lines=[line], _detected_font_size=24)
+    assert not _inside_bubble(identify_regions(busy, [direct])[0], busy.shape[:2])
+
+
+def test_pale_bubble_area_is_unchanged_by_second_tier():
+    from ballontranslator.engine.manga_quality import identify_regions, _speech_shapes, _line_label
+    from ballontranslator.utils.textblock import TextBlock
+
+    image, _, merged = comic_page()
+    labels, contours = _speech_shapes(image)
+    for line in merged.lines:
+        points = np.asarray(line)
+        block = TextBlock(xyxy=[*points.min(axis=0), *points.max(axis=0)], lines=[line])
+        expected = contours[_line_label(line, labels) - 1].tolist()
+        assert identify_regions(image, [block])[0].manga_area == expected
+
+
+def outlined_gradient_page():
+    y, x = np.indices((180, 260))
+    clean = np.stack((70 + x * .25, 100 + y * .25, 120 + x * .1 + y * .1), axis=2).astype(np.uint8)
+    image = clean.copy()
+    mask = np.zeros(image.shape[:2], np.uint8)
+    cv2.putText(image, 'TEXT', (38, 106), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (255, 255, 255), 9)
+    cv2.putText(image, 'TEXT', (38, 106), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (5, 5, 5), 3)
+    cv2.putText(mask, 'TEXT', (38, 106), cv2.FONT_HERSHEY_SIMPLEX, 1.1, 255, 3)
+    block = box_block((15, 45, 225, 140), '天地', size=32, vertical=False,
+                      source_bounds=(32, 70, 133, 113))
+    block.xyxy = [15, 45, 225, 140]
+    return image, mask, clean, block
+
+
+@pytest.mark.parametrize('detected_size', [32, -1])
+def test_outlined_text_on_gradient_is_reconstructed_without_residue(detected_size):
+    from ballontranslator.engine.manga_quality import prepare_background, compose_page, _residue_found, _grow, _background_model
+
+    image, mask, clean, block = outlined_gradient_page()
+    block._detected_font_size = detected_size
+
+    class UnusedInpainter:
+        def all_model_loaded(self):
+            pytest.fail('A smooth gradient must not load an inpainter')
+
+    draft = prepare_background(image, mask, [block], UnusedInpainter())
+    assert block.manga_complex_background and not block.manga_erase_failed
+    changed = np.any(image != clean, axis=2)
+    assert np.all(draft[changed, 3] != 0)
+    error = np.abs(draft[..., :3].astype(int) - clean.astype(int)).max(axis=2)
+    assert error[changed].max() <= 3
+    assert np.percentile(error[draft[..., 3] != 0], 99) <= 2
+    ink = draft[..., 3] != 0
+    area = np.zeros(mask.shape, bool)
+    area[46:140, 16:225] = True
+    ring = _grow(ink, 20) & ~_grow(ink, 4) & area
+    model, spread = _background_model(image, ring)
+    assert not _residue_found(draft[..., :3], ink, area, 4, model, spread, ring)
+    assert np.array_equal(draft[draft[..., 3] == 0, :3], image[draft[..., 3] == 0])
+    cleaned, _, applied = compose_page(image, draft, [block])
+    assert block.manga_review is None
+    assert np.all(applied[changed] != 0)
+    assert np.abs(cleaned[changed].astype(int) - clean[changed].astype(int)).max() <= 3
+
+
+@pytest.mark.parametrize(('low', 'high'), [(65, 145), (0, 200)])
+def test_failed_textured_erasure_retries_once_and_withholds_original(low, high):
+    from ballontranslator.engine.manga_quality import prepare_background, compose_page
+
+    image, mask, _, block = outlined_gradient_page()
+    texture = np.random.default_rng(11).integers(low, high, image.shape, dtype=np.uint8)
+    source = (image.min(axis=2) == 5) | (image.min(axis=2) == 255)
+    texture[source] = image[source]
+    calls = []
+
+    class UnchangedInpainter:
+        def all_model_loaded(self):
+            return True
+
+        def memory_safe_inpaint(self, crop, ink):
+            calls.append(ink.copy())
+            return crop
+
+    draft = prepare_background(texture, mask, [block], UnchangedInpainter())
+    assert len(calls) == 2
+    assert np.count_nonzero(calls[1]) > np.count_nonzero(calls[0])
+    assert block.manga_complex_background and block.manga_residue_retried and block.manga_erase_failed
+    assert not draft[..., 3].any()
+    assert np.array_equal(draft[..., :3], texture)
+    cleaned, result, applied = compose_page(texture, draft, [block])
+    assert block.manga_review == 'geometry'
+    assert np.array_equal(cleaned, texture) and np.array_equal(result, texture)
+    assert not applied.any()
+
+
+def test_unreadable_outside_bubble_is_skipped_and_inside_is_reviewed():
+    from ballontranslator.engine.manga_quality import identify_regions, prepare_background, compose_page
+
+    image, mask, merged = comic_page()
+    inside = identify_regions(image, [merged])[0]
+    outside = box_block((8, 130, 80, 164), '', size=16)
+    outside.text = ['']
+    blocks = [inside, outside]
+    inside.text = ['']
+    draft = prepare_background(image, mask, blocks, None)
+    cleaned, result, applied = compose_page(image, draft, blocks)
+    assert inside.manga_review == 'unreadable'
+    assert outside.manga_review == 'skipped'
+    assert np.array_equal(cleaned, image) and np.array_equal(result, image)
+    assert not applied.any()
+
+
+def test_complex_mask_respects_protected_area_and_resets_retry_state():
+    from ballontranslator.engine.manga_quality import prepare_background
+
+    image, mask, _, target = outlined_gradient_page()
+    protected = box_block((88, 65, 140, 119), '', size=32, vertical=False)
+    protected.manga_keep_original = True
+    target.manga_residue_retried = target.manga_erase_failed = True
+    draft = prepare_background(image, mask, [target, protected], None)
+    assert target.manga_complex_background
+    assert not target.manga_residue_retried and not target.manga_erase_failed
+    assert draft[65:120, 88:141, 3].sum() == 0
+    assert np.array_equal(draft[65:120, 88:141, :3], image[65:120, 88:141])
+    assert draft[:, :88, 3].any()
