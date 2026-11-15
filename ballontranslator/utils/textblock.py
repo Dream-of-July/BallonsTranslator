@@ -132,6 +132,9 @@ class TextBlock:
     manga_line_confidence: List[float] = field(default_factory=list)
     manga_line_text: List[str] = field(default_factory=list)
     manga_partial: bool = False
+    manga_complex_background: bool = False
+    manga_residue_retried: bool = False
+    manga_erase_failed: bool = False
 
     region_mask: np.ndarray = None
     region_inpaint_dict: Dict = None

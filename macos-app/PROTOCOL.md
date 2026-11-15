@@ -57,7 +57,7 @@ image caches).
 `rect` is the unrotated render box. `font_size` is in image pixels.
 `source_rect` is the optional original detection box in the same coordinates.
 `review_reason` is optional and can be `unreadable`, `untranslated`,
-`geometry`, `overflow` or `protected`. Withheld regions keep their source pixels.
+`geometry`, `overflow`, `protected` or `skipped`. Withheld regions keep their source pixels.
 
 ### `get_page` `{name}` → Page
 Fresh copy of one page.
