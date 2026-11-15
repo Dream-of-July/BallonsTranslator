@@ -15,7 +15,7 @@ public final class AppModel {
 
     public struct RunState: Equatable {
         public var pages: Set<String>
-        /// `detect`, `ocr`, `translate`, `inpaint`; nil until the first stage reports.
+        /// `detect`, `ocr`, `translate`, `inpaint`, `enhance`; nil until the first stage reports.
         public var stage: String?
         public var done = 0
         public var total = 0
@@ -44,6 +44,13 @@ public final class AppModel {
         case finished(ProfileTestResult)
     }
 
+    /// A `probe_vision` in flight, or the reason the last one gave no measurement.
+    /// A completed measurement lands in the profile's `vision` instead.
+    public enum VisionProbe: Equatable {
+        case running
+        case failed(String)
+    }
+
     public private(set) var engineState = EngineState.starting
     public private(set) var project: Project?
     public private(set) var isOpening = false
@@ -55,6 +62,7 @@ public final class AppModel {
     /// Pages whose result image is being re-rendered after an edit.
     public private(set) var renderingPages: Set<String> = []
     public private(set) var profileTests: [String: ProfileTest] = [:]
+    public private(set) var visionProbes: [String: VisionProbe] = [:]
 
     public var selectedPage: String? {
         didSet { if selectedPage != oldValue { selectedBlock = nil } }
@@ -389,8 +397,10 @@ public final class AppModel {
     }
 
     /// Whether the engine can leave a block untranslated on purpose.
-    public var canKeepOriginal: Bool {
-        if case .ready(let hello) = engineState { hello.capabilities.contains(Hello.keepOriginal) } else { false }
+    public var canKeepOriginal: Bool { engineSupports(Hello.keepOriginal) }
+
+    private func engineSupports(_ capability: String) -> Bool {
+        if case .ready(let hello) = engineState { hello.capabilities.contains(capability) } else { false }
     }
 
     /// Leaves a withheld block as it is on the page; it no longer counts as "to review".
@@ -467,6 +477,7 @@ public final class AppModel {
                 settings?.profiles[position] = profile
             }
             profileTests[id] = nil
+            visionProbes[id] = nil
         } catch {
             present(error)
         }
@@ -476,6 +487,7 @@ public final class AppModel {
         do {
             settings = try await engine.deleteProfile(id: id)
             profileTests[id] = nil
+            visionProbes[id] = nil
         } catch {
             present(error)
         }
@@ -491,6 +503,46 @@ public final class AppModel {
         } catch {
             profileTests[id] = .finished(ProfileTestResult(ok: false, message: error.localizedDescription, kind: "error", models: []))
         }
+    }
+
+    /// Whether the engine has the enhanced-mode setting.
+    public var supportsEnhance: Bool { engineSupports(Hello.enhance) }
+
+    /// Whether the engine can measure a profile's image support.
+    public var canProbeVision: Bool { engineSupports(Hello.visionProbe) }
+
+    /// Measures whether a profile reads images. The result lands in the profile's `vision`;
+    /// a service that could not be reached leaves it unchanged and keeps the reason in `visionProbes`.
+    public func probeVision(profileID: String) async {
+        guard canProbeVision, visionProbes[profileID] != .running else { return }
+        visionProbes[profileID] = .running
+        do {
+            switch try await engine.probeVision(profileID: profileID) {
+            case .measured(let vision):
+                visionProbes[profileID] = nil
+                if let position = settings?.profiles.firstIndex(where: { $0.id == profileID }) {
+                    settings?.profiles[position].vision = vision
+                }
+            case .failed(let result):
+                visionProbes[profileID] = .failed(result.message)
+            }
+        } catch {
+            visionProbes[profileID] = .failed(error.localizedDescription)
+        }
+    }
+
+    /// Turns enhanced mode on or off. Turning it on is refused unless the service can read images.
+    public func setEnhanceEnabled(_ enabled: Bool) async {
+        guard supportsEnhance, let settings, !enabled || settings.enhanceAvailability == .available else { return }
+        await updateSettings(SettingsPatch(enhance: EnhancePatch(enabled: enabled)))
+    }
+
+    /// Chooses the profile that re-checks pages; nil uses the translation service's.
+    /// A profile measured not to read images cannot be chosen.
+    public func setEnhanceProfile(_ profileID: String?) async {
+        guard supportsEnhance,
+              profileID.flatMap({ id in settings?.profiles.first { $0.id == id } })?.vision != .no else { return }
+        await updateSettings(SettingsPatch(enhance: EnhancePatch(profileID: .some(profileID))))
     }
 
     // MARK: - Zoom

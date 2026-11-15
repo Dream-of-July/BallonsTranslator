@@ -10,6 +10,7 @@ struct SettingsView: View {
 
     static let paneKey = "settingsPane"
 
+    @Environment(AppModel.self) private var model
     @AppStorage(SettingsView.paneKey) private var pane = Pane.translation
 
     var body: some View {
@@ -24,7 +25,8 @@ struct SettingsView: View {
                 EngineSettingsPane()
             }
         }
-        .frame(width: 620, height: 420)
+        // Taller only when the engine offers the enhanced-mode section under the services.
+        .frame(width: 620, height: model.supportsEnhance ? 560 : 420)
     }
 }
 
@@ -37,19 +39,26 @@ struct TranslationSettings: View {
 
     var body: some View {
         if let settings = model.settings {
-            HStack(spacing: 0) {
-                serviceList(settings)
-                    .frame(width: 190)
-                Divider()
-                Group {
-                    if let profile = settings.profiles.first(where: { $0.id == selection }) {
-                        ProfileForm(profile: profile, isActive: settings.translator.profileID == profile.id)
-                            .id(profile.id)
-                    } else {
-                        googleForm(settings)
+            VStack(spacing: 0) {
+                HStack(spacing: 0) {
+                    serviceList(settings)
+                        .frame(width: 190)
+                    Divider()
+                    Group {
+                        if let profile = settings.profiles.first(where: { $0.id == selection }) {
+                            ProfileForm(profile: profile, isActive: settings.translator.profileID == profile.id)
+                                .id(profile.id)
+                        } else {
+                            googleForm(settings)
+                        }
                     }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                if model.supportsEnhance {
+                    Divider()
+                    // Applies to every service, so it sits under both columns.
+                    EnhanceForm(settings: settings)
+                }
             }
             .onAppear {
                 selection = model.settingsProfile ?? settings.translator.profileID
@@ -71,7 +80,8 @@ struct TranslationSettings: View {
             ServiceRow(name: "Google", isActive: settings.translator.kind == .google)
                 .tag(String?.none)
             ForEach(settings.profiles) { profile in
-                ServiceRow(name: profile.name, isActive: settings.translator.profileID == profile.id)
+                ServiceRow(name: profile.name, isActive: settings.translator.profileID == profile.id,
+                           readsImages: profile.vision == .yes)
                     .tag(Optional(profile.id))
             }
         }
@@ -121,16 +131,98 @@ struct TranslationSettings: View {
 private struct ServiceRow: View {
     var name: String
     var isActive: Bool
+    var readsImages = false
 
     var body: some View {
         HStack {
             Text(verbatim: name)
                 .lineLimit(1)
             Spacer()
+            if readsImages {
+                Image(systemName: "eye")
+                    .foregroundStyle(.secondary)
+                    .help("Can read images")
+                    .accessibilityLabel("Can read images")
+            }
             if isActive {
                 Image(systemName: "checkmark")
                     .foregroundStyle(.secondary)
                     .accessibilityLabel("In use")
+            }
+        }
+    }
+}
+
+/// Enhanced mode: after a page is composed, hard blocks are re-checked by a vision model.
+/// The switch only turns on when the service doing that was measured to read images.
+private struct EnhanceForm: View {
+    @Environment(AppModel.self) private var model
+    var settings: EngineSettings
+
+    var body: some View {
+        Form {
+            Section {
+                Toggle(isOn: Binding { settings.enhanceIsOn } set: { on in
+                    Task { await model.setEnhanceEnabled(on) }
+                }) {
+                    Text("Enhanced Mode")
+                    Text("Re-checks hard text with a vision model. Parts of the page are sent to the chosen service.")
+                }
+                .disabled(settings.enhanceAvailability != .available)
+                availability
+                Picker("Re-check With", selection: Binding { settings.enhance.profileID } set: { id in
+                    Task { await model.setEnhanceProfile(id) }
+                }) {
+                    Text("Same as Translation").tag(String?.none)
+                    Divider()
+                    ForEach(settings.profiles) { profile in
+                        Text(verbatim: profile.name)
+                            .tag(Optional(profile.id))
+                            .disabled(profile.vision == .no)
+                    }
+                }
+            }
+        }
+        .formStyle(.grouped)
+        .scrollDisabled(true)
+        // Fixed: three rows at most (toggle, reason, picker); the reason stays on one line.
+        .frame(height: 176)
+    }
+
+    /// Why the switch is off, and for an unmeasured service the way to measure it.
+    @ViewBuilder private var availability: some View {
+        switch settings.enhanceAvailability {
+        case .available:
+            EmptyView()
+        case .visionUnsupported:
+            Text("This service can't read images.")
+                .foregroundStyle(.secondary)
+        case .noProfile:
+            Text("Choose a service that can read images.")
+                .foregroundStyle(.secondary)
+        case .visionUnknown(let id):
+            HStack(spacing: 6) {
+                switch model.visionProbes[id] {
+                case .running:
+                    ProgressView().controlSize(.small)
+                    Text("Checking…").foregroundStyle(.secondary)
+                case .failed(let message):
+                    Label {
+                        Text(verbatim: message)
+                    } icon: {
+                        Image(systemName: "xmark.circle.fill").foregroundStyle(.red)
+                    }
+                    .lineLimit(1)
+                    .help(message)
+                case nil:
+                    Text("Not checked yet").foregroundStyle(.secondary)
+                }
+                Spacer()
+                if model.canProbeVision {
+                    Button("Check") { Task { await model.probeVision(profileID: id) } }
+                        .disabled(model.visionProbes[id] == .running)
+                        .help("Sends one small test image to the service")
+                }
             }
         }
     }

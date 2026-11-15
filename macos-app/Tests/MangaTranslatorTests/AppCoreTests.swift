@@ -459,8 +459,9 @@ private func makeModel(translated: Int = 6, configure: (inout MockEngine.Options
 
     @Test func profileLifecycle() async throws {
         let (model, _) = await makeModel()
+        let before = try #require(model.settings?.profiles.count)
         let created = try #require(await model.createProfile(template: "OpenAI"))
-        #expect(model.settings?.profiles.count == 2)
+        #expect(model.settings?.profiles.count == before + 1)
         await model.testProfile(id: created.id)
         #expect(model.profileTests[created.id] == .finished(ProfileTestResult(ok: false, message: "API key is missing.", kind: "auth", models: [])))
         await model.updateProfile(id: created.id, ProfilePatch(model: "model-small", apiKey: "k"))
@@ -472,7 +473,82 @@ private func makeModel(translated: Int = 6, configure: (inout MockEngine.Options
         #expect(result.ok)
         #expect(model.settings?.profiles.last?.modelOptions == ["model-small", "model-large"])
         await model.deleteProfile(id: created.id)
-        #expect(model.settings?.profiles.count == 1)
+        #expect(model.settings?.profiles.count == before)
+    }
+
+    @Test func skippedTextIsNotToReviewButCanBeTranslated() async throws {
+        let (model, engine) = await makeModel()
+        model.selectedPage = "004.png"
+        let skipped = try #require(model.currentPage?.blocks.first { $0.isSkipped })
+        #expect(skipped.isWithheld && !skipped.needsReview)
+        #expect(model.currentPage.map(model.reviewCount(of:)) == 2)
+        // The walk never stops on it.
+        for _ in 0..<4 {
+            #expect(model.selectNextReview())
+            #expect(model.selectedBlock != skipped.index)
+        }
+        model.apply(BlockEdit(index: skipped.index, sourceText: "ゴゴゴゴ"), autofit: true, to: "004.png")
+        await waitUntil { model.renderingPages.isEmpty }
+        #expect(await engine.params(of: "update_blocks").last
+            == ["page": "004.png", "autofit": true, "edits": [["index": .number(Double(skipped.index)), "source_text": "ゴゴゴゴ"]]])
+        #expect(model.currentPage?.blocks.first { $0.index == skipped.index }?.isWithheld == false)
+    }
+
+    @Test func probeVisionMeasuresOrKeepsTheReason() async throws {
+        let (model, engine) = await makeModel()
+        #expect(model.canProbeVision && model.supportsEnhance)
+        #expect(model.settings?.profiles.map(\.vision) == [.no, .yes, .unknown])
+
+        await model.probeVision(profileID: "p3")
+        #expect(model.visionProbes["p3"] == nil)
+        #expect(model.settings?.profiles.first { $0.id == "p3" }?.vision == .yes)
+        #expect(await engine.params(of: "probe_vision") == [["profile_id": "p3"]])
+
+        // Unreachable service: the measurement is unchanged and the reason stays inline.
+        await model.updateProfile(id: "p1", ProfilePatch(model: "deepseek-reasoner"))
+        #expect(model.settings?.profiles.first?.vision == .unknown)
+        await model.probeVision(profileID: "p1")
+        #expect(model.visionProbes["p1"] == .failed("API key is missing."))
+        #expect(model.settings?.profiles.first?.vision == .unknown)
+        #expect(model.notice == nil)
+
+        let (old, oldEngine) = await makeModel { $0.supportsVision = false }
+        #expect(!old.canProbeVision && !old.supportsEnhance)
+        #expect(old.settings?.profiles.allSatisfy { $0.vision == .unknown } == true)
+        await old.probeVision(profileID: "p3")
+        await old.setEnhanceEnabled(true)
+        #expect(await oldEngine.count(of: "probe_vision") == 0)
+        #expect(await oldEngine.count(of: "set_settings") == 0)
+    }
+
+    @Test func enhanceTurnsOnOnlyWithAServiceThatReadsImages() async throws {
+        // Slow enough for the re-check stage to be seen.
+        let (model, engine) = await makeModel(translated: 0) { $0.stepDelay = .milliseconds(20) }
+        // Google translates and nothing is chosen: refused without asking the engine.
+        await model.setEnhanceEnabled(true)
+        #expect(await engine.count(of: "set_settings") == 0)
+        // A service measured not to read images cannot be chosen.
+        await model.setEnhanceProfile("p1")
+        #expect(await engine.count(of: "set_settings") == 0)
+
+        await model.setEnhanceProfile("p2")
+        await model.setEnhanceEnabled(true)
+        #expect(await engine.params(of: "set_settings") == [["enhance": ["profile_id": "p2"]], ["enhance": ["enabled": true]]])
+        let settings = try #require(model.settings)
+        #expect(settings.enhanceIsOn)
+
+        // Back to "same as translation" while Google translates: stored on, shown off.
+        await model.setEnhanceProfile(nil)
+        #expect(await engine.params(of: "set_settings").last == ["enhance": ["profile_id": nil]])
+        #expect(model.settings?.enhance.enabled == true)
+        #expect(model.settings?.enhanceIsOn == false)
+
+        // A run with enhanced mode on reports the re-check stage.
+        await model.setEnhanceProfile("p2")
+        await model.translate()
+        await waitUntil { model.run?.stage == "enhance" || model.run == nil }
+        #expect(model.run?.stage == "enhance")
+        await waitUntil { model.run == nil }
     }
 }
 

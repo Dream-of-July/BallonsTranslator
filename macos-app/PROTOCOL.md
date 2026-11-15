@@ -33,9 +33,10 @@ same commit as either side.
 ### `hello` → engine and environment status
 Result: `{"protocol": 1, "engine_version": "1.5.21", "device": "mps"|"cpu"|"cuda"|null,
 "torch_installed": bool, "models_ready": bool,
-"capabilities": ["keep_original", "vision_probe"]}`.
+"capabilities": ["keep_original", "vision_probe", "enhance"]}`.
 `capabilities` lists supported optional protocol features. `vision_probe` advertises
 the separate image-capability check and the measured `Profile.vision` field.
+`enhance` advertises the `enhance` settings field and the `enhance` run stage.
 `models_ready` is false when the selected detector/OCR/inpainter still need a download
 or package install; the first `run` will then emit `prepare_progress` events.
 Sent by the app first; the engine may take several seconds to answer (imports).
@@ -58,6 +59,9 @@ image caches).
 `source_rect` is the optional original detection box in the same coordinates.
 `review_reason` is optional and can be `unreadable`, `untranslated`,
 `geometry`, `overflow`, `protected` or `skipped`. Withheld regions keep their source pixels.
+`skipped` marks text outside any speech bubble that could not be read (artwork, sound
+effects, signatures): it is left as the original and is not an item to review. The app
+lets the user type its text and sends it as `source_text` (with `autofit`) to have it translated.
 
 ### `get_page` `{name}` → Page
 Fresh copy of one page.
@@ -102,16 +106,24 @@ Removes blocks (their text is no longer drawn) and re-renders.
  "translator": {"kind": "google"|"llm"|"other", "module": str, "profile_id": str|null},
  "profiles": [Profile…],
  "provider_templates": [str…],
- "output": {"format": ".png"|".jpg"|".webp", "quality": int}}
+ "output": {"format": ".png"|".jpg"|".webp", "quality": int},
+ "enhance": {"enabled": bool, "profile_id": str|null}}
 ```
+`enhance` (capability `enhance`; absent on older engines, read as off): Enhanced mode.
+After a page is composed, hard text blocks are re-checked by a vision model — image
+crops of the page are sent to the chosen service — and corrected once. Off by default.
+`profile_id: null` uses the translation service's profile. The app only offers to turn
+it on when that effective profile's `vision` is `yes`.
 `Profile`: `{"id", "name", "base_url", "model", "model_options": [str…],
 "require_api_key": bool, "has_api_key": bool, "vision": "yes"|"no"|"unknown"}` —
 the key itself is never sent. `vision` is the persisted measurement from
 `probe_vision`, never a provider-template guess. New and older unmeasured profiles
-report `unknown`.
+report `unknown`; the app reads a missing `vision` as `unknown`.
 
 ### `set_settings` `{source_language?, target_language?, translator?: {"kind": "google"}
-| {"kind": "llm", "profile_id"}, output?: {...}}` → Settings
+| {"kind": "llm", "profile_id"}, output?: {...}, enhance?: {enabled?, profile_id?}}` → Settings
+In `enhance`, omitted keys are left untouched and `profile_id: null` selects the
+translation service's profile; an unknown `profile_id` is `not_found`.
 
 ### `create_profile` `{template}` → Profile
 New LLM profile from a provider template (see `provider_templates`).
@@ -127,6 +139,7 @@ Network call on a worker thread; other requests keep being served meanwhile.
 This connection check does not send an image.
 
 ### `probe_vision` `{profile_id}` → `{"vision": "yes"|"no"}`
+Capability `vision_probe`.
 Runs on a worker thread using the existing connection-test request path and its
 15-second timeout. Sends exactly one chat request with a small synthetic image
 generated in memory; no user image or disk file is used. Uses `vision_model` if
@@ -156,7 +169,7 @@ keeping file names. Text exports write one file into `destination`.
 | event | fields |
 |---|---|
 | `prepare_progress` | `module` (`detector`/`ocr`/`inpainter`/`translator`/`packages`), `phase` (e.g. `downloading`, `installing`, `loading`), `message` (short English), `done`?, `total`? (bytes) |
-| `stage_progress` | `stage` (`detect`/`ocr`/`translate`/`inpaint`), `done`, `total` (pages) |
+| `stage_progress` | `stage` (`detect`/`ocr`/`translate`/`inpaint`/`enhance`), `done`, `total` (pages). `enhance` arrives only while enhanced mode re-checks pages |
 | `page_done` | `page` (name), `revision` — result image written; fetch with `get_page` |
 | `run_finished` | `cancelled`: bool, `failed_pages`: [name…] |
 | `error` | `message`, `page`? — non-fatal problem during a run (e.g. translation failed for a page) |

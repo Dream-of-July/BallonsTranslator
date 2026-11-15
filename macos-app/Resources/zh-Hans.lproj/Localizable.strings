@@ -54,6 +54,7 @@
 "Translating" = "翻译";
 "Cleaning pages" = "擦除原文";
 "Getting ready…" = "正在准备…";
+"Reviewing page %lld" = "正在复核 第 %lld 页";
 "Updating page" = "正在更新页面";
 "Original" = "原图";
 "%lld to review" = "%lld 处待校对";
@@ -63,6 +64,7 @@
 "The translation is too long to fit here." = "译文太长，这里放不下。";
 "The translation would cover artwork or another bubble." = "译文会压到画面或旁边的气泡。";
 "This text was left untranslated." = "这段文字没有翻译。";
+"Text outside a bubble, left as is." = "气泡外的文字，已保留原样。";
 "Show the untranslated page" = "查看未翻译的原图";
 
 /* Inspector */
@@ -109,6 +111,17 @@
 "Saved" = "已保存";
 "Required" = "必填";
 "Optional" = "选填";
+"Can read images" = "可识别图片";
+"Enhanced Mode" = "增强模式";
+"Re-checks hard text with a vision model. Parts of the page are sent to the chosen service." = "用视觉模型复核难处理的文字。相关画面片段会发送给所选服务。";
+"Re-check With" = "复核服务";
+"Same as Translation" = "与翻译相同";
+"This service can't read images." = "该服务不支持识别图片";
+"Choose a service that can read images." = "请选择能识别图片的服务";
+"Not checked yet" = "尚未检测";
+"Checking…" = "正在检测…";
+"Check" = "检测";
+"Sends one small test image to the service" = "向该服务发送一张小测试图";
 "Format" = "格式";
 "Quality" = "质量";
 "Status" = "状态";

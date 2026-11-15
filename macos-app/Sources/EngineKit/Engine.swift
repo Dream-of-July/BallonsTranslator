@@ -89,6 +89,11 @@ extension Engine {
         try await request("test_profile", ["id": .string(id)])
     }
 
+    /// One small paid request with a synthetic image; see `probe_vision` in PROTOCOL.md.
+    public func probeVision(profileID: String) async throws -> VisionProbeResult {
+        try await request("probe_vision", ["profile_id": .string(profileID)])
+    }
+
     public func export(to destination: String, what: ExportKind) async throws -> [String] {
         let result: ExportResult = try await request(
             "export", ["destination": .string(destination), "what": .string(what.rawValue)])

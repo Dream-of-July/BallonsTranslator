@@ -17,6 +17,10 @@ public struct Hello: Codable, Equatable, Sendable {
 
     /// Capability: `update_blocks` edits may carry `keep_original`.
     public static let keepOriginal = "keep_original"
+    /// Capability: `probe_vision` exists and profiles carry a measured `vision`.
+    public static let visionProbe = "vision_probe"
+    /// Capability: settings carry `enhance` (vision re-check of hard blocks).
+    public static let enhance = "enhance"
 
     enum CodingKeys: String, CodingKey {
         case protocolVersion = "protocol"
@@ -157,13 +161,18 @@ public struct Block: Codable, Equatable, Sendable, Identifiable {
     public var id: Int { index }
     /// The translation is not drawn; the original text is still on the page.
     public var isWithheld: Bool { reviewReason != nil }
-    /// Withheld because of a problem, not on purpose.
-    public var needsReview: Bool { isWithheld && reviewReason != Self.protected }
+    /// Withheld because of a problem, not on purpose and not as unreadable text outside a bubble.
+    public var needsReview: Bool { isWithheld && reviewReason != Self.protected && !isSkipped }
+    /// Unreadable text outside any bubble, left as the original.
+    public var isSkipped: Bool { reviewReason == Self.skipped }
     /// Where the block shows on the page: the detected box while withheld, the render box otherwise.
     public var visibleRect: CGRect { isWithheld ? sourceRect ?? rect : rect }
 
     /// `review_reason` of a block that is left untranslated on purpose.
     public static let protected = "protected"
+    /// `review_reason` of unreadable text outside any bubble (artwork, sound effects,
+    /// signatures): left as the original and not something to review.
+    public static let skipped = "skipped"
 
     enum CodingKeys: String, CodingKey {
         case index, rect, angle
@@ -419,6 +428,15 @@ public struct TranslatorSelection: Codable, Equatable, Sendable {
     }
 }
 
+/// `Profile.vision`: whether the service was measured to read images.
+public enum VisionSupport: String, Codable, Sendable {
+    case yes, no, unknown
+
+    public init(from decoder: Decoder) throws {
+        self = VisionSupport(rawValue: try decoder.singleValueContainer().decode(String.self)) ?? .unknown
+    }
+}
+
 public struct Profile: Codable, Equatable, Sendable, Identifiable {
     public var id: String
     public var name: String
@@ -428,6 +446,8 @@ public struct Profile: Codable, Equatable, Sendable, Identifiable {
     public var requireAPIKey: Bool
     /// The key itself never leaves the engine.
     public var hasAPIKey: Bool
+    /// Measured by `probe_vision`; `.unknown` when unmeasured or sent by an older engine.
+    public var vision: VisionSupport
 
     enum CodingKeys: String, CodingKey {
         case id, name
@@ -436,10 +456,11 @@ public struct Profile: Codable, Equatable, Sendable, Identifiable {
         case modelOptions = "model_options"
         case requireAPIKey = "require_api_key"
         case hasAPIKey = "has_api_key"
+        case vision
     }
 
     public init(id: String, name: String, baseURL: String, model: String, modelOptions: [String] = [],
-                requireAPIKey: Bool = true, hasAPIKey: Bool = false) {
+                requireAPIKey: Bool = true, hasAPIKey: Bool = false, vision: VisionSupport = .unknown) {
         self.id = id
         self.name = name
         self.baseURL = baseURL
@@ -447,6 +468,36 @@ public struct Profile: Codable, Equatable, Sendable, Identifiable {
         self.modelOptions = modelOptions
         self.requireAPIKey = requireAPIKey
         self.hasAPIKey = hasAPIKey
+        self.vision = vision
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        name = try c.decode(String.self, forKey: .name)
+        baseURL = try c.decode(String.self, forKey: .baseURL)
+        model = try c.decode(String.self, forKey: .model)
+        modelOptions = try c.decode([String].self, forKey: .modelOptions)
+        requireAPIKey = try c.decode(Bool.self, forKey: .requireAPIKey)
+        hasAPIKey = try c.decode(Bool.self, forKey: .hasAPIKey)
+        vision = try c.decodeIfPresent(VisionSupport.self, forKey: .vision) ?? .unknown
+    }
+}
+
+/// `get_settings.enhance`: re-check hard blocks with a vision model after a page is composed.
+public struct EnhanceSettings: Codable, Equatable, Sendable {
+    public var enabled: Bool
+    /// nil uses the translation service's profile.
+    public var profileID: String?
+
+    enum CodingKeys: String, CodingKey {
+        case enabled
+        case profileID = "profile_id"
+    }
+
+    public init(enabled: Bool = false, profileID: String? = nil) {
+        self.enabled = enabled
+        self.profileID = profileID
     }
 }
 
@@ -479,18 +530,20 @@ public struct EngineSettings: Codable, Equatable, Sendable {
     public var profiles: [Profile]
     public var providerTemplates: [String]
     public var output: OutputSettings
+    /// Off when the engine predates the `enhance` capability.
+    public var enhance: EnhanceSettings
 
     enum CodingKeys: String, CodingKey {
         case sourceLanguage = "source_language"
         case targetLanguage = "target_language"
         case languages, translator, profiles
         case providerTemplates = "provider_templates"
-        case output
+        case output, enhance
     }
 
     public init(sourceLanguage: String, targetLanguage: String, languages: LanguageOptions,
                 translator: TranslatorSelection, profiles: [Profile], providerTemplates: [String],
-                output: OutputSettings) {
+                output: OutputSettings, enhance: EnhanceSettings = EnhanceSettings()) {
         self.sourceLanguage = sourceLanguage
         self.targetLanguage = targetLanguage
         self.languages = languages
@@ -498,7 +551,52 @@ public struct EngineSettings: Codable, Equatable, Sendable {
         self.profiles = profiles
         self.providerTemplates = providerTemplates
         self.output = output
+        self.enhance = enhance
     }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        sourceLanguage = try c.decode(String.self, forKey: .sourceLanguage)
+        targetLanguage = try c.decode(String.self, forKey: .targetLanguage)
+        languages = try c.decode(LanguageOptions.self, forKey: .languages)
+        translator = try c.decode(TranslatorSelection.self, forKey: .translator)
+        profiles = try c.decode([Profile].self, forKey: .profiles)
+        providerTemplates = try c.decode([String].self, forKey: .providerTemplates)
+        output = try c.decode(OutputSettings.self, forKey: .output)
+        enhance = try c.decodeIfPresent(EnhanceSettings.self, forKey: .enhance) ?? EnhanceSettings()
+    }
+
+    /// The profile that re-checks pages: the chosen one, else the translation service's.
+    /// nil when neither names an existing profile (e.g. Google translates and none is chosen).
+    public var enhanceProfile: Profile? {
+        let id = enhance.profileID ?? (translator.kind == .llm ? translator.profileID : nil)
+        return profiles.first { $0.id == id }
+    }
+
+    /// Whether enhanced mode can be on with the current choices.
+    public var enhanceAvailability: EnhanceAvailability {
+        guard let profile = enhanceProfile else { return .noProfile }
+        switch profile.vision {
+        case .yes: return .available
+        case .no: return .visionUnsupported
+        case .unknown: return .visionUnknown(profileID: profile.id)
+        }
+    }
+
+    /// What the toggle shows: a stored "on" whose service can no longer read images shows as off.
+    public var enhanceIsOn: Bool {
+        enhance.enabled && enhanceAvailability == .available
+    }
+}
+
+public enum EnhanceAvailability: Equatable, Sendable {
+    case available
+    /// The effective profile was measured not to read images.
+    case visionUnsupported
+    /// The effective profile has not been measured yet; `probe_vision` can.
+    case visionUnknown(profileID: String)
+    /// No LLM profile to re-check with.
+    case noProfile
 }
 
 /// Value for `set_settings.translator`.
@@ -524,19 +622,41 @@ public struct SettingsPatch: Encodable, Equatable, Sendable {
     public var targetLanguage: String?
     public var translator: TranslatorChoice?
     public var output: OutputSettings?
+    public var enhance: EnhancePatch?
 
     enum CodingKeys: String, CodingKey {
         case sourceLanguage = "source_language"
         case targetLanguage = "target_language"
-        case translator, output
+        case translator, output, enhance
     }
 
     public init(sourceLanguage: String? = nil, targetLanguage: String? = nil,
-                translator: TranslatorChoice? = nil, output: OutputSettings? = nil) {
+                translator: TranslatorChoice? = nil, output: OutputSettings? = nil, enhance: EnhancePatch? = nil) {
         self.sourceLanguage = sourceLanguage
         self.targetLanguage = targetLanguage
         self.translator = translator
         self.output = output
+        self.enhance = enhance
+    }
+}
+
+/// Value for `set_settings.enhance`; nil fields are left untouched.
+public struct EnhancePatch: Encodable, Equatable, Sendable {
+    public var enabled: Bool?
+    /// `.some(nil)` sends `null`: use the translation service's profile.
+    public var profileID: String??
+
+    public init(enabled: Bool? = nil, profileID: String?? = nil) {
+        self.enabled = enabled
+        self.profileID = profileID
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: EnhanceSettings.CodingKeys.self)
+        try c.encodeIfPresent(enabled, forKey: .enabled)
+        if let profileID {
+            if let profileID { try c.encode(profileID, forKey: .profileID) } else { try c.encodeNil(forKey: .profileID) }
+        }
     }
 }
 
@@ -578,6 +698,26 @@ public struct ProfileTestResult: Codable, Equatable, Sendable {
     }
 }
 
+/// `probe_vision` reply: a measurement, or the `test_profile`-shaped failure when the
+/// service could not be reached.
+public enum VisionProbeResult: Decodable, Equatable, Sendable {
+    case measured(VisionSupport)
+    case failed(ProfileTestResult)
+
+    enum CodingKeys: String, CodingKey {
+        case vision
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if let vision = try c.decodeIfPresent(VisionSupport.self, forKey: .vision) {
+            self = .measured(vision)
+        } else {
+            self = .failed(try ProfileTestResult(from: decoder))
+        }
+    }
+}
+
 public enum RunMode: String, Codable, Sendable {
     case all
     case `continue`
@@ -616,7 +756,7 @@ public struct PrepareProgress: Codable, Equatable, Sendable {
 
 public enum EngineEvent: Equatable, Sendable {
     case prepareProgress(PrepareProgress)
-    /// `stage` is `detect`, `ocr`, `translate` or `inpaint`; counts are pages.
+    /// `stage` is `detect`, `ocr`, `translate`, `inpaint` or `enhance`; counts are pages.
     case stageProgress(stage: String, done: Int, total: Int)
     case pageDone(page: String, revision: Int)
     case runFinished(cancelled: Bool, failedPages: [String])

@@ -18,6 +18,8 @@ public actor MockEngine: Engine {
         public var translatedPages = 0
         /// `false` behaves like an engine without the `keep_original` edit.
         public var supportsKeepOriginal = true
+        /// `false` behaves like an engine without `probe_vision` and the `enhance` setting.
+        public var supportsVision = true
 
         public init() {}
     }
@@ -44,9 +46,16 @@ public actor MockEngine: Engine {
             languages: LanguageOptions(source: ["日本語", "English", "한국어"],
                                        target: ["简体中文", "繁體中文", "English"]),
             translator: TranslatorSelection(kind: .google, module: "google"),
+            // One profile per `vision` state: measured no, measured yes, not measured yet.
             profiles: [
                 Profile(id: "p1", name: "DeepSeek", baseURL: "https://api.deepseek.com/v1", model: "deepseek-chat",
-                        modelOptions: ["deepseek-chat", "deepseek-reasoner"], requireAPIKey: true, hasAPIKey: false),
+                        modelOptions: ["deepseek-chat", "deepseek-reasoner"], requireAPIKey: true, hasAPIKey: false,
+                        vision: options.supportsVision ? .no : .unknown),
+                Profile(id: "p2", name: "OpenAI", baseURL: "https://api.openai.com/v1", model: "gpt-4o-mini",
+                        modelOptions: ["gpt-4o-mini", "gpt-4o"], requireAPIKey: true, hasAPIKey: true,
+                        vision: options.supportsVision ? .yes : .unknown),
+                Profile(id: "p3", name: "Ollama", baseURL: "http://localhost:11434/v1", model: "qwen2.5vl",
+                        modelOptions: [], requireAPIKey: false, hasAPIKey: false),
             ],
             providerTemplates: ["OpenAI", "DeepSeek", "Ollama"],
             output: OutputSettings(format: ".png", quality: 95)
@@ -68,7 +77,7 @@ public actor MockEngine: Engine {
         case "hello":
             return try JSONValue(encoding: Hello(protocolVersion: engineProtocolVersion, engineVersion: "mock",
                                                  device: "mps", torchInstalled: true, modelsReady: options.modelsReady,
-                                                 capabilities: options.supportsKeepOriginal ? [Hello.keepOriginal] : []))
+                                                 capabilities: capabilities))
         case "open_project":
             return try openProject(path: try string(params, "path"))
         case "get_page":
@@ -109,6 +118,8 @@ public actor MockEngine: Engine {
             if let name = params?["name"]?.stringValue { settings.profiles[index].name = name }
             if let baseURL = params?["base_url"]?.stringValue { settings.profiles[index].baseURL = baseURL }
             if let model = params?["model"]?.stringValue { settings.profiles[index].model = model }
+            // A different endpoint or model has to be measured again.
+            if params?["base_url"]?.stringValue != nil || params?["model"]?.stringValue != nil { settings.profiles[index].vision = .unknown }
             if let key = params?["api_key"]?.stringValue { settings.profiles[index].hasAPIKey = !key.isEmpty }
             return try JSONValue(encoding: settings.profiles[index])
         case "delete_profile":
@@ -116,6 +127,7 @@ public actor MockEngine: Engine {
             if settings.translator.profileID == removed.id {
                 settings.translator = TranslatorSelection(kind: .google, module: "google")
             }
+            if settings.enhance.profileID == removed.id { settings.enhance.profileID = nil }
             return try JSONValue(encoding: settings)
         case "test_profile":
             let index = try profileIndex(params)
@@ -129,6 +141,22 @@ public actor MockEngine: Engine {
                 settings.profiles[index].modelOptions = models
             }
             return try JSONValue(encoding: ProfileTestResult(ok: true, message: "Connected.", kind: "ok", models: models))
+        case "probe_vision":
+            guard options.supportsVision else { throw error(.badRequest, "Unknown method \(method).") }
+            guard let id = params?["profile_id"]?.stringValue,
+                  let index = settings.profiles.firstIndex(where: { $0.id == id }) else {
+                throw error(.notFound, "No such profile.")
+            }
+            try? await Task.sleep(for: options.stepDelay * 3)
+            let profile = settings.profiles[index]
+            guard profile.hasAPIKey || !profile.requireAPIKey else {
+                return try JSONValue(encoding: ProfileTestResult(ok: false, message: "API key is missing.", kind: "auth", models: []))
+            }
+            // Stand-in for reading the digits back: model names that usually take images.
+            let model = profile.model.lowercased()
+            let vision: VisionSupport = ["vl", "4o", "vision", "gemini"].contains(where: model.contains) ? .yes : .no
+            settings.profiles[index].vision = vision
+            return ["vision": .string(vision.rawValue)]
         case "export":
             return try export(params)
         case "shutdown":
@@ -201,7 +229,8 @@ public actor MockEngine: Engine {
             try? await Task.sleep(for: options.stepDelay)
             options.modelsReady = true
         }
-        stages: for stage in ["detect", "ocr", "translate", "inpaint"] {
+        let enhance = options.supportsVision && settings.enhance.enabled
+        stages: for stage in ["detect", "ocr", "translate", "inpaint"] + (enhance ? ["enhance"] : []) {
             for (offset, name) in names.enumerated() {
                 if cancelRequested || Task.isCancelled { break stages }
                 try? await Task.sleep(for: options.stepDelay)
@@ -245,6 +274,10 @@ public actor MockEngine: Engine {
                 let block = page.blocks[position]
                 let unchanged = block.sourceText == original?.sourceText && block.translation == original?.translation
                 page.blocks[position].reviewReason = unchanged ? original?.reviewReason : nil
+                if original?.reviewReason == Block.skipped, !unchanged, block.translation.isEmpty {
+                    // Stand-in for translating the source text the user typed in.
+                    page.blocks[position].translation = block.sourceText
+                }
             }
             if params?["autofit"]?.boolValue == true, let original {
                 // Stand-in for the engine's layout: back to the bubble, sized to fill it.
@@ -285,7 +318,24 @@ public actor MockEngine: Engine {
             }
         }
         if let output = try? params?["output"]?.decode(OutputSettings.self) { settings.output = output }
+        if let enhance = params?["enhance"], options.supportsVision {
+            if let enabled = enhance["enabled"]?.boolValue { settings.enhance.enabled = enabled }
+            switch enhance["profile_id"] {
+            case .none: break
+            case .some(.null): settings.enhance.profileID = nil
+            case .some(let value):
+                guard let id = value.stringValue, settings.profiles.contains(where: { $0.id == id }) else {
+                    throw error(.notFound, "No such profile.")
+                }
+                settings.enhance.profileID = id
+            }
+        }
         return try JSONValue(encoding: settings)
+    }
+
+    private var capabilities: [String] {
+        (options.supportsKeepOriginal ? [Hello.keepOriginal] : [])
+            + (options.supportsVision ? [Hello.visionProbe, Hello.enhance] : [])
     }
 
     private func export(_ params: JSONValue?) throws -> JSONValue {
@@ -360,8 +410,8 @@ enum MockArt {
 
     private static let bubbleCount = 3
 
-    /// Text boxes of a page, already "translated": three bubbles, and on the second and fourth
-    /// page the mix a real run leaves behind — withheld blocks, a sound effect, a signature.
+    /// Text boxes of a page, already "translated": three bubbles, and on the second, fourth and
+    /// sixth page the mix a real run leaves behind — withheld blocks, sound effects, a signature.
     static func blocks(number: Int, english: Bool) -> [Block] {
         let shift = CGFloat((number * 37) % 60)
         let rects = [
@@ -398,10 +448,19 @@ enum MockArt {
                 ? "Hold on, wait for me, I still have to find my umbrella and my keys!"
                 : "等一下等一下,我还得先找到我的雨伞和钥匙才能出门!")
             withhold(2, "geometry", translation: blocks[2].translation)
+            blocks.append(skipped(index: 3, CGRect(x: 560, y: 820, width: 150, height: 60), "ゴゴゴ"))
+        case 5:
+            blocks.append(skipped(index: 3, CGRect(x: 600, y: 300, width: 120, height: 50), "ザワ"))
         default:
             break
         }
         return blocks
+    }
+
+    /// Unreadable text drawn into the artwork, outside every bubble: left as it is.
+    private static func skipped(index: Int, _ rect: CGRect, _ text: String) -> Block {
+        Block(index: index, rect: rect, sourceText: text, fontFamily: "PingFang SC", fontSize: 40,
+              color: RGB(r: 20, g: 20, b: 20), bold: true, sourceRect: rect, reviewReason: Block.skipped)
     }
 
     /// Draws page `number`. `blocks == nil` gives the untranslated source page.

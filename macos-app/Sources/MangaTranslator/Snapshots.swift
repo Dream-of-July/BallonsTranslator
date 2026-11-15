@@ -27,6 +27,8 @@ enum Snapshots {
     private static func renderAll(into directory: URL) async throws {
         let window = CGSize(width: 1120, height: 760)
         let settings = CGSize(width: 620, height: 470)
+        // The translation pane is taller when the engine offers enhanced mode.
+        let translationSettings = CGSize(width: 620, height: 610)
         let folder = FileManager.default.temporaryDirectory.appendingPathComponent("MangaTranslatorSnapshots/Chapter 12")
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
 
@@ -69,6 +71,14 @@ enum Snapshots {
         main.selectNextReview()
         try await capture(ContentView().environment(main), "review-zoomed", window, into: directory)
 
+        // Unreadable text outside a bubble: left as is, selectable, not counted.
+        main.zoom = 1
+        main.selectedPage = "004.png"
+        main.selectedBlock = main.currentPage?.blocks.first(where: \.isSkipped)?.index
+        try await capture(ContentView().environment(main), "skipped", window, into: directory)
+        try await capture(InspectorView().environment(main), "pane-inspector-skipped",
+                          CGSize(width: pane.width, height: 800), into: directory)
+
         let untranslated = await model { $0.translatedPages = 0 }
         await untranslated.open([folder])
         try await capture(ContentView().environment(untranslated), "not-translated", window, into: directory)
@@ -92,6 +102,17 @@ enum Snapshots {
         await stopping.translate()
         await stopping.cancelRun()
         try await capture(ContentView().environment(stopping), "stopping", window, into: directory)
+
+        let enhancing = await model {
+            $0.translatedPages = 3
+            $0.stepDelay = .seconds(1)
+        }
+        await enhancing.setEnhanceProfile("p2")
+        await enhancing.setEnhanceEnabled(true)
+        await enhancing.open([folder])
+        await enhancing.translate()
+        await wait { enhancing.run?.stage == "enhance" }
+        try await capture(ContentView().environment(enhancing), "enhancing", window, into: directory)
 
         let preparing = await model {
             $0.translatedPages = 0
@@ -124,7 +145,30 @@ enum Snapshots {
         let services = await model()
         services.settingsProfile = "p1"
         await services.testProfile(id: "p1")
-        try await capture(TranslationSettings().environment(services), "settings-translation", settings, into: directory)
+        try await capture(TranslationSettings().environment(services), "settings-translation", translationSettings, into: directory)
+
+        // Enhanced mode: on with a service that reads images, then each reason it can't be.
+        let enhanceOn = await model()
+        await enhanceOn.updateSettings(SettingsPatch(translator: .llm(profileID: "p2")))
+        await enhanceOn.setEnhanceEnabled(true)
+        try await capture(TranslationSettings().environment(enhanceOn), "settings-enhance-on", translationSettings, into: directory)
+        let enhanceNo = await model()
+        await enhanceNo.updateSettings(SettingsPatch(translator: .llm(profileID: "p1")))
+        try await capture(TranslationSettings().environment(enhanceNo), "settings-enhance-no", translationSettings, into: directory)
+        let enhanceUnknown = await model()
+        await enhanceUnknown.updateSettings(SettingsPatch(translator: .llm(profileID: "p3")))
+        try await capture(TranslationSettings().environment(enhanceUnknown), "settings-enhance-unknown", translationSettings, into: directory)
+        let enhanceChecking = await model { $0.stepDelay = .seconds(4) }
+        await enhanceChecking.updateSettings(SettingsPatch(translator: .llm(profileID: "p3")))
+        Task { await enhanceChecking.probeVision(profileID: "p3") }
+        await wait { enhanceChecking.visionProbes["p3"] == .running }
+        try await capture(TranslationSettings().environment(enhanceChecking), "settings-enhance-checking", translationSettings, into: directory)
+        let enhanceFailed = await model()
+        if let created = await enhanceFailed.createProfile(template: "OpenAI") {
+            await enhanceFailed.updateSettings(SettingsPatch(translator: .llm(profileID: created.id)))
+            await enhanceFailed.probeVision(profileID: created.id)
+        }
+        try await capture(TranslationSettings().environment(enhanceFailed), "settings-enhance-failed", translationSettings, into: directory)
         try await capture(OutputSettingsPane().environment(services), "settings-output", settings, into: directory)
         try await capture(EngineSettingsPane().environment(services), "settings-engine", settings, into: directory)
     }

@@ -130,6 +130,9 @@ private struct RunProgress: View {
             let bytes = ByteCountFormatStyle(style: .file)
             return "\(prepare.message)  \(Int64(done).formatted(bytes)) / \(Int64(total).formatted(bytes))"
         }
+        if run.stage == "enhance" {
+            return String(localized: "Reviewing page \(max(run.done, 1))")
+        }
         let stage = switch run.stage {
         case "detect": String(localized: "Finding text")
         case "ocr": String(localized: "Reading text")
@@ -335,13 +338,13 @@ struct BlockLayer: View {
                     }
                     .onTapGesture { select(block) }
                     .gesture(move(block), including: block.isWithheld ? .subviews : .all)
-                    .help(block.needsReview ? block.reviewMessage : "")
+                    .help(block.needsReview || block.isSkipped ? block.reviewMessage : "")
                     // The detected box of a withheld block is not rotated.
                     .rotationEffect(.degrees(block.isWithheld ? 0 : block.angle))
                     .position(x: frame.midX, y: frame.midY)
                     .accessibilityElement()
                     .accessibilityLabel(Text(verbatim: block.isWithheld || block.translation.isEmpty ? block.sourceText : block.translation))
-                    .accessibilityValue(Text(verbatim: block.needsReview ? block.reviewMessage : ""))
+                    .accessibilityValue(Text(verbatim: block.needsReview || block.isSkipped ? block.reviewMessage : ""))
                     .accessibilityAddTraits(isSelected ? [.isButton, .isSelected] : .isButton)
                     .accessibilityAction { select(block) }
             }
@@ -421,6 +424,7 @@ extension Block {
         case "overflow": String(localized: "The translation is too long to fit here.")
         case "geometry": String(localized: "The translation would cover artwork or another bubble.")
         case "untranslated": String(localized: "This text has no translation yet.")
+        case Block.skipped: String(localized: "Text outside a bubble, left as is.")
         default: String(localized: "This text was left untranslated.")
         }
     }

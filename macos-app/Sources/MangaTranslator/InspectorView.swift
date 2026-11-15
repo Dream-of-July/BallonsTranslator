@@ -51,10 +51,16 @@ private struct BlockForm: View {
                             .foregroundStyle(.orange)
                     }
                 }
+            } else if block.isSkipped {
+                Section {
+                    Text("Text outside a bubble, left as is.")
+                        .foregroundStyle(.secondary)
+                }
             }
             Section {
-                if block.needsReview {
-                    // What was read may be the problem, so it can be corrected here.
+                if block.needsReview || block.isSkipped {
+                    // What was read may be the problem, so it can be corrected here; typing the
+                    // text of a skipped block has it translated.
                     TextField(text: $sourceDraft, axis: .vertical) {
                         Text("Original", tableName: "Inspector")
                     }

@@ -92,7 +92,85 @@ private func encodeToValue(_ value: some Encodable) throws -> JSONValue {
         #expect(unknown.kind == .other)
     }
 
+    @Test func visionAndEnhanceFieldsAreOptional() throws {
+        // An engine from before `vision_probe` / `enhance` sends neither field.
+        let old = try decode(EngineSettings.self, """
+        {"source_language": "日本語", "target_language": "简体中文",
+         "languages": {"source": ["日本語"], "target": ["简体中文"]},
+         "translator": {"kind": "google", "module": "google", "profile_id": null},
+         "profiles": [{"id": "a", "name": "A", "base_url": "u", "model": "m", "model_options": [],
+                       "require_api_key": true, "has_api_key": false}],
+         "provider_templates": [], "output": {"format": ".png", "quality": 95}}
+        """)
+        #expect(old.profiles.first?.vision == .unknown)
+        #expect(old.enhance == EnhanceSettings(enabled: false, profileID: nil))
+
+        let current = try decode(EngineSettings.self, """
+        {"source_language": "日本語", "target_language": "简体中文",
+         "languages": {"source": ["日本語"], "target": ["简体中文"]},
+         "translator": {"kind": "llm", "module": "LLM_API_Translator", "profile_id": "a"},
+         "profiles": [{"id": "a", "name": "A", "base_url": "u", "model": "m", "model_options": [],
+                       "require_api_key": true, "has_api_key": true, "vision": "yes"},
+                      {"id": "b", "name": "B", "base_url": "u", "model": "m", "model_options": [],
+                       "require_api_key": true, "has_api_key": true, "vision": "maybe"}],
+         "provider_templates": [], "output": {"format": ".png", "quality": 95},
+         "enhance": {"enabled": true, "profile_id": null}}
+        """)
+        #expect(current.profiles.map(\.vision) == [.yes, .unknown])
+        #expect(current.enhance == EnhanceSettings(enabled: true, profileID: nil))
+        #expect(current.enhanceIsOn)
+        // Round trip through the mock's encoding keeps the fields.
+        #expect(try encodeToValue(current).decode(EngineSettings.self) == current)
+
+        let hello = try decode(Hello.self, """
+        {"protocol": 1, "engine_version": "x", "device": null, "torch_installed": true, "models_ready": true,
+         "capabilities": ["keep_original", "vision_probe", "enhance"]}
+        """)
+        #expect(hello.capabilities.contains(Hello.visionProbe) && hello.capabilities.contains(Hello.enhance))
+    }
+
+    @Test func visionProbeResultDecodes() throws {
+        #expect(try decode(VisionProbeResult.self, #"{"vision": "no"}"#) == .measured(.no))
+        #expect(try decode(VisionProbeResult.self, #"{"ok": false, "message": "Connection failed.", "kind": "network", "models": []}"#)
+            == .failed(ProfileTestResult(ok: false, message: "Connection failed.", kind: "network", models: [])))
+    }
+
+    @Test func enhanceAvailabilityFollowsTheEffectiveProfile() {
+        var settings = EngineSettings(
+            sourceLanguage: "日本語", targetLanguage: "简体中文", languages: LanguageOptions(source: [], target: []),
+            translator: TranslatorSelection(kind: .google, module: "google"),
+            profiles: [Profile(id: "no", name: "N", baseURL: "", model: "", vision: .no),
+                       Profile(id: "yes", name: "Y", baseURL: "", model: "", vision: .yes),
+                       Profile(id: "new", name: "U", baseURL: "", model: "")],
+            providerTemplates: [], output: OutputSettings(format: ".png", quality: 95),
+            enhance: EnhanceSettings(enabled: true))
+        // Google translates and nothing is chosen: no service to re-check with.
+        #expect(settings.enhanceProfile == nil)
+        #expect(settings.enhanceAvailability == .noProfile)
+        #expect(!settings.enhanceIsOn)
+
+        settings.enhance.profileID = "yes"
+        #expect(settings.enhanceAvailability == .available)
+        #expect(settings.enhanceIsOn)
+
+        // "Same as translation" follows the translator.
+        settings.enhance.profileID = nil
+        settings.translator = TranslatorSelection(kind: .llm, module: "LLM_API_Translator", profileID: "no")
+        #expect(settings.enhanceAvailability == .visionUnsupported)
+        #expect(!settings.enhanceIsOn)
+        settings.translator.profileID = "new"
+        #expect(settings.enhanceAvailability == .visionUnknown(profileID: "new"))
+
+        // A chosen profile wins over the translator's, and a deleted one leaves nothing.
+        settings.enhance.profileID = "yes"
+        #expect(settings.enhanceProfile?.id == "yes")
+        settings.enhance.profileID = "gone"
+        #expect(settings.enhanceAvailability == .noProfile)
+    }
+
     @Test func eventsDecode() throws {
+        #expect(try decode(EngineEvent.self, #"{"event": "stage_progress", "stage": "enhance", "done": 1, "total": 4}"#)
+            == .stageProgress(stage: "enhance", done: 1, total: 4))
         #expect(try decode(EngineEvent.self, #"{"event": "stage_progress", "stage": "ocr", "done": 3, "total": 12}"#)
             == .stageProgress(stage: "ocr", done: 3, total: 12))
         #expect(try decode(EngineEvent.self, #"{"event": "prepare_progress", "module": "ocr", "phase": "downloading", "message": "Downloading", "done": 10, "total": 200}"#)
@@ -124,6 +202,12 @@ private func encodeToValue(_ value: some Encodable) throws -> JSONValue {
         #expect(try encodeToValue(patch) == ["target_language": "English", "translator": ["kind": "llm", "profile_id": "abc"]])
         #expect(try encodeToValue(SettingsPatch(translator: .google)) == ["translator": ["kind": "google"]])
         #expect(try encodeToValue(ProfilePatch(baseURL: "http://x", apiKey: "")) == ["base_url": "http://x", "api_key": ""])
+        #expect(try encodeToValue(SettingsPatch(enhance: EnhancePatch(enabled: true))) == ["enhance": ["enabled": true]])
+        // `null` is sent on purpose: back to the translation service's profile.
+        #expect(try encodeToValue(SettingsPatch(enhance: EnhancePatch(profileID: .some(nil)))) == ["enhance": ["profile_id": nil]])
+        #expect(try encodeToValue(SettingsPatch(enhance: EnhancePatch(enabled: false, profileID: "p2")))
+            == ["enhance": ["enabled": false, "profile_id": "p2"]])
+        #expect(try encodeToValue(SettingsPatch(targetLanguage: "English")) == ["target_language": "English"])
     }
 
     @Test func errorCodesMatchTheContract() {
@@ -151,5 +235,8 @@ private func encodeToValue(_ value: some Encodable) throws -> JSONValue {
         keep.apply(to: &withheld)
         #expect(withheld.isWithheld && !withheld.needsReview)
         #expect(!block.isWithheld && block.visibleRect == block.rect)
+
+        let skipped = Block(index: 1, rect: block.rect, sourceRect: block.rect, reviewReason: Block.skipped)
+        #expect(skipped.isWithheld && skipped.isSkipped && !skipped.needsReview)
     }
 }
